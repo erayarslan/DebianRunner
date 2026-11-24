@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 import UserNotifications
 import CoreLocation
+import AVFoundation
 #if canImport(BackgroundTasks)
 import BackgroundTasks
 #endif
@@ -197,35 +198,80 @@ import BackgroundTasks
 }
 
 
-/// Opt-in "Keep Linux Running in Background" (Settings > General).
+/// Opt-in "Keep Linux Running in Background" (Settings > General & SSH Server).
 ///
-/// iOS suspends an app shortly after it leaves the screen, which freezes every
-/// Linux process (terminal sessions, servers, downloads). The one public way
-/// to keep running indefinitely that this app already declares is the
-/// `location` background mode (it backs /dev/location; iSH users get the same
-/// effect with `cat /dev/location > /dev/null &`). While enabled, this runs a
-/// coarse location session: kCLLocationAccuracyThreeKilometers (cell/Wi-Fi,
-/// no GPS), updates discarded, never stored or sent anywhere. iOS shows its
-/// location indicator so the user can always see it is active. Off by default.
+/// iOS suspends an app shortly after leaving the foreground or locking the
+/// screen, freezing Linux processes (SSH sessions, remote agents like agy
+/// remote-control, background services) and letting Wi-Fi/TCP flows drop.
+///
+/// While enabled, this combines two iOS background assertions:
+/// 1. A silent `.playback` + `.mixWithOthers` AVAudioPlayer loop (8 kHz mono
+///    all-zero PCM) that keeps the process and network stack awake even when
+///    the iPhone is locked and stationary, without pausing music/podcasts or
+///    taking over Lock Screen media controls.
+/// 2. A continuous CoreLocation session (kCLLocationAccuracyHundredMeters,
+///    kCLDistanceFilterNone, plus CLBackgroundActivitySession on iOS 17+) when
+///    Location permission is granted, matching iSH's background keep-alive.
 @objc(LRBackgroundRunner) @MainActor final class BackgroundRunner: NSObject, ObservableObject, CLLocationManagerDelegate {
     @objc static let shared = BackgroundRunner()
     static let defaultsKey = "LinuxRunner.keepRunningInBackground"
     @Published private(set) var status = "Off"
     private let manager = CLLocationManager()
     private var activitySession: AnyObject?   // CLBackgroundActivitySession on iOS 17+
+    private var audioPlayer: AVAudioPlayer?
+    private var audioActive = false
+    private var locationActive = false
     private var requestedAlwaysUpgrade = false
-    private var activeSession = false
     private var observers: [NSObjectProtocol] = []
+
+    private static let silentWAVData: Data = {
+        let sampleRate: UInt32 = 8000
+        let numChannels: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let byteRate = sampleRate * UInt32(numChannels) * UInt32(bitsPerSample / 8)
+        let blockAlign = numChannels * (bitsPerSample / 8)
+        let dataSize = byteRate * 2 // 2 seconds of digital silence
+        let chunkSize = 36 + dataSize
+
+        var data = Data()
+        data.reserveCapacity(Int(44 + dataSize))
+        data.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // RIFF
+        var leChunk = chunkSize.littleEndian
+        data.append(Data(bytes: &leChunk, count: 4))
+        data.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // WAVE
+        data.append(contentsOf: [0x66, 0x6d, 0x74, 0x20]) // fmt
+        var fmtSize = UInt32(16).littleEndian
+        data.append(Data(bytes: &fmtSize, count: 4))
+        var audioFormat = UInt16(1).littleEndian
+        data.append(Data(bytes: &audioFormat, count: 2))
+        var leChannels = numChannels.littleEndian
+        data.append(Data(bytes: &leChannels, count: 2))
+        var leRate = sampleRate.littleEndian
+        data.append(Data(bytes: &leRate, count: 4))
+        var leByteRate = byteRate.littleEndian
+        data.append(Data(bytes: &leByteRate, count: 4))
+        var leBlockAlign = blockAlign.littleEndian
+        data.append(Data(bytes: &leBlockAlign, count: 2))
+        var leBits = bitsPerSample.littleEndian
+        data.append(Data(bytes: &leBits, count: 2))
+        data.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // data
+        var leDataSize = dataSize.littleEndian
+        data.append(Data(bytes: &leDataSize, count: 4))
+        data.append(Data(count: Int(dataSize)))
+        return data
+    }()
 
     private override init() {
         super.init()
         manager.delegate = self
         manager.activityType = .other
-        manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
-        // A finite distance filter (not CLLocationDistanceMax) prevents iOS 17/18
-        // from treating the location session as inert and suspending the process.
-        manager.distanceFilter = 500
+        // Hundred-meter accuracy with no distance filter keeps locationd active
+        // even while the phone sits stationary on a desk (matching iSH's /dev/location),
+        // without powering full GPS navigation tracking.
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        manager.distanceFilter = kCLDistanceFilterNone
         manager.pausesLocationUpdatesAutomatically = false
+
         let nc = NotificationCenter.default
         observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.reinforceForBackground() }
@@ -233,6 +279,34 @@ import BackgroundTasks
         observers.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 if self?.enabled == true { self?.start() }
+            }
+        })
+        observers.append(nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            let typeRaw = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? NSNumber)?.uintValue ?? 0
+            Task { @MainActor in
+                guard let self, self.enabled else { return }
+                if AVAudioSession.InterruptionType(rawValue: typeRaw) == .ended {
+                    self.startAudioKeepAlive(forceRestart: true)
+                    self.updateStatus()
+                }
+            }
+        })
+        observers.append(nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.enabled else { return }
+                self.audioPlayer = nil
+                self.audioActive = false
+                self.startAudioKeepAlive(forceRestart: true)
+                self.updateStatus()
+            }
+        })
+        observers.append(nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.enabled else { return }
+                if self.audioPlayer?.isPlaying != true {
+                    self.startAudioKeepAlive(forceRestart: true)
+                    self.updateStatus()
+                }
             }
         })
     }
@@ -244,43 +318,91 @@ import BackgroundTasks
     /// Call at launch: resumes the session when the user left it enabled.
     @objc func restore() { if enabled { start() } }
 
+    private func startAudioKeepAlive(forceRestart: Bool = false) {
+        if !forceRestart, let player = audioPlayer, player.isPlaying {
+            audioActive = true
+            return
+        }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+            let player: AVAudioPlayer
+            if let existing = audioPlayer, !forceRestart {
+                player = existing
+            } else {
+                player = try AVAudioPlayer(data: Self.silentWAVData, fileTypeHint: AVFileType.wav.rawValue)
+                player.numberOfLoops = -1
+                // Non-zero gain on all-zero PCM samples outputs digital silence while
+                // ensuring iOS does not treat the player as muted/inert when locked.
+                player.volume = 0.01
+                player.prepareToPlay()
+                audioPlayer = player
+            }
+            let started = player.play()
+            let wasActive = audioActive
+            audioActive = started
+            if started && !wasActive {
+                LRRuntimeBridge.logCategory("BACKGROUND", event: "silent audio keep-alive started (mixWithOthers)")
+            }
+        } catch {
+            audioActive = false
+            LRRuntimeBridge.logCategory("BACKGROUND", event: "silent audio keep-alive failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopAudioKeepAlive() {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        if audioActive {
+            try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        }
+        audioActive = false
+    }
+
     private func reinforceForBackground() {
         guard enabled else { return }
+        var taskID: UIBackgroundTaskIdentifier = .invalid
+        taskID = UIApplication.shared.beginBackgroundTask(withName: "DebianRunner-BackgroundHandoff") {
+            if taskID != .invalid {
+                UIApplication.shared.endBackgroundTask(taskID)
+                taskID = .invalid
+            }
+        }
+        startAudioKeepAlive(forceRestart: audioPlayer?.isPlaying != true)
         switch manager.authorizationStatus {
         case .authorizedWhenInUse, .authorizedAlways:
-            manager.allowsBackgroundLocationUpdates = true
-            manager.showsBackgroundLocationIndicator = true
-            if #available(iOS 17.0, *), activitySession == nil {
-                activitySession = CLBackgroundActivitySession()
-            }
-            manager.startUpdatingLocation()
+            beginLocationSession()
         default:
             break
+        }
+        updateStatus()
+        if taskID != .invalid {
+            UIApplication.shared.endBackgroundTask(taskID)
+            taskID = .invalid
         }
     }
 
     private func start() {
+        // Start silent audio keep-alive first — works immediately even without Location permission.
+        startAudioKeepAlive()
         switch manager.authorizationStatus {
         case .notDetermined:
-            status = "Waiting for location permission"
             manager.requestWhenInUseAuthorization()
         case .denied, .restricted:
-            stopSessionObjects()
-            status = "Location permission denied: allow it in iOS Settings > DebianRunner > Location"
+            stopLocationSession()
         case .authorizedWhenInUse:
             beginLocationSession()
             if !requestedAlwaysUpgrade {
                 requestedAlwaysUpgrade = true
                 manager.requestAlwaysAuthorization()
             }
-            status = "On (While Using): Linux keeps running in background; Allow Always for longest uptime"
         case .authorizedAlways:
             beginLocationSession()
-            status = "On: Linux keeps running when you leave DebianRunner"
         @unknown default:
             beginLocationSession()
-            status = "On: Linux keeps running when you leave DebianRunner"
         }
+        updateStatus()
     }
 
     private func beginLocationSession() {
@@ -290,25 +412,41 @@ import BackgroundTasks
             activitySession = CLBackgroundActivitySession()
         }
         manager.startUpdatingLocation()
-        if !activeSession {
-            activeSession = true
-            LRRuntimeBridge.logCategory("BACKGROUND", event: "keep-running session started (coarse location + background activity session)")
+        if !locationActive {
+            locationActive = true
+            LRRuntimeBridge.logCategory("BACKGROUND", event: "location keep-alive started (hundred-meter + continuous filter)")
         }
     }
 
-    private func stopSessionObjects() {
+    private func stopLocationSession() {
         manager.stopUpdatingLocation()
         manager.allowsBackgroundLocationUpdates = false
         if #available(iOS 17.0, *), let session = activitySession as? CLBackgroundActivitySession {
             session.invalidate()
         }
         activitySession = nil
-        activeSession = false
+        locationActive = false
+    }
+
+    private func updateStatus() {
+        guard enabled else { status = "Off"; return }
+        if audioActive && locationActive {
+            status = "Active (audio + location): Linux, SSH & remote services stay awake when locked"
+        } else if audioActive {
+            status = "Active (silent audio): Linux, SSH & remote services stay awake when locked"
+        } else if locationActive {
+            status = "Active (location): Linux stays awake in background"
+        } else if manager.authorizationStatus == .denied || manager.authorizationStatus == .restricted {
+            status = "Keep-alive unavailable: audio failed and Location permission is denied"
+        } else {
+            status = "Starting background keep-alive…"
+        }
     }
 
     private func stop() {
-        let wasActive = activeSession
-        stopSessionObjects()
+        let wasActive = audioActive || locationActive
+        stopAudioKeepAlive()
+        stopLocationSession()
         status = "Off"
         if wasActive {
             LRRuntimeBridge.logCategory("BACKGROUND", event: "keep-running session stopped")

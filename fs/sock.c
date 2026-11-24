@@ -343,6 +343,24 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol, stru
     int no_sigpipe = 1;
     (void) setsockopt(sock_fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
 #endif
+#if defined(__APPLE__)
+    if ((domain == AF_INET_ || domain == AF_INET6_) && (type & SOCKET_TYPE_MASK) == SOCK_STREAM_) {
+        int keepalive = 1;
+        (void) setsockopt(sock_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+#ifdef TCP_KEEPALIVE
+        int keepidle = 30;
+        (void) setsockopt(sock_fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle, sizeof(keepidle));
+#endif
+#ifdef TCP_KEEPINTVL
+        int keepintvl = 10;
+        (void) setsockopt(sock_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+#endif
+#ifdef TCP_KEEPCNT
+        int keepcnt = 3;
+        (void) setsockopt(sock_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+#endif
+    }
+#endif
     struct fd *fd = adhoc_fd_create(&socket_fdops);
     if (fd == NULL) {
         close(sock_fd);

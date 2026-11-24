@@ -63,7 +63,6 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
         if loadedRoot != root || force {
             if loadedRoot != root { catalog = []; installed = []; searchResults = []; plan = []; details = ""; updatesText = "" }
             loadedRoot = root
-            enqueue("catalog", "") { [weak self] _ in self?.catalog = StoreItem.parseCatalog(self?.read("package-catalog.tsv", 262144) ?? "") }
             enqueue("installed", "") { [weak self] _ in self?.installed = LinuxPackageRecord.parse(self?.read("package-state.tsv", 262144) ?? "") }
         }
     }
@@ -207,21 +206,35 @@ struct AppStoreView: View {
             } else {
                 List {
                     Section { header }
-                    if !query.isEmpty && section != 1 { searchSection }
-                    else if section == 0 { discover }
-                    else if section == 1 { installedSection }
+                    if !query.isEmpty { searchSection }
+                    else if section == 0 { installedSection }
                     else { updatesSection }
+                    if let environment {
+                        Section("Maintenance") {
+                            NavigationLink(destination: PackageView(environment: environment, manager: manager, run: run)) {
+                                Label("Repair Center & Advanced", systemImage: "wrench.and.screwdriver")
+                            }
+                        }
+                    }
                 }.listStyle(.insetGrouped)
+            }
+        }
+        .background {
+            if let environment {
+                NavigationLink(destination: PackageView(environment: environment, manager: manager, run: run), isActive: $showAdvanced) {
+                    EmptyView()
+                }
+                .hidden()
             }
         }
         .navigationTitle("Packages")
         .searchable(text: $query, prompt: "Search APT packages")
-        .onSubmit(of: .search) { if section != 1 { model.search(query.trimmingCharacters(in: .whitespaces)) } }
+        .onSubmit(of: .search) { model.search(query.trimmingCharacters(in: .whitespaces)) }
         .onChange(of: query) { text in
-            // Debounced: search the repositories 0.6 s after typing stops.
+            // Debounced: search APT repositories 0.6 s after typing stops.
             let trimmed = text.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { model.searchResults = []; return }
-            guard section != 1, trimmed.count >= 2 else { return }
+            guard trimmed.count >= 2 else { return }
             searchToken = UUID(); let token = searchToken
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { if token == searchToken && query.trimmingCharacters(in: .whitespaces) == trimmed { model.search(trimmed) } }
         }
@@ -229,11 +242,11 @@ struct AppStoreView: View {
             ToolbarItem(placement: .navigationBarTrailing) {
                 Menu {
                     Button { model.refreshRepositories() } label: { Label("Refresh Repositories", systemImage: "arrow.clockwise") }
-                    if let environment {
-                        Button { showAdvanced = true } label: { Label("Repair Center & Advanced", systemImage: "wrench.and.screwdriver") }.disabled(model.busy)
-                            .background(NavigationLink(destination: PackageView(environment: environment, manager: manager, run: run), isActive: $showAdvanced) { EmptyView() }.hidden())
+                        .disabled(model.busy)
+                    if environment != nil {
+                        Button { showAdvanced = true } label: { Label("Repair Center & Advanced", systemImage: "wrench.and.screwdriver") }
                     }
-                } label: { Image(systemName: "ellipsis.circle") }.disabled(model.busy && !showAdvanced)
+                } label: { Image(systemName: "ellipsis.circle") }
             }
         }
         .safeAreaInset(edge: .bottom) { StoreStatusBar(model: model) }
@@ -252,63 +265,23 @@ struct AppStoreView: View {
                     Text("APT · Debian 13 (trixie) repositories").font(.caption).foregroundColor(.secondary)
                 }
             }
-            Picker("Section", selection: $section) { Text("Discover").tag(0); Text("Installed").tag(1); Text("Updates").tag(2) }
+            Picker("Section", selection: $section) { Text("Installed").tag(0); Text("Updates").tag(1) }
                 .pickerStyle(.segmented)
-                .onChange(of: section) { if $0 == 2 && model.updatesText.isEmpty { model.loadUpdates() } }
+                .onChange(of: section) { if $0 == 1 && model.updatesText.isEmpty { model.loadUpdates() } }
         }.padding(.vertical, 4)
     }
-    static func section(_ category: String) -> String {
-        switch category { case "Accessories", "System": return "Utilities"; default: return category }
-    }
-    private var categories: [String] {
-        let order = ["Development", "Utilities", "Network", "Embedded", "Security"]
-        let present = Set(model.catalog.map { Self.section($0.category) })
-        return order.filter(present.contains) + present.subtracting(order).sorted()
-    }
-    private var featured: [StoreItem] {
-        let picks = ["git", "python3", "nodejs", "vim", "tmux", "htop"]
-        return picks.compactMap { p in model.catalog.first { $0.package == p } }.prefix(6).map { $0 }
-    }
-    @ViewBuilder private var discover: some View {
-        if model.catalog.isEmpty {
-            Section {
-                if model.busy { HStack { ProgressView(); Text(model.stage).foregroundColor(.secondary) } }
-                else {
-                    Text("No catalog packages found in Debian's package lists yet. Refresh repositories first to load available packages.").font(.callout).foregroundColor(.secondary)
-                    Button { model.refreshRepositories() } label: { Label("Refresh Repositories", systemImage: "arrow.clockwise") }
-                }
-            }
-        }
-        if !featured.isEmpty {
-            Section("Popular CLI Tools") {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 14) {
-                        ForEach(featured) { item in
-                            Button { selected = item } label: {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    StoreIcon(symbol: icon(item).symbol, tint: icon(item).tint, size: 56)
-                                    Text(item.name).font(.subheadline.weight(.semibold)).foregroundColor(.primary).lineLimit(1)
-                                    Text(item.installed ? "Installed" : item.version).font(.caption2).foregroundColor(.secondary).lineLimit(1)
-                                }.frame(width: 96, alignment: .leading)
-                            }.buttonStyle(.plain)
-                        }
-                    }.padding(.vertical, 6)
-                }
-            }
-        }
-        ForEach(categories, id: \.self) { category in
-            Section(category) {
-                ForEach(model.catalog.filter { Self.section($0.category) == category }) { item in
-                    Button { selected = item } label: { StoreRow(item: item, icon: icon(item)) }.buttonStyle(.plain)
-                }
-            }
-        }
-        if !model.catalog.isEmpty {
-            Section { Text("Listed tools are available from Debian's official repositories. Search finds every other APT package.").font(.footnote).foregroundColor(.secondary) }
-        }
-    }
     @ViewBuilder private var searchSection: some View {
-        Section("Results for “\(query)”") {
+        let matchingInstalled = model.installed.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        if !matchingInstalled.isEmpty {
+            Section("Installed Matches (\(matchingInstalled.count))") {
+                ForEach(matchingInstalled.prefix(50)) { record in
+                    Button { selected = catalogEntry(StoreItem(record: record)) } label: {
+                        VStack(alignment: .leading, spacing: 2) { Text(record.name).font(.callout); Text(record.version).font(.caption2).foregroundColor(.secondary) }
+                    }.buttonStyle(.plain)
+                }
+            }
+        }
+        Section("APT Repositories for “\(query)”") {
             if model.searchResults.isEmpty {
                 Text(model.busy ? model.stage : "Press Search to look up “\(query)” in APT.").foregroundColor(.secondary)
             }
@@ -318,16 +291,20 @@ struct AppStoreView: View {
         }
     }
     @ViewBuilder private var installedSection: some View {
-        let filtered = query.isEmpty ? model.installed : model.installed.filter { $0.name.localizedCaseInsensitiveContains(query) }
-        Section("Installed Packages (\(filtered.count))") {
-            if filtered.isEmpty {
-                Text(model.busy ? model.stage : "No matching packages.").foregroundColor(.secondary)
+        Section {
+            if model.installed.isEmpty {
+                if model.busy { HStack { ProgressView(); Text(model.stage).foregroundColor(.secondary) } }
+                else { Text("No installed packages loaded yet.").foregroundColor(.secondary) }
             }
-            ForEach(filtered.prefix(2000)) { record in
+            ForEach(model.installed.prefix(2000)) { record in
                 Button { selected = catalogEntry(StoreItem(record: record)) } label: {
                     VStack(alignment: .leading, spacing: 2) { Text(record.name).font(.callout); Text(record.version).font(.caption2).foregroundColor(.secondary) }
                 }.buttonStyle(.plain)
             }
+        } header: {
+            Text("Installed Packages (\(model.installed.count))")
+        } footer: {
+            Text("Use the search bar above to find and install any package from Debian's APT repositories.")
         }
     }
     @ViewBuilder private var updatesSection: some View {

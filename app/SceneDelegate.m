@@ -100,4 +100,16 @@ static NSString *const TerminalUUID = @"TerminalUUID";
     }
 }
 
+- (void)sceneDidEnterBackground:(UIScene *)scene {
+#if !ISH_LINUX && defined(LINUXRUNNER)
+    [LRRuntimeBridge handleDidEnterBackground];
+#endif
+}
+
+- (void)sceneWillEnterForeground:(UIScene *)scene {
+#if !ISH_LINUX && defined(LINUXRUNNER)
+    [LRRuntimeBridge handleWillEnterForeground];
+#endif
+}
+
 @end

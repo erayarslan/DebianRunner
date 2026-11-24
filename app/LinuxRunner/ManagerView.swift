@@ -475,6 +475,7 @@ private struct SSHServerView: View {
     @State private var autoStart = LRRuntimeBridge.sshAutoStart()
     @State private var allowRootLogin = LRRuntimeBridge.sshAllowRootLogin()
     @AppStorage(BackgroundRunner.defaultsKey) private var keepRunningInBackground = false
+    @ObservedObject private var backgroundRunner = BackgroundRunner.shared
     @State private var copied: String?
     @State private var runtimeRunning = LRRuntimeBridge.isRunning()
     @Environment(\.scenePhase) private var scenePhase
@@ -653,7 +654,11 @@ private struct SSHServerView: View {
             Divider()
             Toggle("Keep Linux Running in Background", isOn: $keepRunningInBackground)
                 .onChange(of: keepRunningInBackground) { BackgroundRunner.shared.apply($0) }
-            Text("Enable background execution so active SSH sessions stay alive when you lock your iPhone or switch apps. OpenSSH uses TCP keepalives and skips PAM/DNS lookups for responsive userspace logins.")
+            if keepRunningInBackground {
+                Text(backgroundRunner.status)
+                    .font(.caption).foregroundColor(.green)
+            }
+            Text("Uses a silent mixed audio + location background keep-alive so SSH and remote services stay awake even when your iPhone is locked.")
                 .font(.caption).foregroundColor(.secondary)
         }
     }
@@ -1485,8 +1490,11 @@ struct ManagerView: View {
                 Toggle(isOn: Binding(get: { LongTaskCenter.notificationsEnabled }, set: { LongTaskCenter.notificationsEnabled = $0 })) { SettingsLabel("Notify When Tasks Finish", "bell.badge.fill", .red) }
                 Toggle(isOn: $keepRunningInBackground) { SettingsLabel("Keep Linux Running in Background", "infinity", .green) }
                     .onChange(of: keepRunningInBackground) { BackgroundRunner.shared.apply($0) }
+                if keepRunningInBackground {
+                    Text(backgroundRunner.status).font(.caption).foregroundColor(.green)
+                }
             } header: { Text("General") } footer: {
-                Text("Keep Linux Running in Background uses a background location session so SSH connections and long tasks stay alive when you switch apps.")
+                Text("Keep Linux Running in Background uses a silent mixed audio and continuous location keep-alive so SSH, agy remote-control, and long tasks stay awake when your iPhone is locked.")
             }
             Section("Performance") {
                 NavigationLink(destination: SystemResourcesView()) { SettingsLabel("CPU & Memory", "speedometer", .indigo) }

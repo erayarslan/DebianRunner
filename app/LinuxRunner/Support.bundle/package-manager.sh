@@ -105,12 +105,15 @@ perform() {
   remove)
    apt-get remove -- "$value";;
   diagnose)
-   cat /proc/ish/tasks
-   dpkg --audit; apt-get check
+   cat /proc/ish/tasks 2>/dev/null || true
+   dpkg --audit || true
+   apt-get check || true
    for file in /etc/passwd /etc/group /etc/shadow /etc/gshadow; do [ ! -e "$file" ] || stat -c 'ACCOUNT_METADATA: path=%n mode=%a uid=%u gid=%g' "$file"; done;;
   configure|repair)
    checkpoint=$(mktemp -d /var/lib/linuxrunner/repair-checkpoints/repair.XXXXXX)
-   cp -p /var/lib/dpkg/status "$checkpoint/dpkg-status"; dpkg --audit; dpkg --force-confdef --force-confold --configure -a
+   cp -p /var/lib/dpkg/status "$checkpoint/dpkg-status"
+   dpkg --audit || true
+   dpkg --force-confdef --force-confold --configure -a
    if [ "$operation" = repair ]; then apt-get -f install; fi
    echo "PACKAGE_REPAIR: metadata_checkpoint=$checkpoint rollback=manual-not-automatic";;
   dependencies)
