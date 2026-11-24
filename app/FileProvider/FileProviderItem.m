@@ -94,7 +94,7 @@
     inode_t inode = _identifier.longLongValue;
     if ([_identifier isEqualToString:NSFileProviderRootContainerItemIdentifier])
         inode = path_get_inode(&_mount->db, "");
-    if (!inode_read_stat(&_mount->db, inode, &stat)) {
+    if (!inode_read_stat_if_exist(&_mount->db, inode, &stat)) {
         struct stat st;
         if (fstat(_fd, &st) == 0)
             stat.mode = st.st_mode;
