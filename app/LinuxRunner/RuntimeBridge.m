@@ -559,6 +559,35 @@ static NSString *LRThermalState(void) {
 + (void)recordBoot:(NSString *)root error:(int)error {
     bootedRoot = [root copy]; bootResult = error;
     [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"boot result=%d backend=asbestos jit=false", error]];
+    if (error == 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self syncServiceManagerAndAutostart];
+        });
+    }
+}
++ (void)syncServiceManagerAndAutostart {
+    if (!self.isRunning) return;
+    NSError *error = nil;
+    if (!LRPrepareSupport(&error)) {
+        [self logCategory:@"SERVICE" event:[NSString stringWithFormat:@"prepare support failed: %@", error.localizedDescription ?: @"unknown"]];
+        return;
+    }
+    NSString *script =
+        @"src=/home/mobile/Downloads/.linuxrunner-support/service-manager.sh\n"
+        "[ -f \"$src\" ] || exit 0\n"
+        "mkdir -p /usr/lib/linuxrunner /usr/local/bin /run/debianrunner-systemd/system /var/log/debianrunner-systemd /var/lib/systemd/linger\n"
+        "chmod 1777 /run/debianrunner-systemd 2>/dev/null || true\n"
+        "if ! cmp -s \"$src\" /usr/lib/linuxrunner/service-manager.sh 2>/dev/null; then\n"
+        "  cp -f \"$src\" /usr/lib/linuxrunner/service-manager.sh\n"
+        "  chmod 755 /usr/lib/linuxrunner/service-manager.sh\n"
+        "fi\n"
+        "ln -sf /usr/lib/linuxrunner/service-manager.sh /usr/local/bin/systemctl\n"
+        "ln -sf /usr/lib/linuxrunner/service-manager.sh /usr/local/bin/journalctl\n"
+        "ln -sf /usr/lib/linuxrunner/service-manager.sh /usr/local/bin/loginctl\n"
+        "/usr/lib/linuxrunner/service-manager.sh boot-autostart\n";
+    [self runHeadlessCommand:@[@"/bin/sh", @"-c", script] directory:@"/" completion:^(int exitCode) {
+        [self logCategory:@"SERVICE" event:[NSString stringWithFormat:@"sync service-manager exit=%d", exitCode]];
+    }];
 }
 + (int)prepareExchange:(NSString *)root {
     runtime_instruction_failure = instructionFailure;
@@ -846,6 +875,7 @@ static void LRClearAllEnvironmentUserDefaults(void) {
             }
         }];
     }
+    [self syncServiceManagerAndAutostart];
 }
 
 + (BOOL)fileProviderEnabled {

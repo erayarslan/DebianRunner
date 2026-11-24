@@ -38,6 +38,11 @@
       "mode": "0755"
     },
     {
+      "name": "service-manager.sh",
+      "sha256": "513b1b6c3c387a16bf179b33c93ef6c8cef391ca09bde2257f3af0de5ea0cff3",
+      "mode": "0755"
+    },
+    {
       "name": "share-check.sh",
       "sha256": "ec262147b6c1ece5fd282b574b214764850f8995e7a1531507d0d9a8d5cb93d7",
       "mode": "0755"

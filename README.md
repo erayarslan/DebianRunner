@@ -7,7 +7,7 @@ Headless **Debian GNU/Linux 13 (trixie) minimal ARM64** userspace for iPhone and
 - **Debian 13 Minimal ARM64** — First-launch verified download of official Debian trixie minimal packages (Turkish HTTPS mirrors with `deb.debian.org` fallback).
 - **Terminal** — Native bash shell with touch text selection, unwrapped multiline URL copy, clickable links, smooth scrolling, and a compact key bar.
 - **Built-in SSH Server** — OpenSSH (`sshd` on port `2222`) installed and enabled by default with background keepalive support.
-- **APT & Accounts** — Native **Packages** UI for `apt`/`dpkg` and account creation with passwordless `sudo` enabled by default.
+- **APT, Services & Accounts** — Native **Packages** UI for `apt`/`dpkg`, built-in `systemctl`/`journalctl`/`loginctl` service manager (user & system `.service` units with auto-start/restart), and account creation with passwordless `sudo` enabled by default.
 - **Apple Files & Task Manager** — Browse the Debian rootfs directly in Apple's **Files** app, configure guest CPU/memory, and monitor live processes.
 
 ## Build Unsigned IPA (No Mac Required)

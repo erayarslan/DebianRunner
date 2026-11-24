@@ -1,6 +1,6 @@
 # Known Limitations
 
-DebianRunner executes headless **Debian GNU/Linux 13 (trixie) minimal ARM64** userspace through its own runtime. It does not boot a Linux kernel, provide hardware virtualization, run x86 applications, or implement every Linux system call. Kernel modules, systemd-as-init workflows, and conventional Linux containers are unsupported.
+DebianRunner executes headless **Debian GNU/Linux 13 (trixie) minimal ARM64** userspace through its own runtime. It does not boot a Linux kernel, provide hardware virtualization, run x86 applications, or implement every Linux system call. Kernel modules, full `systemd` as PID 1 (cgroups v2 / unit sandboxing), and conventional Linux containers are unsupported; however, DebianRunner ships a built-in `systemctl` / `journalctl` / `loginctl` service manager (`/usr/local/bin/`) that runs standard `--user` and system `.service` units with supervision and boot auto-start.
 
 - **Headless only:** Desktop environments, X11, Wayland, audio bridges, virtual GPU/Metal rendering, and external-display desktop output are removed.
 - **Debian minimal only:** Only Debian GNU/Linux 13 (trixie) ARM64 is supported.

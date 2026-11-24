@@ -124,6 +124,7 @@ void LRSetDatalessMaterialization(void);
 + (void)runSSHAction:(NSString *)action completion:(void (^ _Nullable)(NSDictionary<NSString *, NSString *> *status))completion NS_SWIFT_NAME(runSSHAction(_:completion:));
 + (NSDictionary<NSString *, NSString *> *)sshStatus;
 + (NSString *)sshLogTail;
++ (void)syncServiceManagerAndAutostart;
 /// True while a support installation (account tools, mode packages) runs; a
 /// second one is refused until it finishes.
 + (BOOL)installationRunning;
