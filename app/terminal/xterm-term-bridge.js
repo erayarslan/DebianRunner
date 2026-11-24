@@ -1,12 +1,9 @@
 /**
- * xterm-term-bridge.js — xterm.js terminal bridge for ios-linuxkit.
+ * xterm-term-bridge.js — xterm.js terminal bridge for DebianRunner.
  *
  * Drop-in alternative to term.js (Ghostty). Uses the same native bridge API
- * (window.exports / webkit.messageHandlers) so the Obj-C host code doesn't
- * need changes — only the HTML entry point differs (xterm-term.html vs term.html).
- *
- * Build switch: in Terminal.m, load xterm-term.html instead of term.html to use
- * the xterm.js renderer instead of Ghostty WebGL/Canvas2D.
+ * (window.exports / webkit.messageHandlers) so the Obj-C host code stays
+ * decoupled from the renderer.
  */
 
 (async () => {
@@ -15,7 +12,18 @@
     window.exports = {
         write() {},
         getSize: () => [0, 0],
-        copy: () => false,
+        copy: () => '',
+        beginSelection: () => null,
+        selectWordAt: () => null,
+        extendSelection: () => null,
+        beginSelectionHandle: () => null,
+        moveSelectionHandle: () => null,
+        endSelectionHandle() {},
+        selectionGeometry: () => null,
+        selectLine: () => null,
+        selectAll: () => null,
+        clearSelection() {},
+        scrollByLines() {},
         setFocused() {},
         scrollToBottom() {},
         newScrollTop() {},
@@ -57,7 +65,7 @@
         'brightWhite',
     ];
 
-    // ── Native bridge (same as term.js) ──────────────────────────────────────
+    // ── Native bridge ────────────────────────────────────────────────────────
     const native = new Proxy({}, {
         get(_, prop) {
             return (...args) => {
@@ -95,20 +103,21 @@
     let nativeScrollRequest = null;
     let oldProps = {};
     let xtermAppActive = null;
-    let selectionAnchor = null;
 
-    // ── Terminal setup ────────────────────────────────────────────────────────
+    // Selection state in buffer linear coordinates (startIdx inclusive, endIdx exclusive)
+    let dragAnchorCell = null;
+    let dragWordRange = null; // { startIdx, endIdx } when press began on a word
+    let dragMoved = false;
+    let handleFixedIdx = null;
+    let lastGeometrySignature = '';
+
+    // ── Terminal setup ───────────────────────────────────────────────────────
     const term = new Terminal({
         cols: 80,
         rows: 24,
         fontSize: styleState.fontSize,
         fontFamily: styleState.fontFamily,
-        theme: {
-            foreground: styleState.foregroundColor,
-            background: styleState.backgroundColor,
-            cursor: styleState.cursorColor || styleState.foregroundColor,
-            cursorAccent: styleState.backgroundColor,
-        },
+        theme: themeForXterm(styleState),
         cursorBlink: styleState.blinkCursor,
         cursorStyle: cursorStyleForXterm(styleState.cursorShape),
         allowTransparency: true,
@@ -133,16 +142,23 @@
     term.onResize(() => {
         native.resize();
         scheduleScrollSync();
+        notifySelection(true);
     });
-    term.onScroll(scheduleScrollSync);
+    term.onScroll(() => {
+        scheduleScrollSync();
+        if (term.hasSelection())
+            notifySelection(false);
+    });
     term.onCursorMove(syncApplicationCursor);
-    term.onSelectionChange(() => native.selectionChanged(term.getSelection()));
+    term.onSelectionChange(() => {
+        native.selectionChanged(term.getSelection());
+        notifySelection(false);
+    });
 
     term.open(terminalElement);
     installNativeFocusAdapter();
     installLigatures();
     disableWebTextInput();
-    installFocusBridge();
     fitAddon.fit();
     syncApplicationCursor();
     scheduleScrollSync();
@@ -165,11 +181,223 @@
             }
             native.resize();
             scheduleScrollSync();
+            if (term.hasSelection())
+                notifySelection(true);
         });
     }
 
     const ro = new ResizeObserver(() => fitTerminal());
     ro.observe(terminalElement);
+
+    // ── Selection helpers ────────────────────────────────────────────────────
+    const NON_WORD_DELIMITERS = new Set(['"', "'", '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', '|']);
+
+    function cellChar(line, col) {
+        if (!line || col < 0 || col >= term.cols)
+            return '';
+        const cell = line.getCell(col);
+        if (!cell)
+            return '';
+        if (cell.getWidth() === 0 && col > 0) {
+            const prev = line.getCell(col - 1);
+            return prev ? prev.getChars() : '';
+        }
+        return cell.getChars();
+    }
+
+    function isBlankCell(line, col) {
+        const ch = cellChar(line, col);
+        return !ch || /^\s+$/.test(ch);
+    }
+
+    function isWordCell(line, col) {
+        const ch = cellChar(line, col);
+        if (!ch || /^\s+$/.test(ch))
+            return false;
+        return !NON_WORD_DELIMITERS.has(ch);
+    }
+
+    function lineTrimmedLength(line) {
+        if (!line)
+            return 0;
+        let len = term.cols;
+        while (len > 0 && isBlankCell(line, len - 1))
+            len--;
+        return len;
+    }
+
+    function getScreenMetrics() {
+        const screen = terminalElement.querySelector('.xterm-screen');
+        const cell = getCellSize();
+        if (!screen || !cell.width || !cell.height)
+            return null;
+        return { screen, rect: screen.getBoundingClientRect(), cell };
+    }
+
+    function selectionCell(x, y) {
+        const m = getScreenMetrics();
+        if (!m || !Number.isFinite(x) || !Number.isFinite(y))
+            return null;
+        const buffer = term.buffer.active;
+        const maxRow = Math.max(0, buffer.length - 1);
+        const col = Math.max(0, Math.min(term.cols - 1, Math.floor((x - m.rect.left) / m.cell.width)));
+        const visRow = Math.max(0, Math.min(term.rows - 1, Math.floor((y - m.rect.top) / m.cell.height)));
+        return {
+            col,
+            row: Math.max(0, Math.min(maxRow, buffer.viewportY + visRow)),
+        };
+    }
+
+    function selectionBoundary(x, y) {
+        const m = getScreenMetrics();
+        if (!m || !Number.isFinite(x) || !Number.isFinite(y))
+            return null;
+        const buffer = term.buffer.active;
+        const maxRow = Math.max(0, buffer.length - 1);
+        const col = Math.max(0, Math.min(term.cols, Math.round((x - m.rect.left) / m.cell.width)));
+        const visRow = Math.max(0, Math.min(term.rows - 1, Math.floor((y - m.rect.top) / m.cell.height)));
+        const row = Math.max(0, Math.min(maxRow, buffer.viewportY + visRow));
+        return { col, row, idx: row * term.cols + col };
+    }
+
+    function wordRangeAt(cell) {
+        if (!cell)
+            return null;
+        const buffer = term.buffer.active;
+        const line = buffer.getLine(cell.row);
+        if (!line)
+            return null;
+        let col = cell.col;
+        // If finger landed just 1 cell right of a word on the same line, snap to it
+        // only when that neighbor is non-blank and the tapped cell is trailing/inner space.
+        if (isBlankCell(line, col)) {
+            if (col > 0 && !isBlankCell(line, col - 1) && (col + 1 >= term.cols || isBlankCell(line, col + 1))) {
+                // Keep empty area un-selected so long-pressing blank space offers Paste cleanly.
+                return null;
+            }
+            return null;
+        }
+        const cols = term.cols;
+        if (!isWordCell(line, col)) {
+            // Tapped on a punctuation delimiter: select that single token.
+            const idx = cell.row * cols + col;
+            return { startIdx: idx, endIdx: idx + 1 };
+        }
+        let startCol = col;
+        let endCol = col + 1;
+        while (startCol > 0 && isWordCell(line, startCol - 1))
+            startCol--;
+        while (endCol < cols && isWordCell(line, endCol))
+            endCol++;
+        return {
+            startIdx: cell.row * cols + startCol,
+            endIdx: cell.row * cols + endCol,
+        };
+    }
+
+    function currentLinearSelection() {
+        const pos = term.getSelectionPosition();
+        if (!pos)
+            return null;
+        const cols = term.cols;
+        const startIdx = pos.start.y * cols + pos.start.x;
+        const endIdx = pos.end.y * cols + pos.end.x;
+        if (endIdx <= startIdx)
+            return null;
+        return { startIdx, endIdx };
+    }
+
+    function applyLinearSelection(startIdx, endIdx) {
+        const cols = term.cols;
+        const maxCells = term.buffer.active.length * cols;
+        const s = Math.max(0, Math.min(maxCells - 1, startIdx));
+        const e = Math.max(s + 1, Math.min(maxCells, endIdx));
+        const startRow = Math.floor(s / cols);
+        const startCol = s % cols;
+        term.select(startCol, startRow, e - s);
+    }
+
+    function getSelectionGeometry(extra) {
+        const m = getScreenMetrics();
+        const text = term.getSelection() || '';
+        const range = currentLinearSelection();
+        if (!m || !range || !term.hasSelection()) {
+            return Object.assign({
+                hasSelection: false,
+                text: '',
+                cellWidth: m ? m.cell.width : 0,
+                cellHeight: m ? m.cell.height : 0,
+                startVisible: false,
+                endVisible: false,
+            }, extra || {});
+        }
+        const cols = term.cols;
+        const vpY = term.buffer.active.viewportY;
+        const startRow = Math.floor(range.startIdx / cols);
+        const startCol = range.startIdx % cols;
+        const lastIdx = range.endIdx - 1;
+        const endRow = Math.floor(lastIdx / cols);
+        const endCol = (lastIdx % cols) + 1;
+
+        const startVisRow = startRow - vpY;
+        const endVisRow = endRow - vpY;
+        const startVisible = startVisRow >= 0 && startVisRow < term.rows;
+        const endVisible = endVisRow >= 0 && endVisRow < term.rows;
+
+        const startX = m.rect.left + startCol * m.cell.width;
+        const startTopY = m.rect.top + startVisRow * m.cell.height;
+        const startBottomY = startTopY + m.cell.height;
+
+        const endX = m.rect.left + endCol * m.cell.width;
+        const endTopY = m.rect.top + endVisRow * m.cell.height;
+        const endBottomY = endTopY + m.cell.height;
+
+        // Pick a clean anchor for the iOS edit menu inside the visible viewport.
+        const visTopRow = Math.max(0, startVisRow);
+        const visBottomRow = Math.min(term.rows - 1, endVisRow);
+        let menuX;
+        let menuY;
+        if (visTopRow <= visBottomRow) {
+            if (startRow === endRow && startVisible) {
+                menuX = (startX + endX) / 2;
+            } else {
+                menuX = m.rect.left + m.rect.width / 2;
+            }
+            menuY = m.rect.top + visTopRow * m.cell.height;
+        } else {
+            menuX = m.rect.left + m.rect.width / 2;
+            menuY = m.rect.top + m.rect.height / 2;
+        }
+
+        return Object.assign({
+            hasSelection: true,
+            text,
+            cellWidth: m.cell.width,
+            cellHeight: m.cell.height,
+            startX,
+            startTopY,
+            startBottomY,
+            startVisible,
+            endX,
+            endTopY,
+            endBottomY,
+            endVisible,
+            menuX,
+            menuY,
+        }, extra || {});
+    }
+
+    function notifySelection(force) {
+        const geom = getSelectionGeometry();
+        const sig = geom.hasSelection
+            ? `${geom.startX.toFixed(1)},${geom.startTopY.toFixed(1)},${geom.endX.toFixed(1)},${geom.endTopY.toFixed(1)},${geom.startVisible},${geom.endVisible},${geom.text.length}`
+            : 'none';
+        if (force || sig !== lastGeometrySignature) {
+            lastGeometrySignature = sig;
+            native.selectionGeometry(geom);
+        }
+        return geom;
+    }
 
     // ── Exports (native → JS) ────────────────────────────────────────────────
     function latin1StringToBytes(str) {
@@ -191,24 +419,132 @@
             return [term.cols, term.rows];
         },
         copy() {
-            return term.getSelection();
+            return term.getSelection() || '';
         },
         beginSelection(x, y) {
-            selectionAnchor = selectionCell(x, y);
-            if (selectionAnchor)
-                term.select(selectionAnchor.col, selectionAnchor.row, 1);
+            const cell = selectionCell(x, y);
+            dragAnchorCell = cell;
+            dragMoved = false;
+            dragWordRange = wordRangeAt(cell);
+            if (dragWordRange) {
+                applyLinearSelection(dragWordRange.startIdx, dragWordRange.endIdx);
+            } else {
+                term.clearSelection();
+            }
+            return notifySelection(true);
+        },
+        selectWordAt(x, y) {
+            const cell = selectionCell(x, y);
+            dragAnchorCell = cell;
+            dragMoved = false;
+            dragWordRange = wordRangeAt(cell);
+            if (dragWordRange) {
+                applyLinearSelection(dragWordRange.startIdx, dragWordRange.endIdx);
+                return notifySelection(true);
+            }
+            return getSelectionGeometry();
         },
         extendSelection(x, y) {
             const end = selectionCell(x, y);
-            if (!selectionAnchor || !end)
-                return;
-            const a = selectionAnchor.row * term.cols + selectionAnchor.col;
-            const b = end.row * term.cols + end.col;
-            const start = Math.min(a, b);
-            term.select(start % term.cols, Math.floor(start / term.cols), Math.abs(a - b) + 1);
+            if (!dragAnchorCell || !end)
+                return getSelectionGeometry();
+            if (!dragMoved && end.row === dragAnchorCell.row && end.col === dragAnchorCell.col && dragWordRange)
+                return getSelectionGeometry();
+            dragMoved = true;
+            const cols = term.cols;
+            const endCellIdx = end.row * cols + end.col;
+            if (dragWordRange) {
+                if (endCellIdx >= dragWordRange.startIdx) {
+                    applyLinearSelection(dragWordRange.startIdx, Math.max(dragWordRange.endIdx, endCellIdx + 1));
+                } else {
+                    applyLinearSelection(endCellIdx, dragWordRange.endIdx);
+                }
+            } else {
+                const anchorIdx = dragAnchorCell.row * cols + dragAnchorCell.col;
+                const s = Math.min(anchorIdx, endCellIdx);
+                const e = Math.max(anchorIdx, endCellIdx) + 1;
+                applyLinearSelection(s, e);
+            }
+            return notifySelection(true);
         },
-        selectAll() { term.selectAll(); },
-        clearSelection() { selectionAnchor = null; term.clearSelection(); },
+        beginSelectionHandle(which) {
+            const range = currentLinearSelection();
+            if (!range) {
+                handleFixedIdx = null;
+                return getSelectionGeometry();
+            }
+            handleFixedIdx = which === 'start' ? range.endIdx : range.startIdx;
+            return getSelectionGeometry();
+        },
+        moveSelectionHandle(x, y) {
+            const bound = selectionBoundary(x, y);
+            if (handleFixedIdx === null || !bound)
+                return getSelectionGeometry();
+            const maxCells = term.buffer.active.length * term.cols;
+            let startIdx;
+            let endIdx;
+            if (bound.idx < handleFixedIdx) {
+                startIdx = bound.idx;
+                endIdx = handleFixedIdx;
+            } else if (bound.idx > handleFixedIdx) {
+                startIdx = handleFixedIdx;
+                endIdx = bound.idx;
+            } else {
+                startIdx = Math.max(0, Math.min(maxCells - 1, handleFixedIdx));
+                endIdx = Math.min(maxCells, startIdx + 1);
+            }
+            applyLinearSelection(startIdx, endIdx);
+            return notifySelection(true);
+        },
+        endSelectionHandle() {
+            handleFixedIdx = null;
+        },
+        selectionGeometry() {
+            return notifySelection(true);
+        },
+        selectLine() {
+            const buffer = term.buffer.active;
+            const maxRow = Math.max(0, buffer.length - 1);
+            const range = currentLinearSelection();
+            let startRow;
+            let endRow;
+            if (range) {
+                startRow = Math.floor(range.startIdx / term.cols);
+                endRow = Math.floor((range.endIdx - 1) / term.cols);
+            } else if (dragAnchorCell) {
+                startRow = endRow = dragAnchorCell.row;
+            } else {
+                startRow = endRow = Math.min(maxRow, buffer.baseY + buffer.cursorY);
+            }
+            while (startRow > 0 && buffer.getLine(startRow)?.isWrapped)
+                startRow--;
+            while (endRow < maxRow && buffer.getLine(endRow + 1)?.isWrapped)
+                endRow++;
+            const endLen = lineTrimmedLength(buffer.getLine(endRow));
+            const endCol = endLen > 0 ? endLen : term.cols;
+            applyLinearSelection(startRow * term.cols, endRow * term.cols + endCol);
+            return notifySelection(true);
+        },
+        selectAll() {
+            term.selectAll();
+            return notifySelection(true);
+        },
+        clearSelection() {
+            dragAnchorCell = null;
+            dragWordRange = null;
+            dragMoved = false;
+            handleFixedIdx = null;
+            term.clearSelection();
+            notifySelection(true);
+        },
+        scrollByLines(delta) {
+            if (!Number.isFinite(delta) || delta === 0)
+                return;
+            term.scrollLines(Math.trunc(delta));
+            scheduleScrollSync();
+            if (term.hasSelection())
+                notifySelection(false);
+        },
         setFocused(focused) {
             terminalElement.classList.toggle('terminal-focused', !!focused);
             setXtermAppActive(!!focused);
@@ -230,6 +566,8 @@
             nativeScrollRequest = {buffer, line, cellHeight};
             term.scrollToLine(line);
             scheduleScrollSync();
+            if (term.hasSelection())
+                notifySelection(false);
         },
         async updateStyle(newStyle) {
             styleState = {...styleState, ...normalizeStyleUpdate(newStyle)};
@@ -247,6 +585,8 @@
             fitTerminal();
             term.refresh(0, term.rows - 1);
             scheduleScrollSync();
+            if (term.hasSelection())
+                notifySelection(true);
         },
         getCharacterSize() {
             const size = getCellSize();
@@ -276,39 +616,6 @@
         term.textarea.autocomplete = 'off';
         term.textarea.autocorrect = 'off';
         term.textarea.spellcheck = false;
-    }
-
-    function selectionCell(x, y) {
-        const screen = terminalElement.querySelector('.xterm-screen');
-        const cell = getCellSize();
-        if (!screen || !cell.width || !cell.height || !Number.isFinite(x) || !Number.isFinite(y))
-            return null;
-        const rect = screen.getBoundingClientRect();
-        return {
-            col: Math.max(0, Math.min(term.cols - 1, Math.floor((x - rect.left) / cell.width))),
-            row: term.buffer.active.viewportY + Math.max(0, Math.min(term.rows - 1, Math.floor((y - rect.top) / cell.height))),
-        };
-    }
-
-    function installFocusBridge() {
-        terminalElement.addEventListener('touchstart', (event) => {
-            if (!term.hasSelection())
-                event.preventDefault();
-        }, {capture: true});
-        terminalElement.addEventListener('touchend', (event) => {
-            if (term.hasSelection())
-                term.clearSelection();
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            native.focus();
-        }, {capture: true});
-        terminalElement.addEventListener('mousedown', (event) => {
-            event.preventDefault();
-            if (!term.hasSelection())
-                native.focus();
-        }, {capture: true});
-        terminalElement.addEventListener('focus', () => native.syncFocus());
-        terminalElement.addEventListener('blur', () => native.syncFocus());
     }
 
     function installLigatures() {
@@ -395,6 +702,8 @@
             native.newScrollTop(scrollTop);
         }
         lastNativeScrollTop = scrollTop;
+        if (term.hasSelection())
+            notifySelection(false);
     }
 
     function syncApplicationCursor() {
@@ -486,8 +795,8 @@
             background: style.backgroundColor,
             cursor: style.cursorColor || style.foregroundColor,
             cursorAccent: style.backgroundColor,
-            selectionBackground: style.foregroundColor,
-            selectionForeground: style.backgroundColor,
+            selectionBackground: 'rgba(56, 132, 255, 0.45)',
+            selectionInactiveBackground: 'rgba(56, 132, 255, 0.35)',
         };
         if (Array.isArray(style.colorPaletteOverrides)) {
             for (let i = 0; i < Math.min(ansiColorNames.length, style.colorPaletteOverrides.length); i++)

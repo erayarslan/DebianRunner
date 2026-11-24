@@ -33,13 +33,82 @@ struct rowcol {
 }
 @end
 
-@interface TerminalView () <UIEditMenuInteractionDelegate>
+@interface LRTerminalSelectionHandle : UIView
+@property (nonatomic) BOOL isStart;
+@property (nonatomic) CGFloat lineHeight;
+- (void)positionAtX:(CGFloat)x topY:(CGFloat)topY bottomY:(CGFloat)bottomY;
+@end
+
+@implementation LRTerminalSelectionHandle
+
+- (instancetype)initWithIsStart:(BOOL)isStart {
+    if (self = [super initWithFrame:CGRectMake(0, 0, 44, 44)]) {
+        _isStart = isStart;
+        _lineHeight = 16;
+        self.backgroundColor = UIColor.clearColor;
+        self.opaque = NO;
+        self.hidden = YES;
+        self.accessibilityLabel = isStart ? @"Selection start handle" : @"Selection end handle";
+    }
+    return self;
+}
+
+- (void)positionAtX:(CGFloat)x topY:(CGFloat)topY bottomY:(CGFloat)bottomY {
+    CGFloat barHeight = MAX(12.0, bottomY - topY);
+    CGFloat midY = (topY + bottomY) * 0.5;
+    CGFloat width = 44.0;
+    CGFloat height = MAX(44.0, barHeight + 36.0);
+    BOOL needsRedraw = fabs(self.lineHeight - barHeight) > 0.5;
+    self.lineHeight = barHeight;
+    self.frame = CGRectMake(round(x - width * 0.5), round(midY - height * 0.5), width, height);
+    if (needsRedraw)
+        [self setNeedsDisplay];
+}
+
+- (void)drawRect:(CGRect)rect {
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx)
+        return;
+    UIColor *accent = UIColor.systemBlueColor;
+    [accent setFill];
+    CGFloat midX = CGRectGetMidX(self.bounds);
+    CGFloat barWidth = 2.0;
+    CGFloat barHeight = MAX(12.0, self.lineHeight);
+    CGFloat barTop = (self.bounds.size.height - barHeight) * 0.5;
+    CGFloat knobDiameter = 11.0;
+    CGFloat knobRadius = knobDiameter * 0.5;
+
+    CGRect barRect = CGRectMake(midX - barWidth * 0.5, barTop, barWidth, barHeight);
+    CGContextFillRect(ctx, barRect);
+
+    CGFloat knobCenterY = self.isStart ? (barTop - knobRadius + 1.0) : (barTop + barHeight + knobRadius - 1.0);
+    CGRect knobRect = CGRectMake(midX - knobRadius, knobCenterY - knobRadius, knobDiameter, knobDiameter);
+    CGContextFillEllipseInRect(ctx, knobRect);
+}
+
+@end
+
+@interface TerminalView () <UIEditMenuInteractionDelegate, UIGestureRecognizerDelegate>
 
 @property (nonatomic) NSMutableArray<UIKeyCommand *> *keyCommands;
 @property ScrollbarView *scrollbarView;
 @property (nonatomic) BOOL terminalFocused;
 @property (nonatomic) BOOL updatingTerminalScroll;
 @property UIEditMenuInteraction *terminalEditMenu API_AVAILABLE(ios(16.0));
+@property (nonatomic) UITapGestureRecognizer *singleTapGesture;
+@property (nonatomic) UITapGestureRecognizer *doubleTapGesture;
+@property (nonatomic) UILongPressGestureRecognizer *selectionGesture;
+@property (nonatomic) LRTerminalSelectionHandle *startSelectionHandle;
+@property (nonatomic) LRTerminalSelectionHandle *endSelectionHandle;
+@property (nonatomic, copy, nullable) NSString *activeDragHandle;
+@property (nonatomic) CGPoint handleDragOffset;
+@property (nonatomic) BOOL selectionActive;
+@property (nonatomic) BOOL draggingSelection;
+@property (nonatomic) BOOL draggingHandle;
+@property (nonatomic) CGPoint lastSelectionMenuPoint;
+@property (nonatomic) CGPoint lastDragPointInWebView;
+@property (nonatomic, nullable) NSTimer *selectionAutoScrollTimer;
+@property (nonatomic) NSInteger selectionAutoScrollDirection;
 
 @property (nullable) NSString *markedText;
 @property (nullable) NSString *selectedText;
@@ -79,8 +148,38 @@ static NSString *LRTerminalBackground(NSString *hex) {
     self.clipsToBounds = YES;
     [self addSubview:scrollbarView];
 #if USE_XTERM_RENDERER
+    UITapGestureRecognizer *singleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTerminalTap:)];
+    singleTap.numberOfTapsRequired = 1;
+    singleTap.cancelsTouchesInView = NO;
+    singleTap.delegate = self;
+    [self addGestureRecognizer:singleTap];
+    self.singleTapGesture = singleTap;
+
+    UITapGestureRecognizer *doubleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTerminalDoubleTap:)];
+    doubleTap.numberOfTapsRequired = 2;
+    doubleTap.cancelsTouchesInView = NO;
+    doubleTap.delegate = self;
+    [self addGestureRecognizer:doubleTap];
+    self.doubleTapGesture = doubleTap;
+    [singleTap requireGestureRecognizerToFail:doubleTap];
+
     UILongPressGestureRecognizer *selectionGesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(selectTerminalText:)];
+    selectionGesture.minimumPressDuration = 0.35;
+    selectionGesture.allowableMovement = 18.0;
+    selectionGesture.cancelsTouchesInView = YES;
+    selectionGesture.delegate = self;
     [self addGestureRecognizer:selectionGesture];
+    self.selectionGesture = selectionGesture;
+
+    self.startSelectionHandle = [[LRTerminalSelectionHandle alloc] initWithIsStart:YES];
+    self.endSelectionHandle = [[LRTerminalSelectionHandle alloc] initWithIsStart:NO];
+    for (LRTerminalSelectionHandle *handle in @[self.startSelectionHandle, self.endSelectionHandle]) {
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panSelectionHandle:)];
+        pan.maximumNumberOfTouches = 1;
+        [handle addGestureRecognizer:pan];
+        [self addSubview:handle];
+    }
+
     if (@available(iOS 16.0, *)) {
         self.terminalEditMenu = [[UIEditMenuInteraction alloc] initWithDelegate:self];
         [self addInteraction:self.terminalEditMenu];
@@ -116,6 +215,7 @@ static NSString *LRTerminalBackground(NSString *hex) {
 }
 
 - (void)dealloc {
+    [_selectionAutoScrollTimer invalidate];
     [NSNotificationCenter.defaultCenter removeObserver:self];
     self.terminal = nil;
 }
@@ -129,7 +229,7 @@ static NSString *LRTerminalBackground(NSString *hex) {
     }
 }
 
-static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight", @"newScrollTop", @"openLink", @"selectionChanged"};
+static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight", @"newScrollTop", @"openLink", @"selectionChanged", @"selectionGeometry"};
 
 - (void)setTerminal:(Terminal *)terminal {
     if (_terminal) {
@@ -160,6 +260,11 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     webView.scrollView.delaysContentTouches = NO;
     webView.scrollView.canCancelContentTouches = NO;
     webView.scrollView.panGestureRecognizer.enabled = NO;
+#if USE_XTERM_RENDERER
+    // Let TerminalView and ScrollbarView own all touch, scroll, and selection
+    // gestures natively so WKContentView never hijacks long presses.
+    webView.userInteractionEnabled = NO;
+#endif
     id <WKScriptMessageHandler> handler = [[WeakScriptMessageHandler alloc] initWithHandler:self];
     for (int i = 0; i < sizeof(HANDLERS)/sizeof(HANDLERS[0]); i++) {
         [webView.configuration.userContentController addScriptMessageHandler:handler name:HANDLERS[i]];
@@ -171,9 +276,21 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 
     self.scrollbarView.contentView = webView;
     [self.scrollbarView addSubview:webView];
+#if USE_XTERM_RENDERER
+    if (self.startSelectionHandle) [self bringSubviewToFront:self.startSelectionHandle];
+    if (self.endSelectionHandle) [self bringSubviewToFront:self.endSelectionHandle];
+#endif
 }
 
 - (void)uninstallTerminalView {
+    [self stopSelectionAutoScroll];
+    self.selectionActive = NO;
+    self.draggingSelection = NO;
+    self.draggingHandle = NO;
+    self.selectedText = nil;
+    self.startSelectionHandle.hidden = YES;
+    self.endSelectionHandle.hidden = YES;
+    [self dismissSelectionMenu];
     // remove old terminal
     UIView *superview = _terminal.webView.superview;
     if (superview != self.scrollbarView) {
@@ -342,8 +459,32 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
         if ([message.body isKindOfClass:NSString.class])
             [UIApplication openURL:message.body];
     } else if ([message.name isEqualToString:@"selectionChanged"]) {
-        if ([message.body isKindOfClass:NSString.class])
-            self.selectedText = message.body;
+        if ([message.body isKindOfClass:NSString.class]) {
+            NSString *text = message.body;
+            self.selectedText = text.length > 0 ? text : nil;
+        }
+    } else if ([message.name isEqualToString:@"selectionGeometry"]) {
+        if ([message.body isKindOfClass:NSDictionary.class]) {
+            [self applySelectionGeometry:message.body];
+        }
+    }
+}
+
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    if (self.selectionActive) {
+        [self dismissSelectionMenu];
+    }
+}
+
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    if (!decelerate && self.selectionActive && !self.draggingSelection) {
+        [self refreshAndPresentSelectionMenu];
+    }
+}
+
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    if (self.selectionActive && !self.draggingSelection) {
+        [self refreshAndPresentSelectionMenu];
     }
 }
 
@@ -376,6 +517,11 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 
 - (void)insertText:(NSString *)text {
     self.markedText = nil;
+#if USE_XTERM_RENDERER
+    if (self.selectionActive) {
+        [self clearTerminalSelection];
+    }
+#endif
 
     if (self.controlKey.highlighted)
         self.controlKey.selected = YES;
@@ -461,9 +607,24 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 }
 
 - (void)copy:(id)sender {
+#if USE_XTERM_RENDERER
+    if (self.selectedText.length > 0) {
+        UIPasteboard.generalPasteboard.string = self.selectedText;
+        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [feedback impactOccurred];
+        [self clearTerminalSelection];
+        return;
+    }
+#endif
     [self.terminal.webView evaluateJavaScript:@"exports.copy()" completionHandler:^(id result, NSError *error) {
-        if (error == nil && [result isKindOfClass:NSString.class] && [result length] > 0)
+        if (error == nil && [result isKindOfClass:NSString.class] && [result length] > 0) {
             UIPasteboard.generalPasteboard.string = result;
+#if USE_XTERM_RENDERER
+            UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+            [feedback impactOccurred];
+            [self clearTerminalSelection];
+#endif
+        }
     }];
 }
 
@@ -471,6 +632,8 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 #if USE_XTERM_RENDERER
     if (action == @selector(copy:))
         return self.selectedText.length > 0;
+    if (action == @selector(paste:))
+        return UIPasteboard.generalPasteboard.hasStrings;
     if (action == @selector(selectAll:))
         return self.terminal.loaded;
 #endif
@@ -478,37 +641,322 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 }
 
 - (void)selectAll:(id)sender {
-    [self.terminal.webView evaluateJavaScript:@"exports.selectAll?.()" completionHandler:nil];
+    if (!self.terminal.loaded)
+        return;
+    [self.terminal.webView evaluateJavaScript:@"exports.selectAll?.()" completionHandler:^(id result, NSError *error) {
+        if ([result isKindOfClass:NSDictionary.class]) {
+            [self applySelectionGeometry:result];
+        }
+        if (self.selectionActive) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (self.selectionActive && !self.draggingSelection)
+                    [self presentSelectionMenuAtPoint:self.lastSelectionMenuPoint];
+            });
+        }
+    }];
+}
+
+- (void)selectLine:(id)sender {
+    if (!self.terminal.loaded)
+        return;
+    [self.terminal.webView evaluateJavaScript:@"exports.selectLine?.()" completionHandler:^(id result, NSError *error) {
+        if ([result isKindOfClass:NSDictionary.class]) {
+            [self applySelectionGeometry:result];
+        }
+        if (self.selectionActive) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (self.selectionActive && !self.draggingSelection)
+                    [self presentSelectionMenuAtPoint:self.lastSelectionMenuPoint];
+            });
+        }
+    }];
+}
+
+- (void)clearTerminalSelection {
+    [self stopSelectionAutoScroll];
+    self.selectionActive = NO;
+    self.draggingSelection = NO;
+    self.draggingHandle = NO;
+    self.activeDragHandle = nil;
+    self.selectedText = nil;
+    self.startSelectionHandle.hidden = YES;
+    self.endSelectionHandle.hidden = YES;
+    [self dismissSelectionMenu];
+    if (self.terminal.loaded) {
+        [self.terminal.webView evaluateJavaScript:@"exports.clearSelection?.()" completionHandler:nil];
+    }
+}
+
+- (void)applySelectionGeometry:(NSDictionary *)geom {
+    BOOL hasSelection = [geom[@"hasSelection"] boolValue];
+    NSString *text = [geom[@"text"] isKindOfClass:NSString.class] ? geom[@"text"] : @"";
+    self.selectionActive = hasSelection;
+    self.selectedText = (hasSelection && text.length > 0) ? text : nil;
+
+    if (self.draggingHandle && [geom[@"activeHandle"] isKindOfClass:NSString.class]) {
+        self.activeDragHandle = geom[@"activeHandle"];
+    }
+
+    if (!hasSelection || self.terminal.webView.superview == nil) {
+        self.startSelectionHandle.hidden = YES;
+        self.endSelectionHandle.hidden = YES;
+        return;
+    }
+
+    BOOL startVisible = [geom[@"startVisible"] boolValue];
+    BOOL endVisible = [geom[@"endVisible"] boolValue];
+
+    CGPoint startTop = [self convertPoint:CGPointMake([geom[@"startX"] doubleValue], [geom[@"startTopY"] doubleValue]) fromView:self.terminal.webView];
+    CGPoint startBottom = [self convertPoint:CGPointMake([geom[@"startX"] doubleValue], [geom[@"startBottomY"] doubleValue]) fromView:self.terminal.webView];
+    [self.startSelectionHandle positionAtX:startTop.x topY:startTop.y bottomY:startBottom.y];
+    self.startSelectionHandle.hidden = !startVisible;
+
+    CGPoint endTop = [self convertPoint:CGPointMake([geom[@"endX"] doubleValue], [geom[@"endTopY"] doubleValue]) fromView:self.terminal.webView];
+    CGPoint endBottom = [self convertPoint:CGPointMake([geom[@"endX"] doubleValue], [geom[@"endBottomY"] doubleValue]) fromView:self.terminal.webView];
+    [self.endSelectionHandle positionAtX:endTop.x topY:endTop.y bottomY:endBottom.y];
+    self.endSelectionHandle.hidden = !endVisible;
+
+    CGPoint menuPt = [self convertPoint:CGPointMake([geom[@"menuX"] doubleValue], [geom[@"menuY"] doubleValue]) fromView:self.terminal.webView];
+    self.lastSelectionMenuPoint = menuPt;
+}
+
+- (void)presentSelectionMenuAtPoint:(CGPoint)point {
+    if (self.window == nil)
+        return;
+    CGFloat minX = MIN(24.0, self.bounds.size.width * 0.5);
+    CGFloat maxX = MAX(minX, self.bounds.size.width - 24.0);
+    CGFloat minY = MIN(24.0, self.bounds.size.height * 0.5);
+    CGFloat maxY = MAX(minY, self.bounds.size.height - 24.0);
+    CGPoint clamped = CGPointMake(MAX(minX, MIN(maxX, point.x)), MAX(minY, MIN(maxY, point.y)));
+
+    if (@available(iOS 16.0, *)) {
+        UIEditMenuConfiguration *config = [UIEditMenuConfiguration configurationWithIdentifier:nil sourcePoint:clamped];
+        [self.terminalEditMenu presentEditMenuWithConfiguration:config];
+    } else {
+        if (!self.isFirstResponder && self.canBecomeFirstResponder) {
+            [self becomeFirstResponder];
+        }
+        [UIMenuController.sharedMenuController showMenuFromView:self rect:CGRectMake(clamped.x, clamped.y, 1, 1)];
+    }
+}
+
+- (void)dismissSelectionMenu {
+    if (@available(iOS 16.0, *)) {
+        [self.terminalEditMenu dismissMenu];
+    } else {
+        [UIMenuController.sharedMenuController hideMenuFromView:self];
+    }
+}
+
+- (void)refreshAndPresentSelectionMenu {
+    if (!self.terminal.loaded)
+        return;
+    [self.terminal.webView evaluateJavaScript:@"exports.selectionGeometry?.()" completionHandler:^(id result, NSError *error) {
+        if ([result isKindOfClass:NSDictionary.class]) {
+            [self applySelectionGeometry:result];
+        }
+        if (self.selectionActive && (!self.startSelectionHandle.hidden || !self.endSelectionHandle.hidden)) {
+            [self presentSelectionMenuAtPoint:self.lastSelectionMenuPoint];
+        }
+    }];
+}
+
+- (void)updateAutoScrollForPointInSelf:(CGPoint)point isHandle:(BOOL)isHandle {
+    CGFloat edge = 36.0;
+    NSInteger direction = 0;
+    if (point.y < edge) {
+        direction = -1;
+    } else if (point.y > self.bounds.size.height - edge) {
+        direction = 1;
+    }
+    self.selectionAutoScrollDirection = direction;
+    self.draggingHandle = isHandle;
+    if (direction == 0) {
+        [self stopSelectionAutoScroll];
+        return;
+    }
+    if (!self.selectionAutoScrollTimer) {
+        __weak TerminalView *weakSelf = self;
+        self.selectionAutoScrollTimer = [NSTimer scheduledTimerWithTimeInterval:0.07 repeats:YES block:^(NSTimer *timer) {
+            TerminalView *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.draggingSelection || strongSelf.selectionAutoScrollDirection == 0) {
+                [timer invalidate];
+                return;
+            }
+            NSInteger delta = strongSelf.selectionAutoScrollDirection;
+            CGPoint pt = strongSelf.lastDragPointInWebView;
+            NSString *script;
+            if (strongSelf.draggingHandle) {
+                script = [NSString stringWithFormat:@"exports.scrollByLines(%ld); exports.moveSelectionHandle(%f,%f)",
+                          (long)delta, pt.x, pt.y];
+            } else {
+                script = [NSString stringWithFormat:@"exports.scrollByLines(%ld); exports.extendSelection(%f,%f)",
+                          (long)delta, pt.x, pt.y];
+            }
+            [strongSelf.terminal.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+                if ([result isKindOfClass:NSDictionary.class]) {
+                    [strongSelf applySelectionGeometry:result];
+                }
+            }];
+        }];
+    }
+}
+
+- (void)stopSelectionAutoScroll {
+    [self.selectionAutoScrollTimer invalidate];
+    self.selectionAutoScrollTimer = nil;
+    self.selectionAutoScrollDirection = 0;
+}
+
+- (void)handleTerminalTap:(UITapGestureRecognizer *)gesture {
+    if (self.selectionActive) {
+        [self clearTerminalSelection];
+        return;
+    }
+    if (!self.isFirstResponder && self.canBecomeFirstResponder) {
+        [self becomeFirstResponder];
+    }
+}
+
+- (void)handleTerminalDoubleTap:(UITapGestureRecognizer *)gesture {
+    if (!self.terminal.loaded)
+        return;
+    CGPoint point = [gesture locationInView:self.terminal.webView];
+    NSString *script = [NSString stringWithFormat:@"exports.selectWordAt(%f,%f)", point.x, point.y];
+    [self.terminal.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+        if ([result isKindOfClass:NSDictionary.class]) {
+            [self applySelectionGeometry:result];
+            if (self.selectionActive) {
+                UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+                [feedback impactOccurred];
+                [self presentSelectionMenuAtPoint:self.lastSelectionMenuPoint];
+            }
+        }
+    }];
 }
 
 - (void)selectTerminalText:(UILongPressGestureRecognizer *)gesture {
     if (!self.terminal.loaded)
         return;
     CGPoint point = [gesture locationInView:self.terminal.webView];
-    if (gesture.state == UIGestureRecognizerStateBegan || gesture.state == UIGestureRecognizerStateChanged) {
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        self.draggingSelection = YES;
+        self.draggingHandle = NO;
         self.scrollbarView.scrollEnabled = NO;
-        NSString *method = gesture.state == UIGestureRecognizerStateBegan ? @"beginSelection" : @"extendSelection";
-        NSString *script = [NSString stringWithFormat:@"exports.%@(%f,%f)", method, point.x, point.y];
-        [self.terminal.webView evaluateJavaScript:script completionHandler:nil];
+        self.lastDragPointInWebView = point;
+        [self dismissSelectionMenu];
+        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+        [feedback impactOccurred];
+        NSString *script = [NSString stringWithFormat:@"exports.beginSelection(%f,%f)", point.x, point.y];
+        [self.terminal.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+            if ([result isKindOfClass:NSDictionary.class]) {
+                [self applySelectionGeometry:result];
+            }
+        }];
+    } else if (gesture.state == UIGestureRecognizerStateChanged) {
+        self.lastDragPointInWebView = point;
+        [self updateAutoScrollForPointInSelf:[gesture locationInView:self] isHandle:NO];
+        NSString *script = [NSString stringWithFormat:@"exports.extendSelection(%f,%f)", point.x, point.y];
+        [self.terminal.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+            if ([result isKindOfClass:NSDictionary.class]) {
+                [self applySelectionGeometry:result];
+            }
+        }];
     } else if (gesture.state == UIGestureRecognizerStateEnded) {
+        [self stopSelectionAutoScroll];
+        self.draggingSelection = NO;
         self.scrollbarView.scrollEnabled = YES;
-        [self becomeFirstResponder];
-        CGPoint anchor = [gesture locationInView:self];
-        if (@available(iOS 16.0, *)) {
-            [self.terminalEditMenu presentEditMenuWithConfiguration:[UIEditMenuConfiguration configurationWithIdentifier:nil sourcePoint:anchor]];
-        } else {
-            [UIMenuController.sharedMenuController showMenuFromView:self rect:CGRectMake(anchor.x, anchor.y, 1, 1)];
-        }
+        CGPoint fallbackAnchor = [gesture locationInView:self];
+        [self.terminal.webView evaluateJavaScript:@"exports.selectionGeometry?.()" completionHandler:^(id result, NSError *error) {
+            if ([result isKindOfClass:NSDictionary.class]) {
+                [self applySelectionGeometry:result];
+            }
+            CGPoint anchor = self.selectionActive ? self.lastSelectionMenuPoint : fallbackAnchor;
+            [self presentSelectionMenuAtPoint:anchor];
+        }];
     } else if (gesture.state == UIGestureRecognizerStateCancelled || gesture.state == UIGestureRecognizerStateFailed) {
+        [self stopSelectionAutoScroll];
+        self.draggingSelection = NO;
         self.scrollbarView.scrollEnabled = YES;
     }
 }
 
+- (void)panSelectionHandle:(UIPanGestureRecognizer *)gesture {
+    if (!self.terminal.loaded || ![gesture.view isKindOfClass:LRTerminalSelectionHandle.class])
+        return;
+    LRTerminalSelectionHandle *handle = (LRTerminalSelectionHandle *)gesture.view;
+    CGPoint touchInWeb = [gesture locationInView:self.terminal.webView];
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        self.draggingSelection = YES;
+        self.draggingHandle = YES;
+        self.scrollbarView.scrollEnabled = NO;
+        NSString *which = handle.isStart ? @"start" : @"end";
+        self.activeDragHandle = which;
+        CGPoint anchorInWeb = [self convertPoint:handle.center toView:self.terminal.webView];
+        self.handleDragOffset = CGPointMake(anchorInWeb.x - touchInWeb.x, anchorInWeb.y - touchInWeb.y);
+        [self dismissSelectionMenu];
+        UISelectionFeedbackGenerator *feedback = [UISelectionFeedbackGenerator new];
+        [feedback selectionChanged];
+        NSString *script = [NSString stringWithFormat:@"exports.beginSelectionHandle('%@')", which];
+        [self.terminal.webView evaluateJavaScript:script completionHandler:nil];
+    } else if (gesture.state == UIGestureRecognizerStateChanged) {
+        CGPoint targetInWeb = CGPointMake(touchInWeb.x + self.handleDragOffset.x, touchInWeb.y + self.handleDragOffset.y);
+        self.lastDragPointInWebView = targetInWeb;
+        [self updateAutoScrollForPointInSelf:[gesture locationInView:self] isHandle:YES];
+        NSString *script = [NSString stringWithFormat:@"exports.moveSelectionHandle(%f,%f)", targetInWeb.x, targetInWeb.y];
+        [self.terminal.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+            if ([result isKindOfClass:NSDictionary.class]) {
+                [self applySelectionGeometry:result];
+            }
+        }];
+    } else if (gesture.state == UIGestureRecognizerStateEnded ||
+               gesture.state == UIGestureRecognizerStateCancelled ||
+               gesture.state == UIGestureRecognizerStateFailed) {
+        [self stopSelectionAutoScroll];
+        self.draggingSelection = NO;
+        self.draggingHandle = NO;
+        self.activeDragHandle = nil;
+        self.scrollbarView.scrollEnabled = YES;
+        [self.terminal.webView evaluateJavaScript:@"exports.endSelectionHandle?.(); exports.selectionGeometry?.()" completionHandler:^(id result, NSError *error) {
+            if ([result isKindOfClass:NSDictionary.class]) {
+                [self applySelectionGeometry:result];
+            }
+            if (self.selectionActive) {
+                [self presentSelectionMenuAtPoint:self.lastSelectionMenuPoint];
+            }
+        }];
+    }
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    if (touch.view == self.startSelectionHandle || touch.view == self.endSelectionHandle) {
+        return NO;
+    }
+    return YES;
+}
+
 - (UIMenu *)editMenuInteraction:(UIEditMenuInteraction *)interaction menuForConfiguration:(UIEditMenuConfiguration *)configuration suggestedActions:(NSArray<UIMenuElement *> *)suggestedActions API_AVAILABLE(ios(16.0)) {
     __weak TerminalView *view = self;
-    UIAction *copy = [UIAction actionWithTitle:@"Copy" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction *action) { [view copy:nil]; }];
-    UIAction *selectAll = [UIAction actionWithTitle:@"Select All" image:nil identifier:nil handler:^(UIAction *action) { [view selectAll:nil]; }];
-    return [UIMenu menuWithChildren:@[copy, selectAll]];
+    NSMutableArray<UIMenuElement *> *actions = [NSMutableArray array];
+    if (self.selectedText.length > 0) {
+        [actions addObject:[UIAction actionWithTitle:@"Copy" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction *action) { [view copy:nil]; }]];
+    }
+    if (UIPasteboard.generalPasteboard.hasStrings) {
+        [actions addObject:[UIAction actionWithTitle:@"Paste" image:[UIImage systemImageNamed:@"doc.on.clipboard"] identifier:nil handler:^(UIAction *action) { [view paste:nil]; }]];
+    }
+    if (self.selectedText.length > 0) {
+        [actions addObject:[UIAction actionWithTitle:@"Select Line" image:nil identifier:nil handler:^(UIAction *action) { [view selectLine:nil]; }]];
+        NSString *trimmed = [self.selectedText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (([trimmed hasPrefix:@"http://"] || [trimmed hasPrefix:@"https://"]) &&
+            [trimmed rangeOfCharacterFromSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].location == NSNotFound) {
+            [actions addObject:[UIAction actionWithTitle:@"Open Link" image:[UIImage systemImageNamed:@"safari"] identifier:nil handler:^(UIAction *action) {
+                [UIApplication openURL:trimmed];
+                [view clearTerminalSelection];
+            }]];
+        }
+    }
+    [actions addObject:[UIAction actionWithTitle:@"Select All" image:nil identifier:nil handler:^(UIAction *action) { [view selectAll:nil]; }]];
+    return [UIMenu menuWithChildren:actions];
 }
 
 - (void)clearScrollback:(UIKeyCommand *)command {

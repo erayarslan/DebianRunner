@@ -609,7 +609,8 @@ session_failed:
                     __weak typeof(self) weak = self;
                     b.menu = [UIMenu menuWithTitle:@"" children:@[
                         [UIAction actionWithTitle:@"Paste" image:[UIImage systemImageNamed:@"doc.on.clipboard"] identifier:nil handler:^(UIAction *a) { [weak.termView paste:nil]; }],
-                        [UIAction actionWithTitle:@"Copy Selection" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction *a) { [weak.termView copy:nil]; }]]];
+                        [UIAction actionWithTitle:@"Copy Selection" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction *a) { [weak.termView copy:nil]; }],
+                        [UIAction actionWithTitle:@"Select All" image:[UIImage systemImageNamed:@"selection.pin.in.out"] identifier:nil handler:^(UIAction *a) { [weak.termView selectAll:nil]; }]]];
                     b.showsMenuAsPrimaryAction = YES;
                 } else [b addTarget:self action:@selector(hideKeyboard:) forControlEvents:UIControlEventTouchUpInside];
                 [line addArrangedSubview:b]; continue;
