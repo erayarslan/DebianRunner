@@ -107,7 +107,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-${{ github.run_number }}
-          retention-days: 30
+          retention-days: 1
           path: |
             build/releases/${{ env.ARTIFACT_NAME }}.ipa
             build/releases/${{ env.ARTIFACT_NAME }}.ipa.sha256
@@ -120,7 +120,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-logs-${{ github.run_number }}
-          retention-days: 7
+          retention-days: 1
           if-no-files-found: ignore
           path: |
             build/releases/archive.log
