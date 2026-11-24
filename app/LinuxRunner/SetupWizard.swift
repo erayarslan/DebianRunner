@@ -19,6 +19,7 @@ struct SetupWizardView: View {
     @State private var password = ""
     @State private var confirmation = ""
     @State private var administrator = true
+    @State private var passwordlessSudo = true
     @State private var working: String?
     @State private var problem: String?
     private var step: SetupStep { SetupStep(rawValue: stepRaw) ?? .welcome }
@@ -148,6 +149,9 @@ struct SetupWizardView: View {
                 SecureField("Password", text: $password).textContentType(.newPassword)
                 SecureField("Confirm password", text: $confirmation).textContentType(.newPassword)
                 Toggle("Administrator (can use sudo)", isOn: $administrator)
+                if administrator {
+                    Toggle("Passwordless sudo (NOPASSWD)", isOn: $passwordlessSudo)
+                }
                 Button("Create Account") { createAccount() }
                     .disabled(working != nil || username.isEmpty || password.isEmpty || password != confirmation)
                 if !confirmation.isEmpty && password != confirmation {
@@ -225,7 +229,7 @@ struct SetupWizardView: View {
     private func createAccount() {
         problem = nil
         working = "Preparing"
-        LRRuntimeBridge.createLinuxUser(username, password: password, administrator: administrator, progress: { working = $0 }) { error in
+        LRRuntimeBridge.createLinuxUser(username, password: password, administrator: administrator, passwordlessSudo: administrator && passwordlessSudo, progress: { working = $0 }) { error in
             working = nil
             if let error { problem = error.localizedDescription; return }
             password = ""; confirmation = ""

@@ -1182,9 +1182,12 @@ static NSArray<NSString *> *LRLoginCommand(NSString *name, NSError **error) {
     NSArray *command = LRLoginCommand(name, error);
     return command ? [self terminalForCommand:command directory:@"/"] : nil;
 }
-+ (TerminalViewController *)createLinuxUser:(NSString *)name error:(NSError **)error { return [self createLinuxUser:name administrator:NO error:error]; }
++ (TerminalViewController *)createLinuxUser:(NSString *)name error:(NSError **)error { return [self createLinuxUser:name administrator:YES passwordlessSudo:YES error:error]; }
 + (BOOL)canGrantAdministrator { return LRAccountTool(@[@"/usr/bin/sudo", @"/bin/sudo"]) != nil; }
 + (TerminalViewController *)createLinuxUser:(NSString *)name administrator:(BOOL)administrator error:(NSError **)error {
+    return [self createLinuxUser:name administrator:administrator passwordlessSudo:administrator error:error];
+}
++ (TerminalViewController *)createLinuxUser:(NSString *)name administrator:(BOOL)administrator passwordlessSudo:(BOOL)passwordlessSudo error:(NSError **)error {
     if (!lr_linux_account_name_valid(name.UTF8String) || [name isEqual:@"root"]) {
         if (error) *error=lrError(EINVAL, @"Use 1–32 lowercase ASCII letters, digits, underscores or hyphens, starting with a letter or underscore."); return nil;
     }
@@ -1195,6 +1198,15 @@ static NSArray<NSString *> *LRLoginCommand(NSString *name, NSError **error) {
     if (administrator) {
         if (!self.canGrantAdministrator) { if(error)*error=lrError(ENOENT, @"sudo is not installed in this environment; install it first, or create the user without administrator access."); return nil; }
         grant=@" && { getent group sudo >/dev/null || groupadd --system sudo; } && usermod -aG sudo -- \"$1\"";
+        if (passwordlessSudo) {
+            grant=[grant stringByAppendingString:
+                @" && mkdir -p /etc/sudoers.d && chmod 750 /etc/sudoers.d"
+                " && printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\\n' \"$1\" > \"/etc/sudoers.d/90-debianrunner-$1.tmp\""
+                " && chmod 440 \"/etc/sudoers.d/90-debianrunner-$1.tmp\""
+                " && { chown 0:0 \"/etc/sudoers.d/90-debianrunner-$1.tmp\" 2>/dev/null || true; }"
+                " && { ! command -v visudo >/dev/null 2>&1 || visudo -cf \"/etc/sudoers.d/90-debianrunner-$1.tmp\" >/dev/null || { rm -f \"/etc/sudoers.d/90-debianrunner-$1.tmp\"; exit 1; }; }"
+                " && mv -f \"/etc/sudoers.d/90-debianrunner-$1.tmp\" \"/etc/sudoers.d/90-debianrunner-$1\""];
+        }
     }
     NSString *script=[NSString stringWithFormat:@"\"$2\" --create-home --shell /bin/bash -- \"$1\"%@ && exec \"$3\" \"$1\"", grant];
     return [self terminalForCommand:@[@"/bin/sh", @"-c", script, @"linuxrunner-create-user", name, create, passwd] directory:@"/"];
@@ -1226,16 +1238,32 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
 }
 + (void)createLinuxUser:(NSString *)name password:(NSString *)password administrator:(BOOL)administrator
                progress:(void (^)(NSString *))progress completion:(void (^)(NSError *))completion {
+    [self createLinuxUser:name password:password administrator:administrator passwordlessSudo:administrator progress:progress completion:completion];
+}
++ (void)createLinuxUser:(NSString *)name password:(NSString *)password administrator:(BOOL)administrator passwordlessSudo:(BOOL)passwordlessSudo
+               progress:(void (^)(NSString *))progress completion:(void (^)(NSError *))completion {
     if (!lr_linux_account_name_valid(name.UTF8String) || [name isEqual:@"root"]) { completion(lrError(EINVAL, @"Use 1–32 lowercase letters, digits, - or _, starting with a letter.")); return; }
     if (password.length < 4) { completion(lrError(EINVAL, @"Use a password of at least 4 characters.")); return; }
     for (NSDictionary *account in self.linuxAccounts) if ([account[@"name"] isEqual:name]) { completion(lrError(EEXIST, @"That Linux account already exists; choose it under Existing Accounts.")); return; }
     char salt[17], hash[160];
     if (lr_random_salt(salt) || lr_sha512_crypt(password.UTF8String, salt, hash, sizeof hash)) { completion(lrError(EIO, @"The password could not be prepared.")); return; }
     NSString *hashed = @(hash); memset(hash, 0, sizeof hash);
+    BOOL grantNopasswd = administrator && passwordlessSudo;
     void (^create)(void) = ^{
         progress(@"Creating your account");
-        NSString *grant = !administrator ? @"" :
-            @"{ getent group sudo >/dev/null || groupadd --system sudo; }; usermod -aG sudo -- \"$1\"\n";
+        NSString *grant = @"";
+        if (administrator) {
+            grant = @"{ getent group sudo >/dev/null || groupadd --system sudo; }; usermod -aG sudo -- \"$1\"\n";
+            if (grantNopasswd) {
+                grant = [grant stringByAppendingString:
+                    @"mkdir -p /etc/sudoers.d && chmod 750 /etc/sudoers.d\n"
+                    "printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\\n' \"$1\" > \"/etc/sudoers.d/90-debianrunner-$1.tmp\"\n"
+                    "chmod 440 \"/etc/sudoers.d/90-debianrunner-$1.tmp\"\n"
+                    "chown 0:0 \"/etc/sudoers.d/90-debianrunner-$1.tmp\" 2>/dev/null || true\n"
+                    "if command -v visudo >/dev/null 2>&1; then visudo -cf \"/etc/sudoers.d/90-debianrunner-$1.tmp\" >/dev/null || { rm -f \"/etc/sudoers.d/90-debianrunner-$1.tmp\"; exit 1; }; fi\n"
+                    "mv -f \"/etc/sudoers.d/90-debianrunner-$1.tmp\" \"/etc/sudoers.d/90-debianrunner-$1\"\n"];
+            }
+        }
         NSString *script = [NSString stringWithFormat:@"set -e\nstty -echo 2>/dev/null || true\n"
             "useradd --create-home --shell /bin/bash -- \"$1\"\n"
             "%@IFS= read -r hash\nprintf '%%s:%%s\\n' \"$1\" \"$hash\" | chpasswd -e\n", grant];
@@ -1250,7 +1278,7 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
                 if (fields.count > 1 && [fields[0] isEqual:name] && [fields[1] isEqual:hashed]) stored = YES;
             }
             BOOL exists = NO; for (NSDictionary *account in self.linuxAccounts) if ([account[@"name"] isEqual:name]) exists = YES;
-            [self logCategory:@"ACCOUNT" event:[NSString stringWithFormat:@"native create user=%@ admin=%d ended=%d exists=%d password_set=%d", name, administrator, ended, exists, stored]];
+            [self logCategory:@"ACCOUNT" event:[NSString stringWithFormat:@"native create user=%@ admin=%d nopasswd=%d ended=%d exists=%d password_set=%d", name, administrator, grantNopasswd, ended, exists, stored]];
             if (exists && stored) completion(nil);
             else completion(lrError(EIO, exists ? @"The account was created but its password could not be set. Set it in Linux Users." : @"The account could not be created. Details are in Runtime Diagnostics (ACCOUNT)."));
         });
@@ -1640,7 +1668,7 @@ static NSCountedSet<NSString *> *LRAwakeSet;
     }
     NSString *remove = LRAccountTool(@[@"/usr/sbin/userdel", @"/usr/bin/userdel"]);
     if (!remove) { if(error)*error=lrError(ENOENT,@"Debian's account-removal tool (userdel) is missing. Install passwd first."); return nil; }
-    return [self terminalForCommand:@[remove,@"--",name] directory:@"/"];
+    return [self terminalForCommand:@[@"/bin/sh", @"-c", @"\"$2\" -- \"$1\" && rm -f \"/etc/sudoers.d/90-debianrunner-$1\"", @"linuxrunner-remove-user", name, remove] directory:@"/"];
 }
 + (TerminalViewController *)terminalForCommand:(NSArray<NSString *> *)command directory:(NSString *)directory {
     TerminalViewController *vc = [[UIStoryboard storyboardWithName:@"Terminal" bundle:nil] instantiateInitialViewController];

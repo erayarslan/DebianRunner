@@ -102,11 +102,15 @@ void LRSetDatalessMaterialization(void);
 + (NSArray<NSString *> * _Nullable)defaultLinuxLoginCommand:(NSError **)error;
 + (TerminalViewController * _Nullable)createLinuxUser:(NSString *)name error:(NSError **)error;
 + (TerminalViewController * _Nullable)createLinuxUser:(NSString *)name administrator:(BOOL)administrator error:(NSError **)error;
++ (TerminalViewController * _Nullable)createLinuxUser:(NSString *)name administrator:(BOOL)administrator passwordlessSudo:(BOOL)passwordlessSudo error:(NSError **)error;
 + (BOOL)canGrantAdministrator;
 // Native account setup (no terminal): installs missing account tools/sudo,
-// creates the user, sets the password from an app-side SHA-512 crypt hash and
-// verifies it in /etc/shadow. Completion and progress run on the main thread.
+// creates the user, optionally writes a validated /etc/sudoers.d NOPASSWD
+// drop-in, sets the password from an app-side SHA-512 crypt hash and verifies
+// it in /etc/shadow. Completion and progress run on the main thread.
 + (void)createLinuxUser:(NSString *)name password:(NSString *)password administrator:(BOOL)administrator
+               progress:(void (^)(NSString *message))progress completion:(void (^)(NSError * _Nullable error))completion;
++ (void)createLinuxUser:(NSString *)name password:(NSString *)password administrator:(BOOL)administrator passwordlessSudo:(BOOL)passwordlessSudo
                progress:(void (^)(NSString *message))progress completion:(void (^)(NSError * _Nullable error))completion;
 + (BOOL)accountToolsPresent;
 + (void)setLinuxPassword:(NSString *)name password:(NSString *)password progress:(void (^)(NSString *message))progress completion:(void (^)(NSError * _Nullable error))completion;

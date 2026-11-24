@@ -18,7 +18,7 @@ When no Debian environment is installed yet, the setup wizard opens automaticall
    - Every package is checked against the bundled `DebianSupport.bundle/manifest.json` (`manifest.sha256` and Debian's signed `InRelease`).
    - Verified packages are assembled locally into a root filesystem archive and imported into an isolated `fakefs` root.
 3. On first launch, DebianRunner boots the newly installed Debian minimal runtime automatically (if another environment was already booted in the same app session, close and reopen DebianRunner when prompted).
-4. On **Your Account**, create a regular Linux user (with optional `sudo` administrator access) or choose **Continue as root (Skip)**.
+4. On **Your Account**, create a regular Linux user (with passwordless `sudo` administrator access enabled by default) or choose **Continue as root (Skip)**.
 5. Tap **Open Terminal** to launch a Debian bash shell.
 
 First-boot package configuration (`dpkg --configure -a` and CA trust-store generation) runs automatically via `/usr/lib/linuxrunner/initialize-debian.sh`. Managed package and account operations wait for it to finish cleanly.

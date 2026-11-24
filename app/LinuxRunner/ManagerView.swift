@@ -237,13 +237,14 @@ private struct LinuxUsersView: View {
     @State private var removeName = ""
     @State private var newPassword = ""
     @State private var newConfirmation = ""
-    @State private var newAdministrator = false
+    @State private var newAdministrator = true
+    @State private var newPasswordlessSudo = true
     @State private var creating: String?
     @State private var passwordFor: PasswordTarget?
     private var running: Bool { LRRuntimeBridge.isRunning() }
     private func createNative() {
         error = nil; creating = "Preparing"
-        LRRuntimeBridge.createLinuxUser(username, password: newPassword, administrator: newAdministrator, progress: { creating = $0 }) { failure in
+        LRRuntimeBridge.createLinuxUser(username, password: newPassword, administrator: newAdministrator, passwordlessSudo: newAdministrator && newPasswordlessSudo, progress: { creating = $0 }) { failure in
             creating = nil
             if let failure { error = failure.localizedDescription; return }
             newPassword = ""; newConfirmation = ""; username = ""; refresh()
@@ -280,6 +281,9 @@ private struct LinuxUsersView: View {
                 SecureField("Password", text: $newPassword).textContentType(.newPassword)
                 SecureField("Confirm password", text: $newConfirmation).textContentType(.newPassword)
                 Toggle("Administrator (can use sudo)", isOn: $newAdministrator)
+                if newAdministrator {
+                    Toggle("Passwordless sudo (NOPASSWD)", isOn: $newPasswordlessSudo)
+                }
                 Button("Create Account") { createNative() }
                     .disabled(!running || creating != nil || username.isEmpty || newPassword.isEmpty || newPassword != newConfirmation)
                 if let creating { HStack(spacing: 10) { ProgressView(); Text(creating) } }
