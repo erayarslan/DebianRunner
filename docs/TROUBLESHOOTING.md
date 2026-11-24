@@ -14,7 +14,7 @@ Repair executes Debian's native `dpkg`/`apt-get` tools and saves a `/var/lib/dpk
 
 ## Debian Minimal Installation Fails or Stops
 
-Keep DebianRunner in the foreground and check network access to `deb.debian.org`, device date/time, and at least 1 GB of free storage. Verified `.deb` downloads are cached so **Try Again** resumes without re-downloading verified packages.
+Keep DebianRunner in the foreground and check network access to `mirror.rabisu.com` / `ftp.linux.org.tr` / `deb.debian.org`, device date/time, and at least 1 GB of free storage. Verified `.deb` downloads are cached so **Try Again** resumes without re-downloading verified packages.
 
 If **Restart DebianRunner** appears (for example when installing a second environment while another is running), swipe DebianRunner away in the app switcher and reopen it to resume setup.
 

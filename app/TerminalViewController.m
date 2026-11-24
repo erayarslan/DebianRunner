@@ -585,20 +585,20 @@ session_failed:
     self.barButtonWidth.constant = buttonWidth;
 }
 
-// LinuxRunner's terminal keys (replaces iSH's bar): the classic two rows,
-//   ESC  /  -  HOME  ^  END  PGUP  ~  clipboard
-//   TAB CTRL ALT  <   v   >  PGDN  |  hide
+// DebianRunner's terminal keys: two spacious rows of 6 keys (removed /, -, HOME, END, PGUP, PGDN):
+//   ESC   TAB    ~    ↑    |   CLIP
+//   CTRL  ALT    ←    ↓    →   HIDE
 // plain labels on black; Ctrl and Alt latch for the next key and turn blue.
 - (UIView *)linuxKeyBar {
     static const void *key = &key;
     UIView *bar = objc_getAssociatedObject(self, key);
     if (bar) return bar;
-    bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 92)];
+    bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 86)];
     bar.backgroundColor = UIColor.blackColor; bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     UIStackView *grid = [UIStackView new]; grid.axis = UILayoutConstraintAxisVertical; grid.distribution = UIStackViewDistributionFillEqually; grid.translatesAutoresizingMaskIntoConstraints = NO;
     [bar addSubview:grid];
-    [NSLayoutConstraint activateConstraints:@[[grid.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:2], [grid.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-2], [grid.topAnchor constraintEqualToAnchor:bar.topAnchor constant:2], [grid.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor constant:-2]]];
-    NSArray *rows = @[@[@"ESC", @"/", @"-", @"HOME", @"↑", @"END", @"PGUP", @"~", @"CLIP"], @[@"TAB", @"CTRL", @"ALT", @"←", @"↓", @"→", @"PGDN", @"|", @"HIDE"]];
+    [NSLayoutConstraint activateConstraints:@[[grid.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:4], [grid.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-4], [grid.topAnchor constraintEqualToAnchor:bar.topAnchor constant:2], [grid.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor constant:-2]]];
+    NSArray *rows = @[@[@"ESC", @"TAB", @"~", @"↑", @"|", @"CLIP"], @[@"CTRL", @"ALT", @"←", @"↓", @"→", @"HIDE"]];
     for (NSArray *row in rows) {
         UIStackView *line = [UIStackView new]; line.distribution = UIStackViewDistributionFillEqually; [grid addArrangedSubview:line];
         for (NSString *label in row) {
@@ -639,13 +639,13 @@ session_failed:
         button.selected = !button.selected;   // blue label while latched; cleared after one key
         return;
     }
-    NSDictionary *sequences = @{@"ESC": @"\x1b", @"TAB": @"\t", @"HOME": @"\x1b[H", @"END": @"\x1b[F", @"PGUP": @"\x1b[5~", @"PGDN": @"\x1b[6~"};
+    NSDictionary *sequences = @{@"ESC": @"\x1b", @"TAB": @"\t"};
     if ([label isEqualToString:@"↑"]) [self pressKey:[self.terminal arrow:'A']];
     else if ([label isEqualToString:@"↓"]) [self pressKey:[self.terminal arrow:'B']];
     else if ([label isEqualToString:@"←"]) [self pressKey:[self.terminal arrow:'D']];
     else if ([label isEqualToString:@"→"]) [self pressKey:[self.terminal arrow:'C']];
     else if (sequences[label]) [self.terminal sendInput:[sequences[label] dataUsingEncoding:NSUTF8StringEncoding]];
-    else [self pressKey:label];   // "/", "-", "~", "|": through Ctrl/Alt latches like typed text
+    else [self pressKey:label];   // "~", "|": through Ctrl/Alt latches like typed text
 }
 - (void)hideKeyboard:(id)sender { [self.termView resignFirstResponder]; }
 - (IBAction)pressEscape:(id)sender {

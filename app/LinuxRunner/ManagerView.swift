@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 import GameController
 import Network
 import Darwin
+import os
 
 @MainActor final class EnvironmentManager: ObservableObject {
     @Published var environments: [LinuxEnvironment] = []
@@ -2583,12 +2584,16 @@ private enum TaskStyle {
 
 private struct GuestProcess: Identifiable {
     let id: Int, ppid: Int, uid: Int, name: String, state: String, threads: Int
-    let cpuMs: Int, privateKB: Int, sharedKB: Int, mappedKB: Int
+    let cpuMs: Int, cpuUs: Int, privateKB: Int, sharedKB: Int, mappedKB: Int
     var cpuPercent: Double = 0
+    /// Private mapped memory (anonymous heap/stack + private file/ELF mappings, excluding MAP_SHARED).
+    var residentKB: Int { max(mappedKB - sharedKB, privateKB) }
     init(_ d: [String: Any]) {
         id = d["pid"] as? Int ?? 0; ppid = d["ppid"] as? Int ?? 0; uid = d["uid"] as? Int ?? 0
         name = d["name"] as? String ?? "?"; state = d["state"] as? String ?? "?"; threads = d["threads"] as? Int ?? 0
-        cpuMs = d["cpu_ms"] as? Int ?? 0; privateKB = d["anonymous_kb"] as? Int ?? 0
+        cpuMs = d["cpu_ms"] as? Int ?? 0
+        cpuUs = d["cpu_us"] as? Int ?? (cpuMs * 1000)
+        privateKB = d["anonymous_kb"] as? Int ?? 0
         sharedKB = d["shared_kb"] as? Int ?? 0; mappedKB = d["mapped_kb"] as? Int ?? 0
     }
     var stateName: String { ["R": "Running", "S": "Sleeping", "T": "Stopped", "Z": "Zombie"][state] ?? state }
@@ -2597,23 +2602,57 @@ private struct GuestProcess: Identifiable {
 @MainActor private final class TaskSampler: ObservableObject {
     @Published var processes: [GuestProcess] = []
     @Published var cpuHistory: [Double] = []
+    @Published var appMemoryHistory: [Double] = []
+    @Published var guestMemoryHistory: [Double] = []
     @Published var memoryHistory: [Double] = []
     @Published var footprint: UInt64 = 0
-    private var previous: [Int: Int] = [:]
-    private var previousTime = Date()
+    @Published var iosAllowanceBytes: UInt64 = 0
+    private var previousUs: [Int: Int] = [:]
+    private var previousTime = Date.distantPast
+    private var hasBaseline = false
     static let interval = 2.0
     func sample() {
-        let now = Date(), elapsedMs = max(now.timeIntervalSince(previousTime) * 1000, 1)
+        let now = Date()
+        let elapsedUs = hasBaseline ? now.timeIntervalSince(previousTime) * 1_000_000 : 0
+        let resetBaseline = !hasBaseline || elapsedUs <= 50_000 || elapsedUs > 10_000_000
         var list = LRRuntimeBridge.taskSnapshot().map(GuestProcess.init)
-        for i in list.indices {
-            if let before = previous[list[i].id] { list[i].cpuPercent = max(0, Double(list[i].cpuMs - before) / elapsedMs * 100) }
+        if !resetBaseline {
+            for i in list.indices {
+                let deltaUs: Int
+                if let before = previousUs[list[i].id] {
+                    deltaUs = max(0, list[i].cpuUs - before)
+                } else {
+                    deltaUs = max(0, list[i].cpuUs)
+                }
+                let maxPct = Double(max(1, list[i].threads)) * 100.0
+                list[i].cpuPercent = min(maxPct, Double(deltaUs) / elapsedUs * 100.0)
+            }
         }
-        previous = Dictionary(uniqueKeysWithValues: list.map { ($0.id, $0.cpuMs) })
+        previousUs = Dictionary(uniqueKeysWithValues: list.map { ($0.id, $0.cpuUs) })
         previousTime = now
+        let wasFirst = !hasBaseline
+        hasBaseline = true
         processes = list
         footprint = LRRuntimeBridge.appFootprintBytes()
-        cpuHistory = Array((cpuHistory + [list.reduce(0) { $0 + $1.cpuPercent }]).suffix(60))
-        memoryHistory = Array((memoryHistory + [Double(list.reduce(0) { $0 + $1.privateKB }) / 1024]).suffix(60))
+        let available = UInt64(os_proc_available_memory())
+        iosAllowanceBytes = available > 0 ? (footprint + available) : 0
+        let totalCPU = list.reduce(0) { $0 + $1.cpuPercent }
+        let appMB = Double(footprint) / 1_048_576.0
+        let guestMappedMB = Double(list.reduce(0) { $0 + $1.residentKB }) / 1024.0
+        let guestAnonMB = Double(list.reduce(0) { $0 + $1.privateKB }) / 1024.0
+        if !resetBaseline || cpuHistory.isEmpty {
+            cpuHistory = Array((cpuHistory + [totalCPU]).suffix(60))
+        }
+        appMemoryHistory = Array((appMemoryHistory + [appMB]).suffix(60))
+        guestMemoryHistory = Array((guestMemoryHistory + [guestMappedMB]).suffix(60))
+        memoryHistory = Array((memoryHistory + [guestAnonMB]).suffix(60))
+        if wasFirst {
+            // Take a quick follow-up sample so CPU % populates immediately instead of waiting 2 seconds.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                guard let self, UIApplication.shared.applicationState == .active else { return }
+                self.sample()
+            }
+        }
     }
 }
 
@@ -2700,7 +2739,7 @@ struct TaskManagerView: View {
     private var shown: [GuestProcess] {
         let filtered = search.isEmpty ? sampler.processes : sampler.processes.filter { $0.name.localizedCaseInsensitiveContains(search) || String($0.id) == search }
         switch sort {
-        case 1: return filtered.sorted { $0.privateKB > $1.privateKB }
+        case 1: return filtered.sorted { $0.residentKB > $1.residentKB }
         case 2: return filtered.sorted { $0.id < $1.id }
         case 3: return filtered.sorted { $0.name.lowercased() < $1.name.lowercased() }
         default: return filtered.sorted { $0.cpuPercent > $1.cpuPercent }
@@ -2708,7 +2747,10 @@ struct TaskManagerView: View {
     }
     private var totalCPU: Double { sampler.cpuHistory.last ?? 0 }
     private var privateKB: Double { Double(sampler.processes.reduce(0) { $0 + $1.privateKB }) }
+    private var guestMappedKB: Double { Double(sampler.processes.reduce(0) { $0 + $1.residentKB }) }
+    private var appFootprintKB: Double { Double(sampler.footprint) / 1024.0 }
     private var memoryLimitKB: Double {
+        if sampler.iosAllowanceBytes > 0 { return Double(sampler.iosAllowanceBytes) / 1024.0 }
         let configured = Double(ProcessInfo.processInfo.environment["LINUXRUNNER_MEMORY_MB"] ?? "") ?? 0
         return (configured > 0 ? configured : 4096) * 1024
     }
@@ -2771,23 +2813,29 @@ struct TaskManagerView: View {
         .frame(maxWidth: .infinity, alignment: .leading).padding(14)
         .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(TaskStyle.panel))
     }
-    private static func bytes(_ kb: Double) -> String { kb >= 1024 * 1024 ? String(format: "%.1f GB", kb / 1048576) : kb >= 1024 ? String(format: "%.0f MB", kb / 1024) : String(format: "%.0f KB", kb) }
+    private static func bytes(_ kb: Double) -> String {
+        if kb >= 1024 * 1024 { return String(format: "%.2f GB", kb / 1048576) }
+        if kb >= 1024 * 100 { return String(format: "%.0f MB", kb / 1024) }
+        if kb >= 1024 { return String(format: "%.1f MB", kb / 1024) }
+        return String(format: "%.0f KB", kb)
+    }
 
     private var overview: some View {
         let execution = LRRuntimeBridge.executionBackendStatus()
         let jit = (execution["active"] as? String) == "jit"
         let rootName = LRRuntimeBridge.activeRootName()
+        let ringMemKB = sampler.footprint > 0 ? appFootprintKB : guestMappedKB
         return ScrollView { VStack(spacing: 12) {
             card("Debian minimal right now", systemImage: "waveform.path.ecg") {
                 HStack {
-                    RingGauge(fraction: totalCPU / (cores * 100), value: String(format: "%.0f%%", totalCPU), label: String(format: "CPU · %.0f cores = %.0f%%", cores, cores * 100), colors: [TaskStyle.frost, Color(red: 0.55, green: 0.45, blue: 1)])
-                    RingGauge(fraction: privateKB / memoryLimitKB, value: Self.bytes(privateKB), label: "Memory · of \(Self.bytes(memoryLimitKB))", colors: [TaskStyle.green, Color(red: 0.3, green: 0.8, blue: 0.85)])
+                    RingGauge(fraction: totalCPU / (cores * 100), value: String(format: totalCPU < 10 && totalCPU > 0 ? "%.1f%%" : "%.0f%%", totalCPU), label: String(format: "CPU · %.0f cores = %.0f%%", cores, cores * 100), colors: [TaskStyle.frost, Color(red: 0.55, green: 0.45, blue: 1)])
+                    RingGauge(fraction: ringMemKB / max(memoryLimitKB, 1), value: Self.bytes(ringMemKB), label: "App RAM · of \(Self.bytes(memoryLimitKB))", colors: [TaskStyle.green, Color(red: 0.3, green: 0.8, blue: 0.85)])
                 }
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
                 tile("\(sampler.processes.count)", "Processes", "square.stack.3d.up.fill", TaskStyle.frost)
                 tile("\(sampler.processes.reduce(0) { $0 + $1.threads })", "Threads", "point.3.connected.trianglepath.dotted", Color(red: 0.75, green: 0.45, blue: 1))
-                tile(sampler.footprint > 0 ? Self.bytes(Double(sampler.footprint) / 1024) : "—", "App memory (iOS)", "memorychip", TaskStyle.yellow)
+                tile(Self.bytes(guestMappedKB), "Linux mapped", "memorychip", TaskStyle.yellow)
                 tile(jit ? "JIT" : "Interpreter", "Execution", jit ? "bolt.fill" : "cpu", jit ? TaskStyle.green : TaskStyle.frost)
             }
             card("Top processes", systemImage: "flame.fill") {
@@ -2824,7 +2872,7 @@ struct TaskManagerView: View {
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 3) {
                 Text(String(format: "%.1f%%", p.cpuPercent)).foregroundColor(p.cpuPercent > 50 ? TaskStyle.yellow : TaskStyle.frost).font(.callout.monospacedDigit().weight(.semibold))
-                Text(Self.bytes(Double(p.privateKB))).font(.caption.monospacedDigit()).foregroundColor(TaskStyle.dim)
+                Text(Self.bytes(Double(p.residentKB))).font(.caption.monospacedDigit()).foregroundColor(TaskStyle.dim)
             }
         }
         .padding(.vertical, compact ? 2 : 4)
@@ -2860,27 +2908,32 @@ struct TaskManagerView: View {
     }
 
     private var performance: some View {
-        ScrollView { VStack(spacing: 12) {
+        let useFootprint = sampler.footprint > 0
+        let activeMemHistory = useFootprint ? sampler.appMemoryHistory : sampler.guestMemoryHistory
+        let currentMemMB = activeMemHistory.last ?? 0
+        let peakMemMB = activeMemHistory.max() ?? 0
+        return ScrollView { VStack(spacing: 12) {
             card("CPU · last 2 minutes", systemImage: "cpu") {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(String(format: "%.0f%%", totalCPU)).font(.system(.largeTitle, design: .rounded).weight(.bold)).foregroundColor(TaskStyle.frost)
+                    Text(String(format: totalCPU < 10 && totalCPU > 0 ? "%.1f%%" : "%.0f%%", totalCPU)).font(.system(.largeTitle, design: .rounded).weight(.bold)).foregroundColor(TaskStyle.frost)
                     Spacer()
-                    Text(String(format: "peak %.0f%%", sampler.cpuHistory.max() ?? 0)).font(.caption).foregroundColor(TaskStyle.dim)
+                    Text(String(format: "peak %.1f%%", sampler.cpuHistory.max() ?? 0)).font(.caption).foregroundColor(TaskStyle.dim)
                 }
                 AreaChart(values: sampler.cpuHistory, color: TaskStyle.frost).frame(height: 120)
-                Text(String(format: "100%% = one core · %.0f guest cores", cores)).font(.caption).foregroundColor(TaskStyle.dim)
+                Text(String(format: "100%% = one core · %.0f guest cores (live thread CPU deltas)", cores)).font(.caption).foregroundColor(TaskStyle.dim)
             }
             card("Memory · last 2 minutes", systemImage: "memorychip") {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(String(format: "%.0f MB", sampler.memoryHistory.last ?? 0)).font(.system(.largeTitle, design: .rounded).weight(.bold)).foregroundColor(TaskStyle.green)
+                    Text(Self.bytes(currentMemMB * 1024)).font(.system(.largeTitle, design: .rounded).weight(.bold)).foregroundColor(TaskStyle.green)
                     Spacer()
-                    Text(String(format: "peak %.0f MB", sampler.memoryHistory.max() ?? 0)).font(.caption).foregroundColor(TaskStyle.dim)
+                    Text("peak \(Self.bytes(peakMemMB * 1024))").font(.caption).foregroundColor(TaskStyle.dim)
                 }
-                AreaChart(values: sampler.memoryHistory, color: TaskStyle.green).frame(height: 120)
-                Text("Private guest memory (shared mappings counted separately)").font(.caption).foregroundColor(TaskStyle.dim)
+                AreaChart(values: activeMemHistory, color: TaskStyle.green).frame(height: 120)
+                Text("iOS app footprint: \(sampler.footprint > 0 ? Self.bytes(appFootprintKB) : "—") · Linux mapped: \(Self.bytes(guestMappedKB)) · Anonymous heap/stack: \(Self.bytes(privateKB))")
+                    .font(.caption).foregroundColor(TaskStyle.dim)
             }
             card("Notes", systemImage: "info.circle") {
-                Text("Values refresh every \(Int(TaskSampler.interval)) seconds from DebianRunner's live process table.").font(.caption).foregroundColor(TaskStyle.dim)
+                Text("CPU tracks host Mach thread execution deltas across all guest threads. Memory plots iOS physical footprint (phys_footprint) alongside Linux mapped pages and private anonymous heap/stack.").font(.caption).foregroundColor(TaskStyle.dim)
             }
         }.padding(.horizontal).padding(.bottom, 16) }
     }
@@ -2898,6 +2951,12 @@ private struct ProcessDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var confirm: Bool?   // false: terminate, true: force
     @State private var result: String?
+    private static func formatKB(_ kb: Int) -> String {
+        let d = Double(kb)
+        if d >= 1024 * 1024 { return String(format: "%.2f GB", d / 1048576) }
+        if d >= 1024 { return String(format: "%.1f MB", d / 1024) }
+        return "\(kb) KB"
+    }
     var body: some View {
         NavigationView {
             List {
@@ -2908,10 +2967,11 @@ private struct ProcessDetailView: View {
                 }
                 Section("Resources") {
                     DetailRow("CPU now", value: String(format: "%.1f%% of a core", process.cpuPercent))
-                    DetailRow("CPU time", value: String(format: "%.1f s", Double(process.cpuMs) / 1000))
-                    DetailRow("Private memory", value: "\(process.privateKB / 1024) MB")
-                    DetailRow("Shared mappings", value: "\(process.sharedKB / 1024) MB")
-                    DetailRow("Mapped address space", value: "\(process.mappedKB / 1024) MB")
+                    DetailRow("CPU time", value: String(format: "%.2f s", Double(process.cpuUs) / 1_000_000))
+                    DetailRow("Private mapped (incl. libs)", value: Self.formatKB(process.residentKB))
+                    DetailRow("Anonymous heap/stack", value: Self.formatKB(process.privateKB))
+                    DetailRow("Shared mappings", value: Self.formatKB(process.sharedKB))
+                    DetailRow("Total mapped address space", value: Self.formatKB(process.mappedKB))
                 }
                 Section {
                     Button("End Process (SIGTERM)") { confirm = false }.disabled(process.id <= 1)

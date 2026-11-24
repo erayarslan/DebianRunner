@@ -497,7 +497,7 @@ static NSString *LRThermalState(void) {
         unsigned long mapped = 0, shared = 0, anonymous = 0;
         if (r->mm) { mem_page_counts(&r->mm->mem, &mapped, &shared, &anonymous); mm_release(r->mm); }   // outside pids_lock
         [result addObject:@{@"pid": @(r->pid), @"ppid": @(r->ppid), @"uid": @(r->uid), @"name": @(r->name), @"state": [NSString stringWithFormat:@"%c", r->state],
-            @"threads": @(r->threads), @"cpu_ms": @(r->cpu_us / 1000), @"mapped_kb": @(mapped * (PAGE_SIZE / 1024)),
+            @"threads": @(r->threads), @"cpu_ms": @(r->cpu_us / 1000), @"cpu_us": @(r->cpu_us), @"mapped_kb": @(mapped * (PAGE_SIZE / 1024)),
             @"anonymous_kb": @(anonymous * (PAGE_SIZE / 1024)), @"shared_kb": @(shared * (PAGE_SIZE / 1024))}];
     }
     free(rows);

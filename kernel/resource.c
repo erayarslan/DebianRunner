@@ -173,7 +173,6 @@ static void timeval_add(struct timeval_ *dst, struct timeval_ *src);
 struct rusage_ rusage_get_group_locked(struct tgroup *group) {
     lock(&group->lock);
     struct rusage_ total = group->rusage; // threads that already exited
-    unlock(&group->lock);
     struct task *task;
     list_for_each_entry(&group->threads, task, group_links) {
         // An exiting thread adds its own time to group->rusage; skip it here.
@@ -188,6 +187,7 @@ struct rusage_ rusage_get_group_locked(struct tgroup *group) {
         };
         rusage_add(&total, &thread);
     }
+    unlock(&group->lock);
     return total;
 }
 

@@ -13,6 +13,7 @@
         write() {},
         getSize: () => [0, 0],
         copy: () => '',
+        linkAt: () => null,
         beginSelection: () => null,
         selectWordAt: () => null,
         extendSelection: () => null,
@@ -24,6 +25,7 @@
         selectAll: () => null,
         clearSelection() {},
         scrollByLines() {},
+        scrollToLine() {},
         setFocused() {},
         scrollToBottom() {},
         newScrollTop() {},
@@ -100,6 +102,8 @@
     let pendingScrollSync = false;
     let lastNativeScrollHeight;
     let lastNativeScrollTop;
+    let lastScrollStateSig = '';
+    let suppressNativeScrollEcho = false;
     let nativeScrollRequest = null;
     let oldProps = {};
     let xtermAppActive = null;
@@ -110,6 +114,21 @@
     let dragMoved = false;
     let handleFixedIdx = null;
     let lastGeometrySignature = '';
+
+    const NON_WORD_DELIMITERS = new Set(['"', "'", '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', '|']);
+    const URL_CHARS_RE = /^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/;
+    const URL_MATCH_RE = /https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+/gi;
+
+    function isHttpUrl(candidate) {
+        if (typeof candidate !== 'string' || !candidate)
+            return false;
+        try {
+            const parsed = new URL(candidate);
+            return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+        } catch {
+            return false;
+        }
+    }
 
     // ── Terminal setup ───────────────────────────────────────────────────────
     const term = new Terminal({
@@ -128,12 +147,21 @@
         overviewRuler: {width: 0},
         smoothScrollDuration: 0,
         windowsMode: false,
+        linkHandler: {
+            activate(_event, uri) {
+                if (isHttpUrl(uri))
+                    native.openLink(uri);
+            },
+        },
     });
 
     const fitAddon = new FitAddon();
     term.loadAddon(new CanvasAddon());
     term.loadAddon(fitAddon);
-    term.loadAddon(new WebLinksAddon());
+    term.loadAddon(new WebLinksAddon((_event, uri) => {
+        if (isHttpUrl(uri))
+            native.openLink(uri);
+    }));
 
     term.onData((data) => {
         native.sendInput(data);
@@ -145,13 +173,14 @@
         notifySelection(true);
     });
     term.onScroll(() => {
-        scheduleScrollSync();
+        if (!suppressNativeScrollEcho)
+            scheduleScrollSync();
         if (term.hasSelection())
             notifySelection(false);
     });
     term.onCursorMove(syncApplicationCursor);
     term.onSelectionChange(() => {
-        native.selectionChanged(term.getSelection());
+        native.selectionChanged(extractCleanSelection());
         notifySelection(false);
     });
 
@@ -190,7 +219,6 @@
     ro.observe(terminalElement);
 
     // ── Selection helpers ────────────────────────────────────────────────────
-    const NON_WORD_DELIMITERS = new Set(['"', "'", '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', '|']);
 
     function cellChar(line, col) {
         if (!line || col < 0 || col >= term.cols)
@@ -317,14 +345,300 @@
         term.select(startCol, startRow, e - s);
     }
 
+    // ── Link & Clean Multiline Copy Helpers ──────────────────────────────────
+
+    function trimTrailingUrlPunctuation(raw) {
+        let url = raw;
+        while (url.length > 0) {
+            const last = url[url.length - 1];
+            if (last === '.' || last === ',' || last === ';' || last === ':' || last === '!' || last === '?' || last === "'" || last === '"') {
+                url = url.slice(0, -1);
+                continue;
+            }
+            if (last === ')') {
+                const opens = (url.match(/\(/g) || []).length;
+                const closes = (url.match(/\)/g) || []).length;
+                if (closes > opens) { url = url.slice(0, -1); continue; }
+            }
+            if (last === ']') {
+                const opens = (url.match(/\[/g) || []).length;
+                const closes = (url.match(/\]/g) || []).length;
+                if (closes > opens) { url = url.slice(0, -1); continue; }
+            }
+            break;
+        }
+        return url;
+    }
+
+    function oscLinkUriAtCell(row, col) {
+        const oscService = term._core?._oscLinkService;
+        if (!oscService || col < 0 || col >= term.cols)
+            return null;
+        const coreBuf = term._core?._bufferService?.buffer;
+        const coreLine = coreBuf?.lines?.get?.(row);
+        const nullCell = coreBuf?.getNullCell ? coreBuf.getNullCell() : null;
+        const pubLine = term.buffer.active.getLine(row);
+        if (!coreLine && !pubLine)
+            return null;
+        const readUrlId = (c) => {
+            if (c < 0 || c >= term.cols)
+                return 0;
+            if (nullCell && coreLine?.loadCell) {
+                coreLine.loadCell(c, nullCell);
+                if (nullCell.hasExtendedAttrs?.() && nullCell.extended?.urlId)
+                    return nullCell.extended.urlId;
+            }
+            const pubCell = pubLine?.getCell?.(c);
+            return pubCell?._cell?.extended?.urlId || pubCell?.extended?.urlId || 0;
+        };
+        let urlId = readUrlId(col);
+        if (!urlId && col > 0) {
+            const pub = term.buffer.active.getLine(row)?.getCell?.(col);
+            if (pub && pub.getWidth?.() === 0)
+                urlId = readUrlId(col - 1);
+        }
+        if (!urlId)
+            return null;
+        const uri = oscService.getLinkData?.(urlId)?.uri;
+        return isHttpUrl(uri) ? uri : null;
+    }
+
+    function isUrlContinuationSegment(trimmed) {
+        if (!trimmed || /^https?:\/\//i.test(trimmed))
+            return false;
+        return URL_CHARS_RE.test(trimmed);
+    }
+
+    function plaintextLinkAtCell(row, col) {
+        const buffer = term.buffer.active;
+        if (!buffer || row < 0 || row >= buffer.length)
+            return null;
+        const maxRow = buffer.length - 1;
+
+        // 1. Expand across terminal soft-wraps (isWrapped).
+        let topRow = row;
+        let botRow = row;
+        while (topRow > 0 && buffer.getLine(topRow)?.isWrapped)
+            topRow--;
+        while (botRow < maxRow && buffer.getLine(botRow + 1)?.isWrapped)
+            botRow++;
+
+        // 2. Also handle hard-wrapped URLs (e.g. CLI/TUI wrapping long auth URLs with \r\n).
+        const buildText = (fromRow, toRow, trimHardLines) => {
+            let joined = '';
+            const spans = [];
+            for (let r = fromRow; r <= toRow; r++) {
+                const line = buffer.getLine(r);
+                if (!line) continue;
+                const nextSoft = r < toRow && !!buffer.getLine(r + 1)?.isWrapped;
+                const raw = line.translateToString(!nextSoft);
+                if (!trimHardLines || line.isWrapped) {
+                    const start = joined.length;
+                    joined += raw;
+                    spans.push({ row: r, colStart: 0, colEnd: raw.length, textStart: start, textEnd: joined.length });
+                } else {
+                    const lead = raw.length - raw.trimStart().length;
+                    const trimmed = raw.trim();
+                    const start = joined.length;
+                    joined += trimmed;
+                    spans.push({ row: r, colStart: lead, colEnd: lead + trimmed.length, textStart: start, textEnd: joined.length });
+                }
+            }
+            return { joined, spans };
+        };
+
+        // Check soft-wrapped logical line first.
+        let built = buildText(topRow, botRow, false);
+        const tappedRowLine = buffer.getLine(row)?.translateToString(true)?.trim() || '';
+        const looksLikeHardWrappedUrl =
+            !(/https?:\/\//i.test(built.joined)) && isUrlContinuationSegment(tappedRowLine) ||
+            (/https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(built.joined.trim()));
+
+        if (looksLikeHardWrappedUrl) {
+            let hardTop = topRow;
+            let hardBot = botRow;
+            // Look upward up to 8 rows if current row is a continuation of a hard-wrapped URL.
+            if (!/https?:\/\//i.test(built.joined)) {
+                let probe = hardTop - 1;
+                let foundStart = -1;
+                while (probe >= Math.max(0, hardTop - 8)) {
+                    const t = (buffer.getLine(probe)?.translateToString(true) || '').trim();
+                    if (!t) break;
+                    if (/https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(t)) {
+                        foundStart = probe;
+                        break;
+                    }
+                    if (!isUrlContinuationSegment(t)) break;
+                    probe--;
+                }
+                if (foundStart >= 0) {
+                    hardTop = foundStart;
+                    while (hardTop > 0 && buffer.getLine(hardTop)?.isWrapped)
+                        hardTop--;
+                }
+            }
+            // Extend downward up to 8 rows while lines are pure URL continuation segments.
+            let probe = hardBot + 1;
+            while (probe <= Math.min(maxRow, hardBot + 8)) {
+                const line = buffer.getLine(probe);
+                const t = (line?.translateToString(true) || '').trim();
+                if (!t) break;
+                if (line?.isWrapped || isUrlContinuationSegment(t)) {
+                    hardBot = probe;
+                    probe++;
+                } else {
+                    break;
+                }
+            }
+            if (hardTop !== topRow || hardBot !== botRow) {
+                built = buildText(hardTop, hardBot, true);
+            }
+        }
+
+        const span = built.spans.find((s) => s.row === row);
+        if (!span || col < span.colStart || col >= span.colEnd)
+            return null;
+        const tapOffset = span.textStart + (col - span.colStart);
+
+        URL_MATCH_RE.lastIndex = 0;
+        let match;
+        while ((match = URL_MATCH_RE.exec(built.joined)) !== null) {
+            const cleaned = trimTrailingUrlPunctuation(match[0]);
+            const mStart = match.index;
+            const mEnd = mStart + cleaned.length;
+            if (tapOffset >= mStart && tapOffset < mEnd && isHttpUrl(cleaned)) {
+                return { url: cleaned, kind: 'url' };
+            }
+        }
+        return null;
+    }
+
+    function unwrapUrlLinesIfApplicable(logicalLines) {
+        const nonEmpty = logicalLines.map((l) => l.trim()).filter(Boolean);
+        if (nonEmpty.length === 0)
+            return null;
+        if (nonEmpty.length === 1) {
+            const single = trimTrailingUrlPunctuation(nonEmpty[0]);
+            return /^https?:\/\/\S+$/i.test(single) && isHttpUrl(single) ? single : null;
+        }
+        // Multiline selection of a wrapped auth URL (even if TUI added hard newlines,
+        // left-padding spaces, or blank separator lines): join into one unbroken URL.
+        const first = nonEmpty[0];
+        if (!/^https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(first))
+            return null;
+        for (let i = 1; i < nonEmpty.length; i++) {
+            if (!isUrlContinuationSegment(nonEmpty[i]))
+                return null;
+        }
+        const joined = trimTrailingUrlPunctuation(nonEmpty.join(''));
+        return isHttpUrl(joined) ? joined : null;
+    }
+
+    function extractCleanSelection() {
+        const range = currentLinearSelection();
+        if (!range)
+            return '';
+        const buffer = term.buffer.active;
+        const cols = term.cols;
+        const startRow = Math.floor(range.startIdx / cols);
+        const startCol = range.startIdx % cols;
+        const lastIdx = range.endIdx - 1;
+        const lastRow = Math.floor(lastIdx / cols);
+        const lastColEnd = (lastIdx % cols) + 1;
+
+        const logicalLines = [];
+        for (let r = startRow; r <= lastRow; r++) {
+            const line = buffer.getLine(r);
+            if (!line) continue;
+            const c0 = r === startRow ? startCol : 0;
+            const c1 = r === lastRow ? lastColEnd : cols;
+            const nextSoftWrapped = (r < lastRow) && !!buffer.getLine(r + 1)?.isWrapped;
+            // Preserve trailing spaces when the row soft-wraps into the next row;
+            // trim trailing blank cells on hard-ended lines so no ghost padding leaks.
+            const segment = line.translateToString(!nextSoftWrapped, c0, c1).replace(/\u00a0/g, ' ');
+            if (r > startRow && line.isWrapped && logicalLines.length > 0) {
+                logicalLines[logicalLines.length - 1] += segment;
+            } else {
+                logicalLines.push(segment);
+            }
+        }
+
+        // Drop accidental blank lines if the entire selection is a single wrapped URL.
+        const unwrappedUrl = unwrapUrlLinesIfApplicable(logicalLines);
+        if (unwrappedUrl)
+            return unwrappedUrl;
+
+        // Also stitch hard-wrapped URL continuations when a selection includes
+        // leading label text (e.g. "Open: https://...\n&client_id=...").
+        const stitched = [];
+        for (let i = 0; i < logicalLines.length; i++) {
+            const line = logicalLines[i];
+            const trimmed = line.trim();
+            if (stitched.length > 0 && isUrlContinuationSegment(trimmed)) {
+                // Find the most recent non-empty line in stitched (allow 1 blank separator line inside a wrapped URL).
+                let prevIdx = stitched.length - 1;
+                if (stitched[prevIdx] === '' && prevIdx > 0)
+                    prevIdx--;
+                const prev = stitched[prevIdx];
+                if (/https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(prev.trimEnd())) {
+                    if (prevIdx < stitched.length - 1)
+                        stitched.pop(); // remove spurious blank separator inside wrapped URL
+                    stitched[prevIdx] = prev.trimEnd() + trimmed;
+                    continue;
+                }
+            }
+            stitched.push(line);
+        }
+
+        // Trim trailing empty lines introduced by dragging slightly past row bounds.
+        while (stitched.length > 1 && stitched[stitched.length - 1] === '')
+            stitched.pop();
+        return stitched.join('\n');
+    }
+
+    function linkUrlForSelection(range, cleanText) {
+        if (!range)
+            return '';
+        const cols = term.cols;
+        const startRow = Math.floor(range.startIdx / cols);
+        const startCol = range.startIdx % cols;
+        const oscUri = oscLinkUriAtCell(startRow, startCol);
+        if (oscUri)
+            return oscUri;
+        const trimmed = (cleanText || '').trim();
+        if (/^https?:\/\/\S+$/i.test(trimmed)) {
+            const cleaned = trimTrailingUrlPunctuation(trimmed);
+            if (isHttpUrl(cleaned))
+                return cleaned;
+        }
+        // Also check if the selection lands inside a larger URL (e.g. double-tapped part of a URL).
+        const midIdx = Math.floor((range.startIdx + range.endIdx - 1) / 2);
+        const midRow = Math.floor(midIdx / cols);
+        const midCol = midIdx % cols;
+        const midOsc = oscLinkUriAtCell(midRow, midCol);
+        if (midOsc)
+            return midOsc;
+        if (trimmed.length <= 2048) {
+            URL_MATCH_RE.lastIndex = 0;
+            const m = URL_MATCH_RE.exec(trimmed);
+            if (m) {
+                const cleaned = trimTrailingUrlPunctuation(m[0]);
+                if (isHttpUrl(cleaned))
+                    return cleaned;
+            }
+        }
+        return '';
+    }
+
     function getSelectionGeometry(extra) {
         const m = getScreenMetrics();
-        const text = term.getSelection() || '';
         const range = currentLinearSelection();
+        const text = range ? extractCleanSelection() : '';
         if (!m || !range || !term.hasSelection()) {
             return Object.assign({
                 hasSelection: false,
                 text: '',
+                linkUrl: '',
                 cellWidth: m ? m.cell.width : 0,
                 cellHeight: m ? m.cell.height : 0,
                 startVisible: false,
@@ -369,9 +683,12 @@
             menuY = m.rect.top + m.rect.height / 2;
         }
 
+        const linkUrl = linkUrlForSelection(range, text);
+
         return Object.assign({
             hasSelection: true,
             text,
+            linkUrl,
             cellWidth: m.cell.width,
             cellHeight: m.cell.height,
             startX,
@@ -419,7 +736,19 @@
             return [term.cols, term.rows];
         },
         copy() {
-            return term.getSelection() || '';
+            return extractCleanSelection();
+        },
+        linkAt(x, y) {
+            const cell = selectionCell(x, y);
+            if (!cell)
+                return null;
+            const oscUri = oscLinkUriAtCell(cell.row, cell.col);
+            if (oscUri)
+                return { url: oscUri, kind: 'osc8', row: cell.row, col: cell.col };
+            const plain = plaintextLinkAtCell(cell.row, cell.col);
+            if (plain)
+                return Object.assign(plain, { row: cell.row, col: cell.col });
+            return null;
         },
         beginSelection(x, y) {
             const cell = selectionCell(x, y);
@@ -545,6 +874,25 @@
             if (term.hasSelection())
                 notifySelection(false);
         },
+        scrollToLine(line) {
+            if (!Number.isFinite(line))
+                return;
+            const buffer = term.buffer.active;
+            const cellHeight = getCellSize().height;
+            const clamped = Math.max(0, Math.min(buffer.baseY, Math.round(line)));
+            if (clamped !== buffer.viewportY) {
+                suppressNativeScrollEcho = true;
+                try {
+                    term.scrollToLine(clamped);
+                } finally {
+                    suppressNativeScrollEcho = false;
+                }
+            }
+            if (cellHeight)
+                lastNativeScrollTop = clamped * cellHeight;
+            if (term.hasSelection())
+                notifySelection(false);
+        },
         setFocused(focused) {
             terminalElement.classList.toggle('terminal-focused', !!focused);
             setXtermAppActive(!!focused);
@@ -561,11 +909,16 @@
                 return;
             const buffer = term.buffer.active;
             const line = Math.max(0, Math.min(buffer.baseY, Math.round(top / cellHeight)));
-            // UIKit owns fractional offsets and momentum. Do not snap its
-            // offset back to the rounded row when acknowledging this request.
+            // UIKit owns fractional offsets and momentum. Do not echo scrollTop back.
             nativeScrollRequest = {buffer, line, cellHeight};
-            term.scrollToLine(line);
-            scheduleScrollSync();
+            suppressNativeScrollEcho = true;
+            try {
+                if (line !== buffer.viewportY)
+                    term.scrollToLine(line);
+            } finally {
+                suppressNativeScrollEcho = false;
+            }
+            lastNativeScrollTop = line * cellHeight;
             if (term.hasSelection())
                 notifySelection(false);
         },
@@ -680,15 +1033,39 @@
         });
     }
 
+    function isMouseTrackingActive() {
+        const mode = term.modes?.mouseTrackingMode;
+        return !!mode && mode !== 'none';
+    }
+
     function syncScroll() {
         const cellHeight = getCellSize().height;
         if (!cellHeight)
             return;
         const buffer = term.buffer.active;
+        const altScreen = buffer.type === 'alternate';
+        const mouseTracking = isMouseTrackingActive();
         // Fit rounds rows down; the unused fraction still belongs to UIKit's
         // viewport. Its maximum offset must equal baseY * cellHeight exactly.
         const scrollHeight = buffer.baseY * cellHeight + terminalElement.clientHeight;
         const scrollTop = buffer.viewportY * cellHeight;
+
+        const stateSig = `${scrollHeight.toFixed(2)},${scrollTop.toFixed(2)},${cellHeight.toFixed(2)},${buffer.baseY},${buffer.viewportY},${altScreen ? 1 : 0},${mouseTracking ? 1 : 0}`;
+        if (stateSig !== lastScrollStateSig) {
+            lastScrollStateSig = stateSig;
+            native.scrollState({
+                scrollHeight,
+                scrollTop,
+                cellHeight,
+                cellWidth: getCellSize().width,
+                cols: term.cols,
+                rows: term.rows,
+                baseY: buffer.baseY,
+                viewportY: buffer.viewportY,
+                altScreen,
+                mouseTracking,
+            });
+        }
 
         if (scrollHeight !== lastNativeScrollHeight) {
             native.newScrollHeight(scrollHeight);

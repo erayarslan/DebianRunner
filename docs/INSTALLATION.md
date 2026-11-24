@@ -6,7 +6,7 @@ Installing the IPA installs DebianRunner. On first launch, DebianRunner download
 
 - ARM64 iPhone or iPad (minimum deployment target iOS/iPadOS 15.0; tested primarily on recent releases).
 - At least 1 GB of free device storage for Debian minimal (4+ GB recommended when installing development toolchains).
-- Network access on first launch to download verified official Debian packages from `deb.debian.org`.
+- Network access on first launch to download verified official Debian packages from Turkish HTTPS mirrors (`mirror.rabisu.com`, `ftp.linux.org.tr`, fallback `deb.debian.org`).
 
 ## Install and Open
 

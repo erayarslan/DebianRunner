@@ -14,7 +14,7 @@ When no Debian environment is installed yet, the setup wizard opens automaticall
 
 1. Review the storage and download size on **Install Debian Minimal**. At least 1 GB of free storage is required.
 2. Tap **Install Debian Minimal** and keep DebianRunner in the foreground.
-   - DebianRunner downloads official Debian 13 (trixie) minimal `.deb` packages from `deb.debian.org`.
+   - DebianRunner downloads official Debian 13 (trixie) minimal `.deb` packages from Turkish HTTPS mirrors (`mirror.rabisu.com`, `ftp.linux.org.tr`) with automatic fallback to `deb.debian.org`, and defaults APT to `ftp.linux.org.tr`.
    - Every package is checked against the bundled `DebianSupport.bundle/manifest.json` (`manifest.sha256` and Debian's signed `InRelease`).
    - Verified packages are assembled locally into a root filesystem archive and imported into an isolated `fakefs` root.
 3. On first launch, DebianRunner boots the newly installed Debian minimal runtime automatically (if another environment was already booted in the same app session, close and reopen DebianRunner when prompted).

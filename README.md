@@ -46,7 +46,7 @@ DebianRunner runs **Debian GNU/Linux 13 (trixie) minimal ARM64** userspace on iP
 ## Getting Started
 
 1. Download or build `DebianRunner.ipa` (no Mac required via GitHub Actions — see below) and sideload it with AltStore, SideStore, Sideloadly, TrollStore, or Xcode. [Installation details](docs/INSTALLATION.md)
-2. Open DebianRunner. On first launch, the setup wizard downloads and verifies official Debian 13 (trixie) minimal ARM64 packages from `deb.debian.org`.
+2. Open DebianRunner. On first launch, the setup wizard downloads and verifies official Debian 13 (trixie) minimal ARM64 packages using Turkish HTTPS mirrors (`mirror.rabisu.com`, `ftp.linux.org.tr`) with automatic fallback to `deb.debian.org`, and configures `/etc/apt/sources.list` to use Turkey's `ftp.linux.org.tr` mirror by default.
 3. Optionally create a regular Linux user (with or without `sudo`) or continue as `root`.
 4. Tap **Open Terminal** on the Home screen to start a Debian bash session.
 

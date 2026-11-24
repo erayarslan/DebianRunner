@@ -29,6 +29,10 @@
     [self.innerDelegate scrollViewDidScroll:scrollView];
 }
 
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    return [super respondsToSelector:aSelector] || [self.innerDelegate respondsToSelector:aSelector];
+}
+
 - (id)forwardingTargetForSelector:(SEL)aSelector {
     if ([self.innerDelegate respondsToSelector:aSelector])
         return self.innerDelegate;
@@ -69,6 +73,9 @@
 
 - (void)setDelegate:(id<UIScrollViewDelegate>)delegate {
     self.outerDelegate.innerDelegate = delegate;
+    // Re-assign so UIScrollView refreshes its cached delegate selector flags.
+    super.delegate = nil;
+    super.delegate = self.outerDelegate;
 }
 
 @end

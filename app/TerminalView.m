@@ -5,6 +5,7 @@
 //  Created by Theodore Dubois on 11/3/17.
 //
 
+#import <QuartzCore/QuartzCore.h>
 #import "ScrollbarView.h"
 #import "TerminalView.h"
 #import "UserPreferences.h"
@@ -98,6 +99,7 @@ struct rowcol {
 @property (nonatomic) UITapGestureRecognizer *singleTapGesture;
 @property (nonatomic) UITapGestureRecognizer *doubleTapGesture;
 @property (nonatomic) UILongPressGestureRecognizer *selectionGesture;
+@property (nonatomic) UIPanGestureRecognizer *altScrollGesture;
 @property (nonatomic) LRTerminalSelectionHandle *startSelectionHandle;
 @property (nonatomic) LRTerminalSelectionHandle *endSelectionHandle;
 @property (nonatomic, copy, nullable) NSString *activeDragHandle;
@@ -109,6 +111,25 @@ struct rowcol {
 @property (nonatomic) CGPoint lastDragPointInWebView;
 @property (nonatomic, nullable) NSTimer *selectionAutoScrollTimer;
 @property (nonatomic) NSInteger selectionAutoScrollDirection;
+@property (nonatomic, copy, nullable) NSString *selectedLinkURL;
+
+// Smooth native scroll + alternate-screen momentum state
+@property (nonatomic) CGFloat terminalCellHeight;
+@property (nonatomic) CGFloat terminalCellWidth;
+@property (nonatomic) NSInteger terminalCols;
+@property (nonatomic) NSInteger terminalRows;
+@property (nonatomic) NSInteger terminalBaseY;
+@property (nonatomic) BOOL terminalAltScreen;
+@property (nonatomic) BOOL terminalMouseTracking;
+@property (nonatomic) NSInteger lastSentScrollLine;
+@property (nonatomic) NSInteger pendingScrollLine;
+@property (nonatomic) BOOL hasPendingScrollLine;
+@property (nonatomic) BOOL scrollEvalInFlight;
+@property (nonatomic) CGFloat altScrollAccumulator;
+@property (nonatomic) CGFloat altScrollVelocity;
+@property (nonatomic) CFTimeInterval altScrollLastTimestamp;
+@property (nonatomic) CGPoint altScrollLastPointInWeb;
+@property (nonatomic, nullable) CADisplayLink *altScrollDisplayLink;
 
 @property (nullable) NSString *markedText;
 @property (nullable) NSString *selectedText;
@@ -143,8 +164,13 @@ static NSString *LRTerminalBackground(NSString *hex) {
     ScrollbarView *scrollbarView = self.scrollbarView = [[ScrollbarView alloc] initWithFrame:self.bounds];
     scrollbarView.delegate = self;
     scrollbarView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    scrollbarView.bounces = NO;
+    scrollbarView.bounces = YES;
+    scrollbarView.alwaysBounceVertical = YES;
+    scrollbarView.showsVerticalScrollIndicator = YES;
+    scrollbarView.showsHorizontalScrollIndicator = NO;
+    scrollbarView.decelerationRate = UIScrollViewDecelerationRateNormal;
     scrollbarView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    self.lastSentScrollLine = -1;
     self.clipsToBounds = YES;
     [self addSubview:scrollbarView];
 #if USE_XTERM_RENDERER
@@ -170,6 +196,13 @@ static NSString *LRTerminalBackground(NSString *hex) {
     selectionGesture.delegate = self;
     [self addGestureRecognizer:selectionGesture];
     self.selectionGesture = selectionGesture;
+
+    UIPanGestureRecognizer *altScroll = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleAltScreenScroll:)];
+    altScroll.maximumNumberOfTouches = 1;
+    altScroll.cancelsTouchesInView = NO;
+    altScroll.delegate = self;
+    [self addGestureRecognizer:altScroll];
+    self.altScrollGesture = altScroll;
 
     self.startSelectionHandle = [[LRTerminalSelectionHandle alloc] initWithIsStart:YES];
     self.endSelectionHandle = [[LRTerminalSelectionHandle alloc] initWithIsStart:NO];
@@ -214,8 +247,17 @@ static NSString *LRTerminalBackground(NSString *hex) {
                  object:UIApplication.sharedApplication];
 }
 
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (!self.window) {
+        [self stopSelectionAutoScroll];
+        [self stopAltScrollMomentum];
+    }
+}
+
 - (void)dealloc {
     [_selectionAutoScrollTimer invalidate];
+    [_altScrollDisplayLink invalidate];
     [NSNotificationCenter.defaultCenter removeObserver:self];
     self.terminal = nil;
 }
@@ -229,7 +271,7 @@ static NSString *LRTerminalBackground(NSString *hex) {
     }
 }
 
-static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight", @"newScrollTop", @"openLink", @"selectionChanged", @"selectionGeometry"};
+static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"newScrollHeight", @"newScrollTop", @"openLink", @"selectionChanged", @"selectionGeometry"};
 
 - (void)setTerminal:(Terminal *)terminal {
     if (_terminal) {
@@ -284,10 +326,15 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 
 - (void)uninstallTerminalView {
     [self stopSelectionAutoScroll];
+    [self stopAltScrollMomentum];
     self.selectionActive = NO;
     self.draggingSelection = NO;
     self.draggingHandle = NO;
     self.selectedText = nil;
+    self.selectedLinkURL = nil;
+    self.lastSentScrollLine = -1;
+    self.hasPendingScrollLine = NO;
+    self.scrollEvalInFlight = NO;
     self.startSelectionHandle.hidden = YES;
     self.endSelectionHandle.hidden = YES;
     [self dismissSelectionMenu];
@@ -434,23 +481,65 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
         if (!self.isFirstResponder) {
             [self becomeFirstResponder];
         }
+    } else if ([message.name isEqualToString:@"scrollState"]) {
+        if (![message.body isKindOfClass:NSDictionary.class])
+            return;
+        NSDictionary *state = message.body;
+        CGFloat cellHeight = [state[@"cellHeight"] doubleValue];
+        CGFloat cellWidth = [state[@"cellWidth"] doubleValue];
+        CGFloat newHeight = [state[@"scrollHeight"] doubleValue];
+        CGFloat newOffset = [state[@"scrollTop"] doubleValue];
+        if (isfinite(cellHeight) && cellHeight > 1.0) self.terminalCellHeight = cellHeight;
+        if (isfinite(cellWidth) && cellWidth > 1.0) self.terminalCellWidth = cellWidth;
+        self.terminalCols = [state[@"cols"] integerValue];
+        self.terminalRows = [state[@"rows"] integerValue];
+        self.terminalBaseY = MAX(0, [state[@"baseY"] integerValue]);
+        BOOL altScreen = [state[@"altScreen"] boolValue];
+        self.terminalAltScreen = altScreen;
+        self.terminalMouseTracking = [state[@"mouseTracking"] boolValue];
+        if (!altScreen)
+            [self stopAltScrollMomentum];
+        self.scrollbarView.scrollEnabled = !altScreen && !self.draggingSelection;
+
+        BOOL userScrolling = self.scrollbarView.isTracking || self.scrollbarView.isDragging || self.scrollbarView.isDecelerating;
+        if (isfinite(newHeight) && newHeight >= 0 && fabs(self.scrollbarView.contentSize.height - newHeight) > 0.5) {
+            self.updatingTerminalScroll = YES;
+            self.scrollbarView.contentSize = CGSizeMake(0, newHeight);
+            self.updatingTerminalScroll = NO;
+        }
+        if (!userScrolling && isfinite(newOffset) && newOffset >= 0) {
+            CGFloat maxOffset = MAX(0, self.scrollbarView.contentSize.height - self.scrollbarView.bounds.size.height);
+            CGFloat clamped = MIN(newOffset, maxOffset);
+            if (fabs(self.scrollbarView.contentOffset.y - clamped) > 0.5) {
+                self.updatingTerminalScroll = YES;
+                [self.scrollbarView setContentOffset:CGPointMake(0, clamped) animated:NO];
+                self.updatingTerminalScroll = NO;
+            }
+            if (self.terminalCellHeight > 0)
+                self.lastSentScrollLine = llround(clamped / self.terminalCellHeight);
+        }
     } else if ([message.name isEqualToString:@"newScrollHeight"]) {
         if (![message.body isKindOfClass:NSNumber.class])
             return;
         CGFloat newHeight = [message.body doubleValue];
         if (!isfinite(newHeight) || newHeight < 0)
             return;
-        self.updatingTerminalScroll = YES;
-        self.scrollbarView.contentSize = CGSizeMake(0, newHeight);
-        self.updatingTerminalScroll = NO;
+        if (fabs(self.scrollbarView.contentSize.height - newHeight) > 0.5) {
+            self.updatingTerminalScroll = YES;
+            self.scrollbarView.contentSize = CGSizeMake(0, newHeight);
+            self.updatingTerminalScroll = NO;
+        }
     } else if ([message.name isEqualToString:@"newScrollTop"]) {
         if (![message.body isKindOfClass:NSNumber.class])
+            return;
+        // Never fight UIKit while the user is dragging or flicking with momentum.
+        if (self.scrollbarView.isTracking || self.scrollbarView.isDragging || self.scrollbarView.isDecelerating)
             return;
         CGFloat newOffset = [message.body doubleValue];
         if (!isfinite(newOffset) || newOffset < 0)
             return;
         newOffset = MIN(newOffset, MAX(0, self.scrollbarView.contentSize.height - self.scrollbarView.bounds.size.height));
-        if (self.scrollbarView.contentOffset.y == newOffset)
+        if (fabs(self.scrollbarView.contentOffset.y - newOffset) <= 0.5)
             return;
         self.updatingTerminalScroll = YES;
         [self.scrollbarView setContentOffset:CGPointMake(0, newOffset) animated:NO];
@@ -468,6 +557,33 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
             [self applySelectionGeometry:message.body];
         }
     }
+}
+
+- (void)sendCoalescedScrollToLine:(NSInteger)line {
+    if (line == self.lastSentScrollLine && !self.scrollEvalInFlight)
+        return;
+    if (self.scrollEvalInFlight) {
+        self.pendingScrollLine = line;
+        self.hasPendingScrollLine = YES;
+        return;
+    }
+    self.scrollEvalInFlight = YES;
+    self.lastSentScrollLine = line;
+    self.hasPendingScrollLine = NO;
+    __weak TerminalView *weakSelf = self;
+    NSString *script = [NSString stringWithFormat:@"exports.scrollToLine(%ld)", (long)line];
+    [self.terminal.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+        TerminalView *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.scrollEvalInFlight = NO;
+        if (strongSelf.hasPendingScrollLine) {
+            NSInteger nextLine = strongSelf.pendingScrollLine;
+            strongSelf.hasPendingScrollLine = NO;
+            if (nextLine != strongSelf.lastSentScrollLine) {
+                [strongSelf sendCoalescedScrollToLine:nextLine];
+            }
+        }
+    }];
 }
 
 - (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
@@ -490,9 +606,96 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     // Terminal output updates the indicator, not the user's scroll position.
-    if (self.updatingTerminalScroll)
+    if (self.updatingTerminalScroll || self.terminalAltScreen)
         return;
-    [self.terminal.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.newScrollTop(%f)", scrollView.contentOffset.y] completionHandler:nil];
+    if (self.terminalCellHeight > 1.0 && self.terminalBaseY >= 0) {
+        NSInteger targetLine = llround(scrollView.contentOffset.y / self.terminalCellHeight);
+        targetLine = MAX(0, MIN(self.terminalBaseY, targetLine));
+        [self sendCoalescedScrollToLine:targetLine];
+    } else {
+        [self.terminal.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.newScrollTop(%f)", scrollView.contentOffset.y] completionHandler:nil];
+    }
+}
+
+- (void)emitAltScrollStep:(NSInteger)direction atPoint:(CGPoint)pointInWeb {
+    // direction < 0 => scroll up (earlier content); direction > 0 => scroll down (later content)
+    if (self.terminalMouseTracking && self.terminalCellWidth > 0 && self.terminalCellHeight > 0) {
+        NSInteger col = MAX(1, MIN(MAX(1, self.terminalCols), (NSInteger)floor(pointInWeb.x / self.terminalCellWidth) + 1));
+        NSInteger row = MAX(1, MIN(MAX(1, self.terminalRows), (NSInteger)floor(pointInWeb.y / self.terminalCellHeight) + 1));
+        NSInteger button = direction < 0 ? 64 : 65; // SGR wheel up / wheel down
+        NSString *seq = [NSString stringWithFormat:@"\x1b[<%ld;%ld;%ldM", (long)button, (long)col, (long)row];
+        [self.terminal sendInput:[seq dataUsingEncoding:NSUTF8StringEncoding]];
+    } else {
+        NSString *seq = [self.terminal arrow:(direction < 0 ? 'A' : 'B')];
+        if (seq.length > 0)
+            [self.terminal sendInput:[seq dataUsingEncoding:NSUTF8StringEncoding]];
+    }
+}
+
+- (void)stopAltScrollMomentum {
+    [self.altScrollDisplayLink invalidate];
+    self.altScrollDisplayLink = nil;
+    self.altScrollVelocity = 0;
+    self.altScrollAccumulator = 0;
+}
+
+- (void)stepAltScrollMomentum:(CADisplayLink *)link {
+    if (!self.terminalAltScreen || self.selectionActive) {
+        [self stopAltScrollMomentum];
+        return;
+    }
+    CFTimeInterval now = link.timestamp;
+    CFTimeInterval dt = self.altScrollLastTimestamp > 0 ? MIN(0.05, MAX(0.001, now - self.altScrollLastTimestamp)) : (1.0 / 60.0);
+    self.altScrollLastTimestamp = now;
+
+    CGFloat stepHeight = MAX(14.0, self.terminalCellHeight > 1.0 ? self.terminalCellHeight : 16.0);
+    self.altScrollAccumulator += self.altScrollVelocity * dt;
+    NSInteger emitted = 0;
+    while (fabs(self.altScrollAccumulator) >= stepHeight && emitted < 6) {
+        NSInteger dir = self.altScrollAccumulator > 0 ? -1 : 1;
+        self.altScrollAccumulator -= (self.altScrollAccumulator > 0 ? stepHeight : -stepHeight);
+        [self emitAltScrollStep:dir atPoint:self.altScrollLastPointInWeb];
+        emitted++;
+    }
+    self.altScrollVelocity *= pow(0.91, dt * 60.0);
+    if (fabs(self.altScrollVelocity) < 45.0) {
+        [self stopAltScrollMomentum];
+    }
+}
+
+- (void)handleAltScreenScroll:(UIPanGestureRecognizer *)gesture {
+    if (!self.terminalAltScreen || self.selectionActive || self.draggingSelection)
+        return;
+    CGPoint ptInWeb = [gesture locationInView:self.terminal.webView];
+    self.altScrollLastPointInWeb = ptInWeb;
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        [self stopAltScrollMomentum];
+    } else if (gesture.state == UIGestureRecognizerStateChanged) {
+        CGPoint delta = [gesture translationInView:self];
+        [gesture setTranslation:CGPointZero inView:self];
+        CGFloat stepHeight = MAX(14.0, self.terminalCellHeight > 1.0 ? self.terminalCellHeight : 16.0);
+        self.altScrollAccumulator += delta.y;
+        NSInteger emitted = 0;
+        while (fabs(self.altScrollAccumulator) >= stepHeight && emitted < 8) {
+            // Dragging finger down (delta.y > 0) reveals earlier lines above (scroll up -> -1).
+            NSInteger dir = self.altScrollAccumulator > 0 ? -1 : 1;
+            self.altScrollAccumulator -= (self.altScrollAccumulator > 0 ? stepHeight : -stepHeight);
+            [self emitAltScrollStep:dir atPoint:ptInWeb];
+            emitted++;
+        }
+    } else if (gesture.state == UIGestureRecognizerStateEnded) {
+        CGFloat vy = [gesture velocityInView:self].y;
+        if (fabs(vy) > 140.0) {
+            self.altScrollVelocity = MAX(-3600.0, MIN(3600.0, vy));
+            self.altScrollLastTimestamp = 0;
+            self.altScrollDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(stepAltScrollMomentum:)];
+            [self.altScrollDisplayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+        } else {
+            [self stopAltScrollMomentum];
+        }
+    } else {
+        [self stopAltScrollMomentum];
+    }
 }
 
 - (void)setKeyboardAppearance:(UIKeyboardAppearance)keyboardAppearance {
@@ -679,6 +882,8 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     self.draggingHandle = NO;
     self.activeDragHandle = nil;
     self.selectedText = nil;
+    self.selectedLinkURL = nil;
+    self.scrollbarView.scrollEnabled = !self.terminalAltScreen;
     self.startSelectionHandle.hidden = YES;
     self.endSelectionHandle.hidden = YES;
     [self dismissSelectionMenu];
@@ -690,8 +895,10 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 - (void)applySelectionGeometry:(NSDictionary *)geom {
     BOOL hasSelection = [geom[@"hasSelection"] boolValue];
     NSString *text = [geom[@"text"] isKindOfClass:NSString.class] ? geom[@"text"] : @"";
+    NSString *linkUrl = [geom[@"linkUrl"] isKindOfClass:NSString.class] ? geom[@"linkUrl"] : @"";
     self.selectionActive = hasSelection;
     self.selectedText = (hasSelection && text.length > 0) ? text : nil;
+    self.selectedLinkURL = (hasSelection && linkUrl.length > 0) ? linkUrl : nil;
 
     if (self.draggingHandle && [geom[@"activeHandle"] isKindOfClass:NSString.class]) {
         self.activeDragHandle = geom[@"activeHandle"];
@@ -809,8 +1016,29 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 }
 
 - (void)handleTerminalTap:(UITapGestureRecognizer *)gesture {
+    [self stopAltScrollMomentum];
     if (self.selectionActive) {
         [self clearTerminalSelection];
+        return;
+    }
+    if (self.terminal.loaded) {
+        CGPoint point = [gesture locationInView:self.terminal.webView];
+        NSString *script = [NSString stringWithFormat:@"exports.linkAt?.(%f,%f)", point.x, point.y];
+        __weak TerminalView *weakSelf = self;
+        [self.terminal.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+            TerminalView *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            NSString *url = ([result isKindOfClass:NSDictionary.class] && [result[@"url"] isKindOfClass:NSString.class]) ? result[@"url"] : nil;
+            if (url.length > 0 && ([url hasPrefix:@"http://"] || [url hasPrefix:@"https://"])) {
+                UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+                [feedback impactOccurred];
+                [UIApplication openURL:url];
+                return;
+            }
+            if (!strongSelf.isFirstResponder && strongSelf.canBecomeFirstResponder) {
+                [strongSelf becomeFirstResponder];
+            }
+        }];
         return;
     }
     if (!self.isFirstResponder && self.canBecomeFirstResponder) {
@@ -865,7 +1093,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     } else if (gesture.state == UIGestureRecognizerStateEnded) {
         [self stopSelectionAutoScroll];
         self.draggingSelection = NO;
-        self.scrollbarView.scrollEnabled = YES;
+        self.scrollbarView.scrollEnabled = !self.terminalAltScreen;
         CGPoint fallbackAnchor = [gesture locationInView:self];
         [self.terminal.webView evaluateJavaScript:@"exports.selectionGeometry?.()" completionHandler:^(id result, NSError *error) {
             if ([result isKindOfClass:NSDictionary.class]) {
@@ -877,7 +1105,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     } else if (gesture.state == UIGestureRecognizerStateCancelled || gesture.state == UIGestureRecognizerStateFailed) {
         [self stopSelectionAutoScroll];
         self.draggingSelection = NO;
-        self.scrollbarView.scrollEnabled = YES;
+        self.scrollbarView.scrollEnabled = !self.terminalAltScreen;
     }
 }
 
@@ -916,7 +1144,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
         self.draggingSelection = NO;
         self.draggingHandle = NO;
         self.activeDragHandle = nil;
-        self.scrollbarView.scrollEnabled = YES;
+        self.scrollbarView.scrollEnabled = !self.terminalAltScreen;
         [self.terminal.webView evaluateJavaScript:@"exports.endSelectionHandle?.(); exports.selectionGeometry?.()" completionHandler:^(id result, NSError *error) {
             if ([result isKindOfClass:NSDictionary.class]) {
                 [self applySelectionGeometry:result];
@@ -926,6 +1154,13 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
             }
         }];
     }
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (gestureRecognizer == self.altScrollGesture) {
+        return self.terminalAltScreen && !self.selectionActive && !self.draggingSelection;
+    }
+    return YES;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
@@ -941,19 +1176,34 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     if (self.selectedText.length > 0) {
         [actions addObject:[UIAction actionWithTitle:@"Copy" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction *action) { [view copy:nil]; }]];
     }
+    NSString *linkUrl = self.selectedLinkURL;
+    if (linkUrl.length == 0 && self.selectedText.length > 0) {
+        NSString *trimmed = [self.selectedText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (([trimmed hasPrefix:@"http://"] || [trimmed hasPrefix:@"https://"]) &&
+            [trimmed rangeOfCharacterFromSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].location == NSNotFound) {
+            linkUrl = trimmed;
+        }
+    }
+    if (linkUrl.length > 0) {
+        [actions addObject:[UIAction actionWithTitle:@"Open Link" image:[UIImage systemImageNamed:@"safari"] identifier:nil handler:^(UIAction *action) {
+            [UIApplication openURL:linkUrl];
+            [view clearTerminalSelection];
+        }]];
+        NSString *trimmedSelected = [self.selectedText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (![linkUrl isEqualToString:trimmedSelected]) {
+            [actions addObject:[UIAction actionWithTitle:@"Copy Link" image:[UIImage systemImageNamed:@"link"] identifier:nil handler:^(UIAction *action) {
+                UIPasteboard.generalPasteboard.string = linkUrl;
+                UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+                [feedback impactOccurred];
+                [view clearTerminalSelection];
+            }]];
+        }
+    }
     if (UIPasteboard.generalPasteboard.hasStrings) {
         [actions addObject:[UIAction actionWithTitle:@"Paste" image:[UIImage systemImageNamed:@"doc.on.clipboard"] identifier:nil handler:^(UIAction *action) { [view paste:nil]; }]];
     }
     if (self.selectedText.length > 0) {
         [actions addObject:[UIAction actionWithTitle:@"Select Line" image:nil identifier:nil handler:^(UIAction *action) { [view selectLine:nil]; }]];
-        NSString *trimmed = [self.selectedText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (([trimmed hasPrefix:@"http://"] || [trimmed hasPrefix:@"https://"]) &&
-            [trimmed rangeOfCharacterFromSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].location == NSNotFound) {
-            [actions addObject:[UIAction actionWithTitle:@"Open Link" image:[UIImage systemImageNamed:@"safari"] identifier:nil handler:^(UIAction *action) {
-                [UIApplication openURL:trimmed];
-                [view clearTerminalSelection];
-            }]];
-        }
     }
     [actions addObject:[UIAction actionWithTitle:@"Select All" image:nil identifier:nil handler:^(UIAction *action) { [view selectAll:nil]; }]];
     return [UIMenu menuWithChildren:actions];
