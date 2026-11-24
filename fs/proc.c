@@ -5,9 +5,8 @@
 #include "fs/proc.h"
 #include "fs/path.h"
 
-// procfs and sysfs share this implementation; the mount picks the tree.
-static struct proc_dir_entry *mount_root(struct mount *mount) {
-    return mount && mount->fs == &sysfs ? &sys_root : &proc_root;
+static struct proc_dir_entry *mount_root(struct mount *UNUSED(mount)) {
+    return &proc_root;
 }
 
 static int proc_lookup(struct proc_dir_entry *root_entry, const char *path, struct proc_entry *entry) {
@@ -316,21 +315,6 @@ void proc_printf(struct proc_data *buf, const char *format, ...) {
 static int proc_fsetattr(struct fd *UNUSED(fd), struct attr attr) {
     return attr.type == attr_size ? 0 : _EPERM;
 }
-
-// sysfs: the same synthetic-file machinery over fs/sys.c's tree (the software
-// DRM device's entries), with sysfs's filesystem magic that udev checks.
-const struct fs_ops sysfs = {
-    .name = "sysfs", .magic = 0x62656572,
-    .fsetattr = proc_fsetattr,
-    .permission = proc_permission,
-    .open = proc_open,
-    .getpath = proc_getpath,
-    .stat = proc_stat,
-    .fstat = proc_fstat,
-    .readlink = proc_readlink,
-    .follow_link = proc_follow_link,
-    .unlink = proc_unlink,
-};
 
 const struct fs_ops procfs = {
     .name = "proc", .magic = 0x9fa0,

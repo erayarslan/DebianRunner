@@ -21,26 +21,15 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
-		1C1100000000000000000C02 /* lr_zstd_decompress.c in Sources */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000C02; };
-		1C1100000000000000000C01 /* steamos_image.c in Sources */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000C01; };
-        1A13000000000000000000C1 /* CaptureCleanupUITests.m in Sources */ = {isa = PBXBuildFile; fileRef = 1A14000000000000000000C1; };
         1F5300000000000000000048 /* LinuxRunnerLaunch.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 1F5400000000000000000048; };
 		1C1100000000000000000004 /* DebianSupport.bundle */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000004; };
 		1C1100000000000000000003 /* DebianInstaller.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000003; };
-		1C1100000000000000000A01 /* ArchInstaller.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000A01; };
-		1C1100000000000000000F01 /* FedoraInstaller.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F01; };
-		1C1100000000000000000F02 /* KaliInstaller.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F02; };
-		1C1100000000000000000F91 /* UbuntuInstaller.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F91; };
 		1C1100000000000000000F06 /* BluetoothSerialView.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F06; };
 		1C1100000000000000000F05 /* LongTaskCenter.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F05; };
 		1C1100000000000000000F04 /* HomeComponents.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F04; };
 		1C1100000000000000000F77 /* ModesView.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F77; };
 		1C1100000000000000000F03 /* AppStoreView.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F03; };
-		1C1100000000000000000B03 /* SteamOSSupport.bundle */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000B03; };
 		1C1100000000000000000B04 /* DistroLogos.bundle */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000B04; };
-		1C1100000000000000000B05 /* DesktopLogos.bundle */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000B05; };
-		1C1100000000000000000B02 /* SteamOSInstaller.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000B02; };
-		1C1100000000000000000B01 /* SteamOSManifest.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000B01; };
 		1C1100000000000000000002 /* DebianBootstrap.c */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000002; };
 		AABBCCDD1122334455667701 /* netlink.c in Sources */ = {isa = PBXBuildFile; fileRef = AABBCCDD1122334455667702 /* netlink.c */; };
 		0FC2383C2991FBA6004C09EC /* mmx.c in Sources */ = {isa = PBXBuildFile; fileRef = 0FC2383B2991FB82004C09EC /* mmx.c */; };
@@ -369,16 +358,9 @@
 		1A1100000000000000000003 /* RuntimeBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 1A1200000000000000000003; };
 		1A1100000000000000000004 /* FileTransfer.c in Sources */ = {isa = PBXBuildFile; fileRef = 1A1200000000000000000004; };
 		1A1300000000000000000001 /* LinuxRunnerUITests.m in Sources */ = {isa = PBXBuildFile; fileRef = 1A1400000000000000000001; };
-		1A13000000000000000000B1 /* ReferenceDistributionUITests.m in Sources */ = {isa = PBXBuildFile; fileRef = 1A14000000000000000000B1; };
-		1F5100000000000000000048 /* MetalFramebufferView.m in Sources */ = {isa = PBXBuildFile; fileRef = 1F5200000000000000000048; };
-		1F51000000000000000000A1 /* AudioBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 1F52000000000000000000A1; };
 		1F51000000000000000000A4 /* PasswordHash.c in Sources */ = {isa = PBXBuildFile; fileRef = 1F52000000000000000000A4; };
-		1B1100000000000000000001 /* GUIViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 1B1200000000000000000001; };
-		1B1100000000000000000002 /* RFBClient.m in Sources */ = {isa = PBXBuildFile; fileRef = 1B1200000000000000000002; };
-		1B1100000000000000000003 /* RFBProtocol.c in Sources */ = {isa = PBXBuildFile; fileRef = 1B1200000000000000000003; };
-		1B1100000000000000000004 /* GUISupport.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 1B1200000000000000000004; };
+		1B1100000000000000000004 /* Support.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 1B1200000000000000000004; };
 1C1100000000000000000001 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000001; };
-		1D1100000000000000000854 /* shader_compiler.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1D1200000000000000000854 /* shader_compiler.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXBuildRule section */
@@ -573,26 +555,15 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		1C1200000000000000000C02 /* lr_zstd_decompress.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = deps/zstd/lr_zstd_decompress.c; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000C01 /* steamos_image.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = tools/steamos_image.c; sourceTree = SOURCE_ROOT; };
-        1A14000000000000000000C1 /* CaptureCleanupUITests.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = app/UITests/CaptureCleanupUITests.m; sourceTree = SOURCE_ROOT; };
         1F5400000000000000000048 /* LinuxRunnerLaunch.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = app/LinuxRunner/LinuxRunnerLaunch.storyboard; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000004 /* DebianSupport.bundle */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = app/LinuxRunner/DebianSupport.bundle; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000003 /* DebianInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/DebianInstaller.swift; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000A01 /* ArchInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/ArchInstaller.swift; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000F01 /* FedoraInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/FedoraInstaller.swift; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000F02 /* KaliInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/KaliInstaller.swift; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000F91 /* UbuntuInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/UbuntuInstaller.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000F06 /* BluetoothSerialView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/BluetoothSerialView.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000F05 /* LongTaskCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/LongTaskCenter.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000F04 /* HomeComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/HomeComponents.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000F77 /* ModesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/ModesView.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000F03 /* AppStoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/AppStoreView.swift; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000B03 /* SteamOSSupport.bundle */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = app/LinuxRunner/SteamOSSupport.bundle; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000B04 /* DistroLogos.bundle */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = app/LinuxRunner/DistroLogos.bundle; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000B05 /* DesktopLogos.bundle */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = app/LinuxRunner/DesktopLogos.bundle; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000B02 /* SteamOSInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/SteamOSInstaller.swift; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000B01 /* SteamOSManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/SteamOSManifest.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000002 /* DebianBootstrap.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = app/LinuxRunner/DebianBootstrap.c; sourceTree = SOURCE_ROOT; };
 		AABBCCDD1122334455667702 /* netlink.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = netlink.c; sourceTree = "<group>"; };
 		0FC2383B2991FB82004C09EC /* mmx.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mmx.c; sourceTree = "<group>"; };
@@ -777,7 +748,6 @@
 		BB0B880E2589662200208600 /* sprite64.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = sprite64.png; sourceTree = "<group>"; };
 		BB0B88172589662A00208600 /* reworked.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = reworked.png; sourceTree = "<group>"; };
 		BB0B88202589734A00208600 /* notsurewhatthisis.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = notsurewhatthisis.png; sourceTree = "<group>"; };
-		BB0C03002AEEC85500E5ECBB /* gen_apk_repositories.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; name = gen_apk_repositories.py; path = app/gen_apk_repositories.py; sourceTree = "<group>"; };
 		BB0DF6F22CC4B01000EFECAE /* fchdir.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = fchdir.c; sourceTree = "<group>"; };
 		BB0DF6F32CC4B01000EFECAE /* fchdir.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = fchdir.h; sourceTree = "<group>"; };
 		BB0F552D239F8A790032A2A1 /* Icons.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Icons.plist; sourceTree = "<group>"; };
@@ -943,18 +913,10 @@
 		1A1200000000000000000003 /* RuntimeBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = app/LinuxRunner/RuntimeBridge.m; sourceTree = SOURCE_ROOT; };
 		1A1200000000000000000004 /* FileTransfer.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = app/LinuxRunner/FileTransfer.c; sourceTree = SOURCE_ROOT; };
 		1A1400000000000000000001 /* LinuxRunnerUITests.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = app/UITests/LinuxRunnerUITests.m; sourceTree = SOURCE_ROOT; };
-		1A14000000000000000000B1 /* ReferenceDistributionUITests.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = app/UITests/ReferenceDistributionUITests.m; sourceTree = SOURCE_ROOT; };
-		1F5200000000000000000048 /* MetalFramebufferView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = app/LinuxRunner/MetalFramebufferView.m; sourceTree = SOURCE_ROOT; };
-		1F52000000000000000000A1 /* AudioBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = app/LinuxRunner/AudioBridge.m; sourceTree = SOURCE_ROOT; };
-		1F52000000000000000000A2 /* AudioBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = app/LinuxRunner/AudioBridge.h; sourceTree = SOURCE_ROOT; };
 		1F52000000000000000000A4 /* PasswordHash.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = app/LinuxRunner/PasswordHash.c; sourceTree = SOURCE_ROOT; };
 		1F52000000000000000000A5 /* PasswordHash.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = app/LinuxRunner/PasswordHash.h; sourceTree = SOURCE_ROOT; };
-		1B1200000000000000000001 /* GUIViewController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = app/LinuxRunner/GUIViewController.m; sourceTree = SOURCE_ROOT; };
-		1B1200000000000000000002 /* RFBClient.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = app/LinuxRunner/RFBClient.m; sourceTree = SOURCE_ROOT; };
-		1B1200000000000000000003 /* RFBProtocol.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = app/LinuxRunner/RFBProtocol.c; sourceTree = SOURCE_ROOT; };
-		1B1200000000000000000004 /* GUISupport.bundle */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = app/LinuxRunner/GUISupport.bundle; sourceTree = SOURCE_ROOT; };
+		1B1200000000000000000004 /* Support.bundle */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = app/LinuxRunner/Support.bundle; sourceTree = SOURCE_ROOT; };
 1C1200000000000000000001 /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/Diagnostics.swift; sourceTree = SOURCE_ROOT; };
-		1D1200000000000000000854 /* shader_compiler.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = graphics/shader_compiler.cpp; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -1122,7 +1084,6 @@
 			children = (
 				BB13F7C8200ACC24003D1C4D /* xcode-meson.sh */,
 				494D03F72727DAC6004F0CCE /* xcode-ninja.sh */,
-				BB0C03002AEEC85500E5ECBB /* gen_apk_repositories.py */,
 			);
 			name = Scripts;
 			sourceTree = "<group>";
@@ -1240,43 +1201,25 @@
 			isa = PBXGroup;
 			children = (
 				1A1400000000000000000001,
-                1A14000000000000000000C1,
 				1A1200000000000000000004 /* FileTransfer.c */,
-				1F5200000000000000000048 /* MetalFramebufferView.m */,
-				1F52000000000000000000A1 /* AudioBridge.m */,
-				1F52000000000000000000A2 /* AudioBridge.h */,
 				1F52000000000000000000A4 /* PasswordHash.c */,
 				1F52000000000000000000A5 /* PasswordHash.h */,
 				1F5400000000000000000048 /* LinuxRunnerLaunch.storyboard */,
-				1B1200000000000000000001 /* GUIViewController.m */,
-				1B1200000000000000000002 /* RFBClient.m */,
-				1B1200000000000000000003 /* RFBProtocol.c */,
-				1B1200000000000000000004 /* GUISupport.bundle */,
+				1B1200000000000000000004 /* Support.bundle */,
 				1A1200000000000000000003 /* RuntimeBridge.m */,
-				1D1200000000000000000854 /* shader_compiler.cpp */,
 				1A1200000000000000000002 /* ManagerView.swift */,
 				1A12000000000000000000A3 /* SetupWizard.swift */,
 				1A1200000000000000000001 /* Environment.swift */,
                 1C1200000000000000000001 /* Diagnostics.swift */,
 				1C1200000000000000000004 /* DebianSupport.bundle */,
 				1C1200000000000000000003 /* DebianInstaller.swift */,
-				1C1200000000000000000A01 /* ArchInstaller.swift */,
-				1C1200000000000000000F01 /* FedoraInstaller.swift */,
-				1C1200000000000000000F02 /* KaliInstaller.swift */,
-				1C1200000000000000000F91 /* UbuntuInstaller.swift */,
 				1C1200000000000000000F06 /* BluetoothSerialView.swift */,
 				1C1200000000000000000F05 /* LongTaskCenter.swift */,
 				1C1200000000000000000F04 /* HomeComponents.swift */,
 				1C1200000000000000000F77 /* ModesView.swift */,
 				1C1200000000000000000F03 /* AppStoreView.swift */,
-				1C1200000000000000000B03 /* SteamOSSupport.bundle */,
 				1C1200000000000000000B04 /* DistroLogos.bundle */,
-				1C1200000000000000000B05 /* DesktopLogos.bundle */,
-				1C1200000000000000000B02 /* SteamOSInstaller.swift */,
-				1C1200000000000000000B01 /* SteamOSManifest.swift */,
 				1C1200000000000000000002 /* DebianBootstrap.c */,
-				1C1200000000000000000C02 /* lr_zstd_decompress.c */,
-				1C1200000000000000000C01 /* steamos_image.c */,
 				BB792B521F96D90D00FFB7A4 /* app */,
 				BB9C7B88240A343400F5D4F0 /* iSH.xcconfig */,
 				BB4A53931FAA393B00A72ACE /* most of the code */,
@@ -1668,8 +1611,6 @@
 				A07000000000000000000008 /* Build Static Apple Images */,
 				AA0000081F96D90D00FFB7A4 /* Sources */,
 				AA0000091F96D90D00FFB7A4 /* Frameworks */,
-				A07000000000000000000007 /* Download AOT Root */,
-				AA000012AF96D90D00FFB7A4 /* Generate APK Repositories File */,
 				AA000013AF96D90D00FFB7A4 /* Compile JavaScript */,
 				AA000010AF96D90D00FFB7A4 /* Resources */,
 				AA000014AF96D90D00FFB7A4 /* Embed Foundation Extensions */,
@@ -1726,8 +1667,6 @@
 				AA000300AF96D90D00FFB7A4 /* Build Meson (ARM64) */,
 				AA0000081F96D90D00FFB7A4 /* Sources */,
 				AA0000091F96D90D00FFB7A4 /* Frameworks */,
-				AA000011AF96D90D00FFB7A4 /* Download Root */,
-				AA000012AF96D90D00FFB7A4 /* Generate APK Repositories File */,
 				AA000013AF96D90D00FFB7A4 /* Compile JavaScript */,
 				AA000010AF96D90D00FFB7A4 /* Resources */,
 				AA000014AF96D90D00FFB7A4 /* Embed Foundation Extensions */,
@@ -1749,11 +1688,8 @@
 			buildConfigurationList = AA0000031F96D90D00FFB7A4 /* Build configuration list for PBXNativeTarget "iSH-ARM64" */;
 			buildPhases = (
 				AA000300AF96D90D00FFB7A4 /* Build Meson (ARM64) */,
-				1D1500000000000000000854 /* Build Shader Compiler */,
 				AA0000081F96D90D00FFB7A4 /* Sources */,
 				AA0000091F96D90D00FFB7A4 /* Frameworks */,
-				AA000011AF96D90D00FFB7A4 /* Download Root */,
-				AA000012AF96D90D00FFB7A4 /* Generate APK Repositories File */,
 				AA000013AF96D90D00FFB7A4 /* Compile JavaScript */,
 				AA000010AF96D90D00FFB7A4 /* Resources */,
 				AA000014AF96D90D00FFB7A4 /* Embed Foundation Extensions */,
@@ -1826,8 +1762,6 @@
 			buildPhases = (
 				BB21A17826890A5B00BD19B4 /* Sources */,
 				BB792B4D1F96D90D00FFB7A4 /* Frameworks */,
-				BBF1248B1FA7BF530088FB50 /* Download Root */,
-				BB034E8C263643C10000A498 /* Generate APK Repositories File */,
 				BB4A53AC1FAA49CA00A72ACE /* Compile JavaScript */,
 				BB792B4E1F96D90D00FFB7A4 /* Resources */,
 			);
@@ -1931,8 +1865,6 @@
 			buildPhases = (
 				BB21A1722689084800BD19B4 /* Sources */,
 				BBEF196F268066D1001225BD /* Frameworks */,
-				BBEF1979268066D1001225BD /* Download Root */,
-				BBEF197A268066D1001225BD /* Generate APK Repositories File */,
 				BBEF197B268066D1001225BD /* Compile JavaScript */,
 				BBEF197C268066D1001225BD /* Resources */,
 				BBEF1997268066D1001225BD /* Embed Foundation Extensions */,
@@ -2104,11 +2036,9 @@
 				XT000012AF96D90D00FFB7A4 /* xterm-term-bridge.js in Resources */,
 				XT000013AF96D90D00FFB7A4 /* xterm-vendor in Resources */,
 				1F5300000000000000000048 /* LinuxRunnerLaunch.storyboard in Resources */,
-				1B1100000000000000000004 /* GUISupport.bundle in Resources */,
+				1B1100000000000000000004 /* Support.bundle in Resources */,
 				1C1100000000000000000004 /* DebianSupport.bundle */,
-				1C1100000000000000000B03 /* SteamOSSupport.bundle */,
 				1C1100000000000000000B04 /* DistroLogos.bundle */,
-				1C1100000000000000000B05 /* DesktopLogos.bundle */,
 				CC000002AF96D90D00FFB7A4 /* RootfsPatch.bundle in Resources */,
 				JB000001AF96D90D00FFB7A4 /* JetBrainsMonoNerdFontMono-Regular.ttf in Resources */,
 				JB000002AF96D90D00FFB7A4 /* JetBrainsMonoNerdFontMono-Bold.ttf in Resources */,
@@ -2237,65 +2167,6 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		A07000000000000000000007 /* Download AOT Root */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = ();
-			inputPaths = (
-				"$(SRCROOT)/app/download-root.sh",
-				"$(SRCROOT)/app/download-aot-root.sh",
-				"$(SRCROOT)/app/GuestARM64.xcconfig",
-				"$(SRCROOT)/scripts/package-bun-rootfs.py",
-			);
-			name = "Download AOT Root";
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/root.tar.gz",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "sh \"$SRCROOT/app/download-aot-root.sh\"\n";
-			showEnvVarsInLog = 0;
-		};
-		AA000011AF96D90D00FFB7A4 /* Download Root */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Download Root";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/root.tar.gz",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "sh \"$SRCROOT/app/download-root.sh\"\n";
-			showEnvVarsInLog = 0;
-		};
-		AA000012AF96D90D00FFB7A4 /* Generate APK Repositories File */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-				"$(SRCROOT)/app/gen_apk_repositories.py",
-			);
-			name = "Generate APK Repositories File";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/repositories.txt",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "python3 $SRCROOT/app/gen_apk_repositories.py\n";
-		};
 		AA000013AF96D90D00FFB7A4 /* Compile JavaScript */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -2347,26 +2218,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "set -eu\nexport PATH=\"$PATH:/opt/homebrew/bin:$HOME/.bun/bin\"\nbun \"$SRCROOT/tools/jit_aot/archive-apple.ts\"\n";
-		};
-		BB034E8C263643C10000A498 /* Generate APK Repositories File */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-				"$(SRCROOT)/app/gen_apk_repositories.py",
-			);
-			name = "Generate APK Repositories File";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/repositories.txt",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = "/bin/sh -e";
-			shellScript = "python3 $SRCROOT/app/gen_apk_repositories.py\n";
 		};
 		BB13F813200AEFAC003D1C4D /* ShellScript */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -2452,42 +2303,6 @@
 			shellPath = /bin/sh;
 			shellScript = "mkdir -p \"$CONFIGURATION_BUILD_DIR\"\nln -sf \"$MESON_BUILD_DIR/deps/$PRODUCT_NAME.a\" \"$CONFIGURATION_BUILD_DIR\"\n";
 		};
-		BBEF1979268066D1001225BD /* Download Root */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputPaths = (
-			);
-			name = "Download Root";
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/root.tar.gz",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "sh \"$SRCROOT/app/download-root.sh\"\n";
-			showEnvVarsInLog = 0;
-		};
-		BBEF197A268066D1001225BD /* Generate APK Repositories File */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-				"$(SRCROOT)/app/gen_apk_repositories.py",
-			);
-			name = "Generate APK Repositories File";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/repositories.txt",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = "/bin/sh -e";
-			shellScript = "python3 $SRCROOT/app/gen_apk_repositories.py\n";
-		};
 		BBEF197B268066D1001225BD /* Compile JavaScript */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
@@ -2503,22 +2318,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = "/bin/sh -e";
 			shellScript = "cd $SRCROOT/deps/libapps\n./hterm/bin/mkdist\n";
-			showEnvVarsInLog = 0;
-		};
-		BBF1248B1FA7BF530088FB50 /* Download Root */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputPaths = (
-			);
-			name = "Download Root";
-			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/root.tar.gz",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "sh \"$SRCROOT/app/download-root.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 		BBFB2C572590257E00545EAB /* ShellScript */ = {
@@ -2537,18 +2336,7 @@
 			shellPath = /bin/sh;
 			shellScript = "mkdir -p \"$CONFIGURATION_BUILD_DIR\"\nln -sf \"$MESON_BUILD_DIR/$PRODUCT_NAME.a\" \"$CONFIGURATION_BUILD_DIR\"\n";
 		};
-		1D1500000000000000000854 /* Build Shader Compiler */ = {
- isa = PBXShellScriptBuildPhase;
- alwaysOutOfDate = 1;
- buildActionMask = 2147483647;
- files = ();
- inputPaths = ();
- outputPaths = ();
- name = "Build Shader Compiler";
- runOnlyForDeploymentPostprocessing = 0;
- shellPath = /bin/bash;
- shellScript = "/bin/bash \"$SRCROOT/scripts/build-shader-compiler.sh\" \"$PLATFORM_NAME\" \"$ARCHS\"";
-};
+
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -2646,13 +2434,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				1D1100000000000000000854 /* shader_compiler.cpp in Sources */,
-				1F5100000000000000000048 /* MetalFramebufferView.m in Sources */,
-				1F51000000000000000000A1 /* AudioBridge.m in Sources */,
 				1F51000000000000000000A4 /* PasswordHash.c in Sources */,
-				1B1100000000000000000001 /* GUIViewController.m in Sources */,
-				1B1100000000000000000002 /* RFBClient.m in Sources */,
-				1B1100000000000000000003 /* RFBProtocol.c in Sources */,
 				1A1100000000000000000004 /* FileTransfer.c in Sources */,
 				1A1100000000000000000003 /* RuntimeBridge.m in Sources */,
 				1A1100000000000000000002 /* ManagerView.swift in Sources */,
@@ -2660,17 +2442,11 @@
 				1A1100000000000000000001 /* Environment.swift in Sources */,
                 1C1100000000000000000001 /* Diagnostics.swift in Sources */,
 				1C1100000000000000000003 /* DebianInstaller.swift */,
-				1C1100000000000000000A01 /* ArchInstaller.swift */,
-				1C1100000000000000000F01 /* FedoraInstaller.swift */,
-				1C1100000000000000000F02 /* KaliInstaller.swift */,
-				1C1100000000000000000F91 /* UbuntuInstaller.swift */,
 				1C1100000000000000000F06 /* BluetoothSerialView.swift */,
 				1C1100000000000000000F05 /* LongTaskCenter.swift */,
 				1C1100000000000000000F04 /* HomeComponents.swift */,
 				1C1100000000000000000F77 /* ModesView.swift */,
 				1C1100000000000000000F03 /* AppStoreView.swift */,
-				1C1100000000000000000B02 /* SteamOSInstaller.swift */,
-				1C1100000000000000000B01 /* SteamOSManifest.swift */,
 				1C1100000000000000000002 /* DebianBootstrap.c */,
 				AA000020AF96D90D00FFB7A4 /* main.m in Sources */,
 				AA000021AF96D90D00FFB7A4 /* LocationDevice.m in Sources */,
@@ -2713,8 +2489,6 @@
 				AA00011FAF96D90D00FFB7A4 /* NSObject+SaneKVO.m in Sources */,
 				AA000120AF96D90D00FFB7A4 /* ThemesViewController.m in Sources */,
 				AA000121AF96D90D00FFB7A4 /* fakefs.c in Sources */,
-				1C1100000000000000000C02 /* lr_zstd_decompress.c in Sources */,
-				1C1100000000000000000C01 /* steamos_image.c in Sources */,
 				AA000122AF96D90D00FFB7A4 /* ArrowBarButton.m in Sources */,
 				AA000130AF96D90D00FFB7A4 /* DebugServer.c in Sources */,
 			);
@@ -2745,8 +2519,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				1A1300000000000000000001,
-				1A13000000000000000000B1,
-                1A13000000000000000000C1,
 				BB41591F255EF9E300E0950C /* UITests.m in Sources */,
 				BBD23D5F258DA450003DCB40 /* Screenshots.m in Sources */,
 				BBD23D77258DA4BC003DCB40 /* SnapshotHelper.swift in Sources */,

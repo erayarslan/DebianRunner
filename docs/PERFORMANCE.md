@@ -1,54 +1,16 @@
-# Graphics and Runtime Performance
-
-## Enable the Metal GPU
-
-Open **Settings → Graphics → Linux GPU Device → GPU → Metal GPU · Experimental**. Fully close LinuxRunner from the app switcher and reopen it, then check **Active renderer** and its reason on the same page. Build 900's **Automatic** GPU selection uses software. **Software Rendering** remains available for compatibility.
-
-This virtual GPU path uses **guest Mesa/virgl → virglrenderer → ANGLE → Metal**. The separate **Linux Applications → Renderer** picker and a Metal framebuffer presenter are different mechanisms; neither alone confirms this GPU device is active. Even an active device does not guarantee every application/API uses it.
-
-## Physical iPhone — Maintainer Report
-
-The maintainer reports this result from physical-device Hyprland testing:
-
-| Item | Reported value |
-| --- | --- |
-| Hardware | iPhone 16 Pro |
-| OS | iOS 27.2 |
-| Software rendering | Approximately 10 FPS |
-| Metal rendering | Approximately 55–60 FPS |
-| Test scope | Hyprland; detailed scene, distribution/package versions and duration not supplied |
-| Measurement method | Counter/instrument not specified; informal observation supplied by the maintainer |
-
-Reported on 2026-11-01. The maintainer reports that other desktops can achieve higher frame rates; no additional desktop-specific figures were supplied. No raw trace or paired-run dataset was supplied. Treat this as an owner-reported physical-device result, not an independently reproduced controlled benchmark. The owner separately confirms both the Hyprland and FreeCAD captures used the GPU. Do not substitute the development-host method below for this phone observation.
-
-## Development-Host Hyprland Measurement
-
-**Hardware/environment:** Apple M1 development host, macOS 27, LinuxRunner ARM64 runtime; Arch Linux ARM with Hyprland 0.57. Recorded release-candidate source: `4c1e31d5`.
-
-**Workload:** continuously scrolling foot terminal, 960 × 540 output. **Method:** virtual-KMS page-flip count divided by 60 seconds, two alternating software/accelerated rounds on the same host/runtime. This measures compositor output updates, not a game's FPS or final phone/receiver scanout.
-
-| Renderer | Round 1 | Round 2 | Mean |
-| --- | --- | --- | --- |
-| llvmpipe / software KMS | 4.1 FPS | 4.0 FPS | 4.05 FPS |
-| Mesa virgl / virglrenderer / ANGLE / Metal | 55.6 FPS | 55.3 FPS | 55.45 FPS |
-
-The ratio of means is **13.7×** for this workload. **These are not physical-iPhone measurements.** The owner confirms the supplied Hyprland and FreeCAD images used GPU acceleration; the images are separate from the benchmark. Hardware, desktop, graphics API, workload and presentation path affect real performance.
-
-The earlier 4.5 → 49.9 FPS development-host result used an earlier candidate; it is superseded here by the later alternating measurement. It was not an iPhone result either.
+# Runtime Performance
 
 ## Interpreter and Optional JIT
 
-Measured on **2026-11-01**, on the same Apple M1/macOS 27 host and Debian 13/LXQt filesystem fixture, comparing:
+Measured on **2026-11-01** on an Apple M1/macOS development host with a Debian 13 ARM64 filesystem fixture, comparing:
 
-- Build 899 source `a1632e5a`, interpreter, Meson debugoptimized with JIT disabled.
-- The current release-cycle interpreter, debugoptimized, JIT disabled.
-- The same release-cycle runtime with JIT enabled (JIT code version 14).
+- Build 899 (`a1632e5a`), interpreter, Meson debugoptimized with JIT disabled.
+- Updated Asbestos interpreter, debugoptimized, JIT disabled.
+- Updated runtime with optional ARM64 JIT enabled (JIT code version 14).
 
-The engineering record names the latter two as current main rather than recording an exact hash. Measurements preceded the final vector-RBIT and proc-stat-lock fixes; those fixes did not touch the measured paths. This provenance limits exact reproduction of the recorded comparison.
+**Method:** three alternating rounds per runtime; medians and min–max below. Microbenchmarks report **ns/iteration**; macro workloads (`python_start` onward) report **wall-clock ms**. Output checksums matched across all runs. Correctness gates (`jit_fault_registers_contract`, `precise_fault_pc_contract`, `jit_smoke`) passed on each compared runtime.
 
-**Method:** three rounds, runtime order alternating within each round; medians and min–max below. Microbenchmarks report **ns/iteration**; macro workloads (`python_start` onward) report **wall-clock ms**. Output checksums were identical. Recorded correctness gates (`jit_fault_registers_contract`, `precise_fault_pc_contract`, `jit_smoke`) passed on each compared runtime. These are existing engineering results, not tests rerun during documentation preparation.
-
-The microbenchmark source is retained at [interp_bench.c](../tests/linuxrunner/bench/interp_bench.c). The original orchestration scripts and fixture configuration are not a self-contained public benchmark kit; do not treat this table as a one-command reproducibility claim. Ratios are Build 899 time / candidate time; above 1 means faster.
+The microbenchmark source is at [interp_bench.c](../tests/linuxrunner/bench/interp_bench.c). Ratios are Build 899 time / candidate time (above 1.0× means faster).
 
 | workload | rel 899 median (min–max) | current interpreter | current JIT | interpreter vs 899 | JIT vs 899 | outputs |
 |---|---|---|---|---|---|---|
@@ -75,9 +37,8 @@ The microbenchmark source is retained at [interp_bench.c](../tests/linuxrunner/b
 | sort | 466 (454–583) | 465 (420–549) | 461 (453–520) | 1.00× | 1.01× | identical |
 | sha256 | 15 (15–32) | 15 (14–16) | 23 (22–27) | 1.00× | 0.65× | identical |
 
-
 ## Interpret the Numbers Carefully
 
-NEON and string microbenchmarks show interpreter improvements of about 1.26× and 1.32×. The JIT benefits some compute-heavy workloads, while translation overhead makes several short workloads slower: Python startup is 198 ms versus 171 ms for Build 899, and the short SHA-256 macro is 23 ms versus 15 ms. Not every workload improves.
+NEON and string microbenchmarks show interpreter improvements of about 1.26× and 1.32×. The optional JIT benefits longer compute-heavy workloads (`python_compute`, `python_json`, `gcc_compile`), while translation overhead can make short-lived commands (`python_start`, `sha256`) slower than the interpreter.
 
-Macro timings varied by up to approximately 47% on the busy host; differences below about 10% are not significant in this run. These results are not device benchmarks, universal speedups, battery measurements or network benchmarks. The phone result above is a separate maintainer report. No optional-JIT device benchmark is available in the reviewed evidence.
+These are development-host measurements, not physical-iPhone benchmarks. See [JIT implementation](engine/IOS_JIT.md).

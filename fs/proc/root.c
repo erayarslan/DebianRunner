@@ -198,7 +198,7 @@ int proc_show_mountinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf)
 
 static int proc_show_filesystems(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     // The filesystem types LinuxRunner can mount (see fs/ and kernel/fs.c).
-    proc_printf(buf, "nodev\tproc\nnodev\ttmpfs\nnodev\tdevpts\nnodev\tsysfs\n\tfakefs\n\trealfs\n");
+    proc_printf(buf, "nodev\tproc\nnodev\ttmpfs\nnodev\tdevpts\n\tfakefs\n\trealfs\n");
     return 0;
 }
 

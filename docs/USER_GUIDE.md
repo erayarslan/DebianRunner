@@ -1,13 +1,12 @@
-# LinuxRunner User Guide
+# DebianRunner User Guide
 
-Start with [Installing LinuxRunner](INSTALLATION.md), then [Installing Linux inside the app](GETTING_STARTED.md). JIT is optional; Debian or Arch is recommended for desktops.
+Start with [Installing DebianRunner](INSTALLATION.md), then [Getting Started with Debian Minimal](GETTING_STARTED.md). JIT is optional; no desktop environment is required or included.
 
-- [Desktop controls, sessions and logs](DESKTOP_CONTROLS.md)
-- [Metal activation and measured performance](PERFORMANCE.md)
-- [Networking, DeX Mode and external displays](NETWORKING_AND_DISPLAYS.md)
 - [Import/export and shared files](FILE_SHARING.md)
-- [Application and desktop compatibility](COMPATIBILITY.md)
-- [Troubleshooting and recovery](TROUBLESHOOTING.md)
-- [Architecture](ARCHITECTURE.md) and [building](BUILDING.md)
+- [Networking and headless modes](NETWORKING_AND_DISPLAYS.md)
+- [Compatibility](COMPATIBILITY.md) and [Known limitations](KNOWN_LIMITATIONS.md)
+- [Runtime performance](PERFORMANCE.md)
+- [Troubleshooting and repair](TROUBLESHOOTING.md)
+- [Architecture](ARCHITECTURE.md) and [Building from source](BUILDING.md)
 
-The [README](../README.md) contains the current requirements and visual overview. Historical release notes describe their own versions.
+The [README](../README.md) provides a quick overview. Historical notes in `docs/releases/` describe earlier upstream versions.

@@ -1,2 +1,0 @@
-dissect.btrfs==1.10
-zstandard==0.25.0

@@ -14,7 +14,7 @@ struct DiagnosticEvent: Codable {
 enum DiagnosticPrivacy {
     static func redact(_ input: String) -> String {
         // Fail closed for payloads whose meaning cannot be safely inferred.
-        if ["JavaScript result=", "bytes_hex=", "BROWSER_TEST:", "key_text=", "Authorization:", "Set-Cookie:", "Cookie:"].contains(where: input.localizedCaseInsensitiveContains) { return "[private payload omitted]" }
+        if ["bytes_hex=", "key_text=", "Authorization:", "Set-Cookie:", "Cookie:"].contains(where: input.localizedCaseInsensitiveContains) { return "[private payload omitted]" }
         if input.contains("-----BEGIN") { return "[key material omitted]" }
         var result = input
         let patterns = [
@@ -34,8 +34,7 @@ enum DiagnosticPrivacy {
     static func crashOutput(_ input: String) -> String {
         let log = input.lowercased()
         let diagnostic = ["fatal", "assert", "check failed", "error", "warning", "sandbox", "libc++", "terminat", "out_of_range", "string_view::substr"]
-        let qtPlatform = ["qt.qpa.", "Could not load the Qt platform plugin", "This application failed to start because no Qt platform plugin", "Available platform plugins are:"]
-        guard diagnostic.contains(where: log.contains) || qtPlatform.contains(where: input.hasPrefix) else { return "[non-diagnostic application output omitted]" }
+        guard diagnostic.contains(where: log.contains) else { return "[non-diagnostic application output omitted]" }
         return String(redact(input).prefix(640))
     }
     static func applicationExport(_ input: String) -> String {
@@ -43,14 +42,14 @@ enum DiagnosticPrivacy {
         // include diagnostic records, not arbitrary user program output.
         input.split(separator: "\n", omittingEmptySubsequences: false).map { line in
             let s = String(line)
-            let allowed = ["GUI_", "DESKTOP_", "X11_", "FOCUS:", "QT_TEST:", "BROWSER:", "BROWSER_", "FIREFOX_", "[Parent", "Gtk-WARNING", "WARNING", "ERROR", "FATAL", "Crash Annotation", "Xlib:", "xauth:", "QPainter::", "QWidget::", "QEGLPlatformContext:", "qt.qpa.", "Could not load the Qt platform plugin", "This application failed to start because no Qt platform plugin", "Available platform plugins are:"]
+            let allowed = ["WARNING", "ERROR", "FATAL", "Crash Annotation", "PACKAGE_", "DEBIAN_"]
             return allowed.contains(where: s.hasPrefix) ? redact(s) : "[unstructured application output omitted]"
         }.joined(separator: "\n")
     }
 }
 
 // Crash reports contain structured runtime evidence, never arbitrary application
-// buffers or browser output. A preceding errno is evidence, not proven causality.
+// buffers. A preceding errno is evidence, not proven causality.
 struct GuestCrashReport: Codable, Identifiable {
     var id = UUID()
     var timestamp = Date()
@@ -89,7 +88,7 @@ struct GuestCrashReport: Codable, Identifiable {
     }
     var fullText: String {
         let format = ISO8601DateFormatter()
-        return "LinuxRunner Application Crash Diagnostics\n\(summary)\nTimestamp: \(format.string(from: timestamp))\nClassification: \(category)\nProbable cause: \(probableCause)\nSignal/exit status is confirmed. A preceding syscall error does not prove the crash cause.\n" + metadata.keys.sorted().map { "\($0): \(metadata[$0] ?? "")" }.joined(separator: "\n") + "\n\nRuntime context (frame-pointer walk is best effort; symbols appear only for exact exported/function ranges):\n" + context.joined(separator: "\n") + "\n\nPrivacy: bounded stdout/stderr tails are filtered to diagnostic lines and redacted before persistence. Arbitrary output, input, cookies, browser contents and environment variables are omitted. Error evidence is bounded; missing context is not a successful test.\n"
+        return "LinuxRunner Application Crash Diagnostics\n\(summary)\nTimestamp: \(format.string(from: timestamp))\nClassification: \(category)\nProbable cause: \(probableCause)\nSignal/exit status is confirmed. A preceding syscall error does not prove the crash cause.\n" + metadata.keys.sorted().map { "\($0): \(metadata[$0] ?? "")" }.joined(separator: "\n") + "\n\nRuntime context (frame-pointer walk is best effort; symbols appear only for exact exported/function ranges):\n" + context.joined(separator: "\n") + "\n\nPrivacy: bounded stdout/stderr tails are filtered to diagnostic lines and redacted before persistence. Arbitrary output, input, cookies and environment variables are omitted. Error evidence is bounded; missing context is not a successful test.\n"
     }
 }
 final class GuestCrashStore {
@@ -271,8 +270,6 @@ import SwiftUI
             // A nonzero exit status alone is ordinary Unix behaviour (grep found
             // nothing, a readiness probe polled "not yet", test failed). Keep it
             // only with evidence of a failure; crashes (signals) are always kept.
-            // Recording every such exit evicted real crash reports and showed
-            // "desktop-probe exited with status 1" banners during desktop start.
             if signal == 0 && report.probableCause.hasPrefix("Unknown") { return }
             if let store = store { store.append(report) } else { memoryOnly.insert(report,at:0); memoryOnly=Array(memoryOnly.prefix(20)) }
             DispatchQueue.main.async {
@@ -337,7 +334,7 @@ import SwiftUI
         }
     }
     // Independent bounded log persists installation diagnostics even if the
-    // live ring is busy with the already-running Alpine guest.
+    // live ring is busy with another running guest.
     @objc static func installer(_ severity: Int, message: String) {
         record("DEBIAN_INSTALL", severity: severity, message: message, pid: 0, tid: 0)
         let event = DiagnosticEvent(level: DiagnosticLevel(rawValue: severity) ?? .info, category: "DEBIAN_INSTALL", message: message)

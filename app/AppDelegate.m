@@ -39,7 +39,6 @@
 #include "fs/dyndev.h"
 #include "fs/devices.h"
 #include "fs/path.h"
-#include "graphics/guest_gpu.h"
 #if !ISH_LINUX && defined(GUEST_ARM64)
 #include "DebugServer.h"
 #endif
@@ -156,11 +155,8 @@ static int bootError;
     NSLog(@"AOT target layout: %s", layout);
 #endif
 #ifdef LINUXRUNNER
-    LRBootEvent("rootfs located: validating bundled resource");
-    NSURL *archiveURL = [NSBundle.mainBundle URLForResource:@"root" withExtension:@"tar.gz"];
-    if (!archiveURL || ![NSFileManager.defaultManager isReadableFileAtPath:archiveURL.path]) return _ENOENT;
-    LRBootEvent("environment metadata: loading root catalog and verified import if needed");
-    if (Roots.instance.initializationError || !Roots.instance.defaultRoot) return _EIO;
+    LRBootEvent("environment metadata: loading Debian root catalog");
+    if (Roots.instance.initializationError || !Roots.instance.defaultRoot) return _ENOENT;
 #endif
     NSURL *root = [Roots.instance rootUrl:Roots.instance.defaultRoot];
 #ifdef LINUXRUNNER
@@ -225,16 +221,6 @@ static int bootError;
     generic_mknodat(AT_PWD, "/dev/full", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_FULL_MINOR));
     generic_mknodat(AT_PWD, "/dev/random", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_RANDOM_MINOR));
     generic_mknodat(AT_PWD, "/dev/urandom", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_URANDOM_MINOR));
-    
-#ifdef LINUXRUNNER
-    // Guest Metal device (fs/gpu.c). Every open is an isolated, quota-limited
-    // context, like a Linux DRM render node, so ordinary desktop users need it:
-    // before this, only root-run launchers could create it and GPU modes failed
-    // or silently fell back for non-root desktop sessions. A node left 0600 by
-    // older launchers is repaired here.
-    generic_mknodat(AT_PWD, "/dev/linuxrunner-gpu", S_IFCHR|0666, dev_make(LR_GPU_MAJOR, 0));
-    generic_setattrat(AT_PWD, "/dev/linuxrunner-gpu", (struct attr) {.type = attr_mode, .mode = S_IFCHR|0666}, false);
-#endif
 
     generic_mkdirat(AT_PWD, "/dev/pts", 0755);
     generic_mkdirat(AT_PWD, "/mnt", 0755);
@@ -255,16 +241,6 @@ static int bootError;
     generic_mknodat(AT_PWD, "/dev/location", S_IFCHR|0666, dev_make(DYN_DEV_MAJOR, DEV_LOCATION_MINOR));
 
     do_mount(&procfs, "proc", "/proc", "", 0);
-#ifdef LINUXRUNNER
-    // Software KMS device (fs/drm.c) and the sysfs entries describing it:
-    // CPU rendering only. Its /dev nodes exist only while a Hyprland desktop
-    // runs (session.sh), so other desktops see no DRM device.
-    setenv("ISH_SOFTWARE_DRM", "1", 0);
-    // Anonymous shared-buffer exports for the managed KWin virtual output.
-    // No device is exposed until the selected desktop prepares its nodes.
-    setenv("ISH_SOFTWARE_DMABUF", "1", 0);
-    do_mount(&sysfs, "sysfs", "/sys", "", 0);
-#endif
     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
 
 #ifdef LINUXRUNNER
@@ -310,29 +286,7 @@ static int bootError;
     NSArray<NSString *> *command;
     command = UserPreferences.shared.bootCommand;
 #ifdef LINUXRUNNER
-    BOOL kali = [LRRuntimeBridge activeEnvironmentIsKali];
-    BOOL ubuntu = [LRRuntimeBridge activeEnvironmentIsUbuntu];
-    BOOL voidLinux = [LRRuntimeBridge activeEnvironmentIsVoid];
-    if (!kali && ([LRRuntimeBridge activeEnvironmentIsDebian] || [LRRuntimeBridge activeEnvironmentIsArch] || [LRRuntimeBridge activeEnvironmentIsSteamOS])) command = @[@"/bin/sh", @"/usr/lib/linuxrunner/init.sh"];
-    if ([LRRuntimeBridge activeEnvironmentIsFedora] || kali || ubuntu || voidLinux) {
-        // The official Fedora, Kali and Ubuntu userspaces are not booted with
-        // their normal init system here. Run
-        // only LinuxRunner's bundled first-start validator and a userspace PID 1.
-        // Do not copy host files into fakefs behind its metadata database.
-        NSURL *support = [NSBundle.mainBundle URLForResource:@"GUISupport" withExtension:@"bundle"];
-        NSString *initializerName = kali ? @"initialize-kali.sh" : ubuntu ? @"initialize-ubuntu.sh" : voidLinux ? @"initialize-void.sh" : @"initialize-fedora.sh";
-        NSString *initializer = support ? [NSString stringWithContentsOfURL:[support URLByAppendingPathComponent:initializerName] encoding:NSUTF8StringEncoding error:nil] : nil;
-        if (!initializer.length || initializer.length > 4000) {
-            LRBootEvent("Distribution initializer resource missing or invalid");
-            return _EINVAL;
-        }
-        // Ubuntu-based flavors (Pop!_OS, Zorin OS): record which one, so desktop
-        // setup layers its signed repository (GUISupport initialize-<flavor>.sh).
-        NSString *flavor = ubuntu ? [LRRuntimeBridge activeFlavor] : nil;
-        NSString *flavorMarker = ([flavor isEqual:@"pop"] || [flavor isEqual:@"zorin"]) ? [NSString stringWithFormat:@"mkdir -p /var/lib/linuxrunner && printf '%%s\\n' %@ > /var/lib/linuxrunner/flavor\n", flavor] : @"";
-        NSString *script = [NSString stringWithFormat:@"mkdir -p /var/log || exit 1\n%@(\n%@\n) >>/var/log/linuxrunner-initialize.log 2>&1\nwhile :; do sleep 3600; done\n", flavorMarker, initializer];
-        command = @[@"/bin/sh", @"-c", script];
-    }
+    command = @[@"/bin/sh", @"/usr/lib/linuxrunner/init.sh"];
 #endif
     if (command.count == 0) {
         NSLog(@"boot command is empty");
@@ -512,6 +466,7 @@ static void configureGuestHostAlias(void) {
 #ifdef LINUXRUNNER
     LRBootEvent("application delegate initialized");
     if (![LRRuntimeBridge autoStart]) { LRBootEvent("runtime auto start OFF: native workspace available before boot"); return YES; }
+    if (!Roots.instance.defaultRoot) { LRBootEvent("no Debian environment installed yet: waiting for initial setup"); return YES; }
     [self startLinuxRuntime];
 #else
     CFAbsoluteTime bootStart = CFAbsoluteTimeGetCurrent();

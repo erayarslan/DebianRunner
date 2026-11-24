@@ -241,7 +241,7 @@
 - (int)startSession {
     NSArray<NSString *> *command = self.runnerCommand ?: UserPreferences.shared.launchCommand;
 #ifdef LINUXRUNNER
-    if (!self.runnerCommand && ([LRRuntimeBridge activeEnvironmentIsDebian] || [LRRuntimeBridge activeEnvironmentIsArch] || [LRRuntimeBridge activeEnvironmentIsFedora])) command = @[@"/bin/bash", @"-l"];
+    if (!self.runnerCommand) command = @[@"/bin/bash", @"-l"];
     if (!self.runnerCommand) {
         NSError *accountError = nil;
         NSArray<NSString *> *login = [LRRuntimeBridge defaultLinuxLoginCommand:&accountError];
@@ -294,10 +294,8 @@
     }
 
 #ifdef LINUXRUNNER
-    // The glibc distributions use the same terminal/login path. su - selects
-    // the configured user's home; a default root login starts in its home too.
-    if (!self.runnerDirectory.length && !self.runnerCommand &&
-        ([LRRuntimeBridge activeEnvironmentIsDebian] || [LRRuntimeBridge activeEnvironmentIsArch] || [LRRuntimeBridge activeEnvironmentIsFedora])) {
+    // Debian minimal login starts in /root unless su - selects a normal user's home.
+    if (!self.runnerDirectory.length && !self.runnerCommand) {
         struct fd *home = generic_open("/root", O_RDONLY_ | O_DIRECTORY_, 0);
         if (!IS_ERR(home)) fs_chdir(current->fs, home);
     }

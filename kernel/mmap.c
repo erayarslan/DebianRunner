@@ -2,7 +2,6 @@
 #include <stdatomic.h>
 #include "debug.h"
 #include "kernel/calls.h"
-#include "fs/dmabuf.h"
 #include "kernel/errno.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
@@ -354,12 +353,6 @@ addr_t sys_mremap(addr_t addr, dword_t old_len, dword_t new_len, dword_t flags) 
 
     struct pt_entry *entry = mem_pt(current->mem, start);
     if (entry == NULL) {
-        result = _EFAULT;
-        goto out;
-    }
-    // Linux udmabuf VMAs are VM_DONTEXPAND. Never replace a device buffer
-    // with an anonymous copy when mremap asks to grow it.
-    if (entry->data->fd && fd_is_software_dmabuf(entry->data->fd)) {
         result = _EFAULT;
         goto out;
     }

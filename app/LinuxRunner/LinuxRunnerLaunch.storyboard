@@ -17,7 +17,7 @@
                         <rect key="frame" x="0.0" y="0.0" width="393" height="852"/>
                         <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
                         <subviews>
-                            <label opaque="NO" userInteractionEnabled="NO" contentMode="left" text="LinuxRunner" textAlignment="center" translatesAutoresizingMaskIntoConstraints="NO" id="LR0-00-title">
+                            <label opaque="NO" userInteractionEnabled="NO" contentMode="left" text="DebianRunner" textAlignment="center" translatesAutoresizingMaskIntoConstraints="NO" id="LR0-00-title">
                                 <rect key="frame" x="46" y="407" width="301" height="38"/>
                                 <fontDescription key="fontDescription" type="system" weight="bold" pointSize="32"/>
                                 <color key="textColor" white="1" alpha="1" colorSpace="custom" customColorSpace="genericGamma22GrayColorSpace"/>

@@ -7,8 +7,8 @@ import CoreLocation
 import BackgroundTasks
 #endif
 
-/// User-started long work (package installs, desktop components, Kali tools,
-/// App Store changes, an opted-in terminal) and what iOS genuinely allows it
+/// User-started long work (Debian installation, APT package changes, headless
+/// mode packages, an opted-in terminal) and what iOS genuinely allows it
 /// while LinuxRunner is not in front:
 ///
 /// * Always: a UIApplication background-task assertion, a short grace period
@@ -75,7 +75,7 @@ import BackgroundTasks
 
     /// `userStarted`: the user explicitly started this task (install button);
     /// only then may iOS's notification permission prompt appear, never in
-    /// the middle of an implicit step such as desktop component setup.
+    /// the middle of an implicit background step.
     @objc @discardableResult func begin(title: String, detail: String) -> String { begin(title: title, detail: detail, userStarted: false) }
     @discardableResult func begin(title: String, detail: String, userStarted: Bool) -> String {
         let token = UUID().uuidString.lowercased()
@@ -156,7 +156,7 @@ import BackgroundTasks
                             self.entries[i].state = .pausedByIOS
                             LRRuntimeBridge.logCategory("BACKGROUND", event: "iOS expired continued processing title=\(self.entries[i].title)")
                             if UIApplication.shared.applicationState != .active {
-                                self.notify(title: self.entries[i].title, body: "iOS paused this task. Open LinuxRunner to continue.", success: false)
+                                self.notify(title: self.entries[i].title, body: "iOS paused this task. Open DebianRunner to continue.", success: false)
                             }
                         }
                     }
@@ -202,7 +202,7 @@ private final class ActivityRecognizer: UIGestureRecognizer {
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
 }
 
-/// While a long operation (installation, package or desktop setup) runs and
+/// While a long operation (Debian installation, APT package, or mode setup) runs and
 /// the user has not touched the screen for the configured time, show a mostly
 /// black screen with a small, slowly moving status. It never pauses or changes
 /// the operation, does not keep the display awake, and leaves iOS's auto-lock
@@ -302,7 +302,7 @@ struct InstallScreensaverView: View {
         .contentShape(Rectangle())
         .onTapGesture { wake() }
         .accessibilityElement(children: .combine)
-        .accessibilityHint("Double-tap to return to LinuxRunner")
+        .accessibilityHint("Double-tap to return to DebianRunner")
         .statusBarHidden(true)
     }
 }
@@ -345,12 +345,12 @@ struct InstallScreensaverView: View {
             status = "Waiting for location permission"
             manager.requestWhenInUseAuthorization()
         case .denied, .restricted:
-            status = "Location permission denied: allow it in iOS Settings > LinuxRunner > Location"
+            status = "Location permission denied: allow it in iOS Settings > DebianRunner > Location"
         default:
             manager.allowsBackgroundLocationUpdates = true
             manager.showsBackgroundLocationIndicator = true
             manager.startUpdatingLocation()
-            status = "On: Linux keeps running when you leave LinuxRunner"
+            status = "On: Linux keeps running when you leave DebianRunner"
             LRRuntimeBridge.logCategory("BACKGROUND", event: "keep-running session started (coarse location, indicator shown)")
         }
     }

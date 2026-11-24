@@ -104,7 +104,7 @@ struct BluetoothSerialView: View {
         switch state {
         case "poweredOn": return scanning ? "Scanning" : "Ready"
         case "poweredOff": return "Bluetooth is off. Turn it on in Control Center."
-        case "unauthorized": return "Bluetooth access is off for LinuxRunner. Allow it in iOS Settings › Privacy › Bluetooth."
+        case "unauthorized": return "Bluetooth access is off for DebianRunner. Allow it in iOS Settings › Privacy › Bluetooth."
         case "unsupported": return "This device does not support Bluetooth LE."
         default: return "Tap Scan to start Bluetooth."
         }
@@ -120,8 +120,8 @@ struct EmbeddedCompatibilityView: View {
     private let entries: [Entry] = [
         Entry(name: "Bluetooth LE serial (ESP32, HM-10, RN4870, u-blox, Ezurio, Bluno, Telit, custom firmware)", status: "Supported", detail: "Appears as /dev/ttyBLE0-3: terminal programs, pyserial, arduino-cli monitor. Any firmware with one writable and one notifying characteristic works; dropped links reconnect on the same port. Throughput is BLE-limited (typically a few KB/s). Tested with a physical board: not yet.", level: 2),
         Entry(name: "Wi-Fi: OTA upload (ArduinoOTA, espota.py), telnet/RFC2217 serial bridges, MQTT, HTTP", status: "Supported", detail: "Uses Linux networking directly. pyserial accepts socket:// and rfc2217:// URLs; PlatformIO and arduino-cli support OTA upload to network ports.", level: 2),
-        Entry(name: "Compiling sketches (arduino-cli, PlatformIO, esp-idf)", status: "Partial", detail: "The ARM64 Linux toolchains run in LinuxRunner's interpreter; builds are slow. Install from the App Store (arduino-cli, PlatformIO Core, esptool).", level: 1),
-        Entry(name: "USB serial through a USB-MIDI adapter (Raspberry Pi Pico, ESP32-S2/S3, Leonardo/Micro, Teensy)", status: "Supported", detail: "Boards with native USB run LinuxRunner's serial-over-MIDI firmware once (flashed from a computer) and appear as /dev/ttyMIDI0-3, with baud rate and DTR/RTS passed to the adapter. iOS supports USB MIDI for every app without special permission. App side tested on the Mac; with a physical adapter: not yet.", level: 2),
+        Entry(name: "Compiling sketches (arduino-cli, PlatformIO, esp-idf)", status: "Partial", detail: "The ARM64 Linux toolchains run in DebianRunner's interpreter; builds are slow. Install from Packages (arduino-cli, PlatformIO Core, esptool).", level: 1),
+        Entry(name: "USB serial through a USB-MIDI adapter (Raspberry Pi Pico, ESP32-S2/S3, Leonardo/Micro, Teensy)", status: "Supported", detail: "Boards with native USB run DebianRunner's serial-over-MIDI firmware once (flashed from a computer) and appear as /dev/ttyMIDI0-3, with baud rate and DTR/RTS passed to the adapter. iOS supports USB MIDI for every app without special permission. App side tested on the Mac; with a physical adapter: not yet.", level: 2),
         Entry(name: "Flashing a board (esptool, avrdude) through the USB-MIDI adapter", status: "Partial", detail: "The adapter mirrors DTR/RTS on two GPIOs wired to the target's reset and boot pins (EN/IO0 on ESP32, RESET on AVR), the auto-reset circuit USB serial boards use. Not yet tested with hardware.", level: 1),
         Entry(name: "USB serial chips plugged in directly (CH340, CP210x, FTDI, native USB CDC-ACM)", status: "Not possible", detail: "iOS gives ordinary apps no USB host access to these chips. DriverKit USB drivers need entitlements Apple grants case by case and only run on iPad with Apple silicon. Use a USB-MIDI adapter between the phone and the board.", level: 0),
         Entry(name: "Classic Bluetooth serial (HC-05/HC-06, ESP32 BluetoothSerial SPP)", status: "Not possible", detail: "iOS exposes classic Bluetooth SPP only to MFi-certified accessories.", level: 0),
@@ -165,7 +165,7 @@ struct USBSerialView: View {
                     Button("Rescan") { bridge.rescan() }.buttonStyle(.bordered)
                 }
             } footer: {
-                Text("iPhone and iPad cannot open the USB serial chips on Arduino or ESP32 boards. A board with native USB (Raspberry Pi Pico, ESP32-S2/S3, Arduino Leonardo/Micro, Teensy) running LinuxRunner's serial-over-MIDI firmware connects through iOS's built-in USB MIDI support instead, as its own serial port or as an adapter for another board, including its reset lines for flashing.")
+                Text("iPhone and iPad cannot open the USB serial chips on Arduino or ESP32 boards. A board with native USB (Raspberry Pi Pico, ESP32-S2/S3, Arduino Leonardo/Micro, Teensy) running DebianRunner's serial-over-MIDI firmware connects through iOS's built-in USB MIDI support instead, as its own serial port or as an adapter for another board, including its reset lines for flashing.")
             }
             Section("Linux Serial Ports") {
                 if links.isEmpty { Text("Connect an adapter with the USB cable (USB-C, or Lightning with Apple's camera adapter).").foregroundColor(.secondary) }

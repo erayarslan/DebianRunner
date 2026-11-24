@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "version": "2",
+  "resources": [
+    {
+      "name": "apt-unattended.conf",
+      "sha256": "6d801927886d6041a0e987db4cc033724f0ee9377e21a700e03bd3c88cbf9134",
+      "mode": "0644"
+    },
+    {
+      "name": "catalog-debian.tsv",
+      "sha256": "675b673e0e3ada49e5863a4d1000b9b288fa917cf737549f6debfb2b554183e0",
+      "mode": "0644"
+    },
+    {
+      "name": "debian-support.sh",
+      "sha256": "8ce180f6d2711ced80a8ac90146203aa08bb882b00900ced57137c0bc7cd60d9",
+      "mode": "0755"
+    },
+    {
+      "name": "installer-run.sh",
+      "sha256": "58c19632783eebe183806ff11089e56dd4a7abba0a5e47df8994d2e14630a4a1",
+      "mode": "0755"
+    },
+    {
+      "name": "liftoff-index.html",
+      "sha256": "b531ae6a2207ff60b73a081cc226cecd896ee00344b25e7db936d78969a96cac",
+      "mode": "0644"
+    },
+    {
+      "name": "lr-agent.sh",
+      "sha256": "71cca60c02bc7a3a64b4dd96808b10212c022c83e7971d5223b15df1354c485b",
+      "mode": "0755"
+    },
+    {
+      "name": "modes.sh",
+      "sha256": "198a54f2255dcaf6e91b228de70895367bbebbe290905e45019dd5b65ee173d0",
+      "mode": "0755"
+    },
+    {
+      "name": "package-lock.sh",
+      "sha256": "6650f484c57c1b3b56921956ded2fa9157ab32091dc3aebee65a059d88f6ef2e",
+      "mode": "0755"
+    },
+    {
+      "name": "package-manager.sh",
+      "sha256": "b3870c4d51984f4eb87bc7e4695ac0622c6f664462972247422067be3e21cc0f",
+      "mode": "0755"
+    },
+    {
+      "name": "share-check.sh",
+      "sha256": "ec262147b6c1ece5fd282b574b214764850f8995e7a1531507d0d9a8d5cb93d7",
+      "mode": "0755"
+    },
+    {
+      "name": "support-common.sh",
+      "sha256": "73b1b9209863a4847ea33f2cd00ea010aa29072b8da413a6438b8d46095d699f",
+      "mode": "0755"
+    },
+    {
+      "name": "support-version",
+      "sha256": "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+      "mode": "0644"
+    },
+    {
+      "name": "terminal-notices.txt",
+      "sha256": "eb8209ed950389276daab13795cfbe3dd4c214865ce2a7478c60136bee838ac3",
+      "mode": "0644"
+    }
+  ]
+}

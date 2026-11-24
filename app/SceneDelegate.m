@@ -10,7 +10,6 @@
 #ifdef LINUXRUNNER
 #import "LinuxRunner-Swift.h"
 #import "LinuxRunner/RuntimeBridge.h"
-#import "LinuxRunner/GUIViewController.h"
 #endif
 
 TerminalViewController *currentTerminalViewController = NULL;
@@ -49,7 +48,6 @@ static NSString *const TerminalUUID = @"TerminalUUID";
     if (!LRRuntimeBridge.isRunning) {
         self.runnerTerminal = vc;
         self.window.rootViewController = [LinuxRunnerShell makeControllerWithTerminal:vc];
-        [LRGUIViewController registerExternalDisplayForController:self.window.rootViewController];
         return;
     }
 #endif
@@ -63,7 +61,6 @@ static NSString *const TerminalUUID = @"TerminalUUID";
 #ifdef LINUXRUNNER
     self.runnerTerminal = vc;
     self.window.rootViewController = [LinuxRunnerShell makeControllerWithTerminal:vc];
-    [LRGUIViewController registerExternalDisplayForController:self.window.rootViewController];
 #endif
 }
 

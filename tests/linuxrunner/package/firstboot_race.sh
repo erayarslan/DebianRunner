@@ -8,7 +8,7 @@
 #   firstboot_race.sh resume <gui dir>   first start was interrupted earlier; nothing runs it now
 # After package_lock_acquire returns, Debian must be configured, the trust
 # store built, and dpkg's own lock free (dpkg --configure -a succeeds).
-mode=$1; G=${2:-/home/mobile/Downloads/.linuxrunner/gui}; fails=0
+mode=$1; G=${2:-/home/mobile/Downloads/.linuxrunner/support}; fails=0
 check() { if [ "$2" = 0 ]; then echo "PASS $1"; else echo "FAIL $1"; fails=$((fails+1)); fi; }
 [ ! -f /var/lib/linuxrunner/initialized ] || { echo 'FIRSTBOOT_RACE_TEST SKIP image already initialized'; exit 2; }
 if [ "$mode" = race ]; then

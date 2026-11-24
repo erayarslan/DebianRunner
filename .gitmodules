@@ -9,9 +9,3 @@
 	url = https://github.com/ish-app/linux
 	update = none
 	shallow = true
-[submodule "deps/glslang"]
-	path = deps/glslang
-	url = https://github.com/KhronosGroup/glslang.git
-[submodule "deps/spirv-cross"]
-	path = deps/spirv-cross
-	url = https://github.com/KhronosGroup/SPIRV-Cross.git

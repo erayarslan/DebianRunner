@@ -1,28 +1,30 @@
 # Files between iOS and Linux
 
-Open **Settings → Files & Devices → File Sharing** for the selected environment. The File Sharing screen groups Import Files, Export Files and Shared Folders. **Choose Destination & Import**, **Select File or Folder to Export** and **Open Shared Folder** lead to the same guarded **Shared Files** browser. **Add or Manage Shared Folders** retains the native Files picker and existing security-scoped folder bookmarks. The browser works with that environment’s folder, independently of the current terminal directory.
+Open **Home → Files** or **Settings → Linux Environment → File Sharing** for the active Debian minimal environment. The File Sharing screen groups **DebianRunner Shared**, **Folders from Files**, and **Import & Export**.
 
 ## Import
 
-1. Open the destination folder in Shared Files; **New Folder** creates a subfolder.
+1. Open the destination folder in **Shared Files**; **New Folder** creates a subfolder.
 2. Choose **Import File Here**, then select a regular file in the native Files picker.
-3. Wait for completion. In Linux, open `/mnt/LinuxRunnerShared` or `~/Shared`.
+3. Wait for completion. In Debian, access `/mnt/LinuxRunnerShared` or `~/Shared`.
 
-The configured Linux account receives a `~/Shared` alias when that name is free. An existing file, folder or alias is preserved. `/mnt/LinuxRunnerShared` remains the explicit shared location. This is one folder per environment, not a separate private folder for each Linux account.
+The configured Linux account receives a `~/Shared` alias when that name is free. An existing file, folder, or alias is preserved. `/mnt/LinuxRunnerShared` remains the explicit shared location.
 
-In iOS Files, browse **On My iPhone/iPad → LinuxRunner → Shared → <environment root name>**. Existing Downloads exchanges and external-folder bookmarks are retained; the browser links to **Previous Downloads Exchange**. No automatic migration deletes or replaces those files.
+In iOS Files, browse **On My iPhone/iPad → DebianRunner → Shared → <environment root name>**.
+
+## Linked Folders
+
+Under **Folders from Files**, tap **Add Folder…** to link any folder from iCloud Drive, On My iPhone/iPad, a USB drive, or a file server. Debian sees it at `/mnt/<name>`. Removing a link never deletes the underlying files.
 
 ## Export
 
-Select a file, then **Save to Files…** and choose a destination in the native picker. For a directory, open it and choose **Export This Folder as ZIP**, or use its context menu. Export reads a temporary snapshot; the Linux source is retained. Finish editing files before exporting them.
+Select a file in **Shared Files**, then choose **Save to Files…**. For a directory, open it and choose **Export This Folder as ZIP** (or use its context menu).
 
 ## Limits and recovery
 
-- Data streams in 64 KiB blocks; imports and exports are limited to 512 MiB. ZIP exports additionally allow at most 4096 entries and 32 directory levels, with no compression.
-- Unicode filenames are preserved. Existing names are never overwritten; choose another destination or rename the source.
-- Symbolic links, special files and paths escaping the shared directory are refused. Some Linux filenames containing backslashes cannot be transferred through this browser.
-- Cancellation removes the unpublished temporary copy. A transfer interrupted by app termination leaves no partially published destination; private import staging is cleaned at the next initialization. Retry the original source after reopening.
-- A source changed during copying causes an error rather than a verified-success claim. This is change detection, not a filesystem-wide transactional snapshot.
-- Cloud providers may need connectivity or time to download the chosen source. iOS permissions still apply.
+- Data streams in 64 KiB blocks; imports and exports are limited to 512 MiB. ZIP exports allow at most 4096 entries and 32 directory levels.
+- Unicode filenames are preserved; existing names are never overwritten.
+- Symbolic links, special files, and paths escaping the shared directory are refused.
+- Cancellation removes unpublished temporary copies. A source modified during copying raises an error rather than reporting false success.
 
-Files-provider behavior depends on the platform and provider. Test access with a copy of important data, and report reproducible failures through the [troubleshooting guide](TROUBLESHOOTING.md).
+See [Troubleshooting](TROUBLESHOOTING.md) if a file transfer or linked folder check fails.

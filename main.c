@@ -13,7 +13,6 @@
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "kernel/init.h"
-#include "graphics/guest_gpu.h"
 #include "fs/path.h"
 #include "fs/devices.h"
 #include "emu/cpu.h"
@@ -282,15 +281,7 @@ int main(int argc, char *const argv[]) {
         return err;
     }
     do_mount(&procfs, "proc", "/proc", "", 0);
-    // sysfs describes only the software DRM device (fs/sys.c).
-    const char *software_drm = getenv("ISH_SOFTWARE_DRM");
-    if (software_drm && !strcmp(software_drm, "1"))
-        do_mount(&sysfs, "sysfs", "/sys", "", 0);
     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
-    // Same guest Metal device node the app creates at boot (app/AppDelegate.m):
-    // isolated per-open contexts, usable by ordinary desktop users.
-    generic_mknodat(AT_PWD, "/dev/linuxrunner-gpu", S_IFCHR|0666, dev_make(LR_GPU_MAJOR, 0));
-    generic_setattrat(AT_PWD, "/dev/linuxrunner-gpu", (struct attr) {.type = attr_mode, .mode = S_IFCHR|0666}, false);
     err = prepare_guest_runtime_dirs();
     fprintf(stderr, "GUEST_BOOT: /dev/shm mode=01777 host-page=%ld guest-page=%u result=%d\n", sysconf(_SC_PAGESIZE), (unsigned)PAGE_SIZE, err);
     if (err < 0) return 1;

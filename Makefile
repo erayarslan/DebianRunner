@@ -11,12 +11,12 @@ DEBUG_BUILD_DIR ?= build-arm64-linux-debug
 NATIVE_BUILD_DIR ?= build-arm64-native-release
 AOT_RECORD_DIR ?= /workspace/tmp/ish-aot-targeted
 MESON_SETUP_ARGS ?=
-ROOTFS_DIR ?= $(CURDIR)/alpine-arm64-fakefs
 DEBIAN_ROOTFS_DIR ?= $(CURDIR)/debian-arm64-fakefs
+ROOTFS_DIR ?= $(DEBIAN_ROOTFS_DIR)
 DEBIAN_SUITE ?= trixie
 NODE_VERSION ?= 24.14.1
 BUN_VERSION ?= 1.3.13
-ROOTFS_LANES ?= alpine=$(ROOTFS_DIR) debian=$(DEBIAN_ROOTFS_DIR)
+ROOTFS_LANES ?= debian=$(DEBIAN_ROOTFS_DIR)
 CLI_PACKAGE_MANAGERS ?= npm bun pip
 REPORT_DIR ?= /workspace/tmp
 TIMEOUT_S ?= 120
@@ -63,16 +63,6 @@ check-docs-style:
 
 test-docs-style:
 	bun test scripts/check-docs-style.test.ts
-
-.PHONY: test-rootfs-download test-bun-rootfs test-go-rootfs
-test-rootfs-download:
-	sh tests/arm64/rootfs/download-root.sh
-
-test-bun-rootfs:
-	python3 tests/arm64/rootfs/package_bun_test.py
-
-test-go-rootfs:
-	python3 tests/arm64/rootfs/package_go_test.py
 
 .PHONY: build-arm64-linux
 build-arm64-linux:

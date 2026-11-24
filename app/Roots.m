@@ -62,6 +62,7 @@ static NSString *kDefaultRoot = @"Default Root";
         NSAssert(error == nil, @"couldn't list roots: %@", error);
 #endif
         self.roots = [[NSMutableOrderedSet alloc] initWithArray:rootNames ?: @[]];
+#ifndef LINUXRUNNER
         if (!self.roots.count) {
             // import default root
             NSError *error;
@@ -69,15 +70,11 @@ static NSString *kDefaultRoot = @"Default Root";
                                         name:@"default"
                                        error:&error
                             progressReporter:nil]) {
-#ifdef LINUXRUNNER
-                self.initializationError = error ?: [NSError errorWithDomain:NSPOSIXErrorDomain code:EIO userInfo:nil];
-                LRBootEvent("rootfs import failed"); return self;
-#else
                 NSAssert(NO, @"failed to import default root, error %@", error);
-#endif
             }
             _wantsVersionFile = YES;
         }
+#endif
         [self observe:@[@"roots"] options:0 owner:self usingBlock:^(typeof(self) self) {
             if (self.defaultRoot == nil && self.roots.count)
                 self.defaultRoot = self.roots[0];
@@ -87,6 +84,8 @@ static NSString *kDefaultRoot = @"Default Root";
 
         if ((!self.defaultRoot || ![self.roots containsObject:self.defaultRoot]) && self.roots.count)
             self.defaultRoot = self.roots.firstObject;
+        else if (!self.roots.count)
+            self.defaultRoot = nil;
     }
     return self;
 }
@@ -164,17 +163,11 @@ static void root_import_progress_callback(void *cookie, double progress, const c
 
 - (BOOL)importRootFromArchive:(NSURL *)archive name:(NSString *)name error:(NSError **)error progressReporter:(id<ProgressReporter> _Nullable)progress {
 #ifdef LINUXRUNNER
-    return [self importVerifiedRootFromArchive:archive name:name sha256:[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerRootfsSHA256"] metadata:@{@"distributionID":@"alpine",@"distribution":@"Alpine Linux",@"version":@"3.24.2",@"packageManager":@"apk",@"defaultShell":@"/bin/sh"} error:error progressReporter:progress];
+    if (error) *error = [NSError errorWithDomain:@"dev.linuxrunner.rootfs" code:ENOTSUP
+        userInfo:@{NSLocalizedDescriptionKey:@"Install Debian minimal using the built-in verified Debian installer."}];
+    return NO;
 }
 - (BOOL)importVerifiedRootFromArchive:(NSURL *)archive name:(NSString *)name sha256:(NSString *)expected metadata:(NSDictionary *)metadata error:(NSError **)error progressReporter:(id<ProgressReporter> _Nullable)progress {
-    return [self importVerifiedRootFromArchive:archive name:name sha256:expected topLevel:nil metadata:metadata error:error progressReporter:progress];
-}
-// topLevel: the archive's single top-level directory, imported as the root;
-// an entry outside it fails the import.
-- (BOOL)importVerifiedRootFromArchive:(NSURL *)archive name:(NSString *)name sha256:(NSString *)expected topLevel:(NSString * _Nullable)topLevel metadata:(NSDictionary *)metadata error:(NSError **)error progressReporter:(id<ProgressReporter> _Nullable)progress {
-#endif
-#ifndef LINUXRUNNER
-    NSString *topLevel = nil;
 #endif
 #ifdef LINUXRUNNER
     if (!validRunnerRoot(name) || [self.roots containsObject:name]) {
@@ -182,37 +175,17 @@ static void root_import_progress_callback(void *cookie, double progress, const c
             userInfo:@{NSLocalizedDescriptionKey:@"Invalid or duplicate environment root identifier."}];
         return NO;
     }
-    // Protect every importer, including the retained upstream filesystem UI.
-    // The normal importer admits the pinned Alpine image. The managed Debian
-    // installer supplies its archive hash only after authenticating every package.
-    // Verify a private snapshot, then import those exact bytes. A document
-    // provider may change its original URL while verification is in progress.
+    // The managed Debian installer supplies its archive hash only after
+    // authenticating every package. Verify a private snapshot, then import
+    // those exact bytes.
     unsigned long long maximumBytes = 512ULL * 1024 * 1024;
-    unsigned long long pinnedBytes = 0;
-    if ([metadata[@"distributionID"] isEqual:@"steamos"]) {
-        NSURL *support = [NSBundle.mainBundle URLForResource:@"SteamOSSupport" withExtension:@"bundle"];
-        NSData *manifestData = support ? [NSData dataWithContentsOfURL:[support URLByAppendingPathComponent:@"manifest.json"]] : nil;
-        id decoded = manifestData ? [NSJSONSerialization JSONObjectWithData:manifestData options:0 error:nil] : nil;
-        NSDictionary *manifest = [decoded isKindOfClass:NSDictionary.class] ? decoded : nil;
-        pinnedBytes = [manifest[@"archiveBytes"] unsignedLongLongValue];
-        if (![manifest isKindOfClass:NSDictionary.class] || [manifest[@"schema"] integerValue] != 1 ||
-            ![manifest[@"architecture"] isEqual:@"arm64"] || ![manifest[@"archiveSHA256"] isEqual:expected] ||
-            ![manifest[@"sourceImageSHA256"] isEqual:metadata[@"sourceImageSHA256"]] ||
-            !pinnedBytes || pinnedBytes > 6ULL * 1024 * 1024 * 1024) {
-            if (error) *error = [NSError errorWithDomain:@"dev.linuxrunner.rootfs" code:EINVAL
-                userInfo:@{NSLocalizedDescriptionKey:@"The SteamOS archive must match this app's prepared image manifest."}];
-            return NO;
-        }
-        maximumBytes = pinnedBytes;
-    }
     NSDictionary *attributes = archive ? [archive resourceValuesForKeys:
         @[NSURLIsRegularFileKey, NSURLIsSymbolicLinkKey, NSURLFileSizeKey] error:error] : nil;
     if (![attributes[NSURLIsRegularFileKey] boolValue] ||
         [attributes[NSURLIsSymbolicLinkKey] boolValue] ||
-        [attributes[NSURLFileSizeKey] unsignedLongLongValue] > maximumBytes ||
-        (pinnedBytes && [attributes[NSURLFileSizeKey] unsignedLongLongValue] != pinnedBytes)) {
+        [attributes[NSURLFileSizeKey] unsignedLongLongValue] > maximumBytes) {
         if (error) *error = [NSError errorWithDomain:@"dev.linuxrunner.rootfs" code:EINVAL
-            userInfo:@{NSLocalizedDescriptionKey:pinnedBytes ? @"Select the prepared SteamOS archive with the expected size." : @"Select a regular rootfs archive up to 512 MiB."}];
+            userInfo:@{NSLocalizedDescriptionKey:@"Select a regular rootfs archive up to 512 MiB."}];
         return NO;
     }
     NSURL *verifiedArchive = [NSFileManager.defaultManager.temporaryDirectory
@@ -251,7 +224,7 @@ static void root_import_progress_callback(void *cookie, double progress, const c
     uint8_t digest[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(digest, &hash);
     NSMutableString *actual = [NSMutableString new];
     for (NSUInteger i = 0; i < sizeof(digest); i++) [actual appendFormat:@"%02x", digest[i]];
-    if (ioError || cancelled || (pinnedBytes && copied != pinnedBytes) || expected.length != 64 || ![actual isEqual:expected]) {
+    if (ioError || cancelled || expected.length != 64 || ![actual isEqual:expected]) {
         [NSFileManager.defaultManager removeItemAtURL:verifiedArchive error:nil];
         if (error) *error = cancelled ? [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil] :
             [NSError errorWithDomain:@"dev.linuxrunner.rootfs" code:ioError ?: EINVAL
@@ -276,7 +249,7 @@ static void root_import_progress_callback(void *cookie, double progress, const c
     NSURL *importArchive = archive;
 #endif
     BOOL imported = fakefs_import_prefix(importArchive.fileSystemRepresentation,
-                       tempDestination.fileSystemRepresentation, topLevel.UTF8String,
+                       tempDestination.fileSystemRepresentation, NULL,
                        &fs_err, (struct progress) {(__bridge void *) progress,
 #ifdef LINUXRUNNER
                            root_import_progress_callback
@@ -319,54 +292,6 @@ static void root_import_progress_callback(void *cookie, double progress, const c
         addRoot();
     return YES;
 }
-
-#ifdef LINUXRUNNER
-static void root_stream_progress_callback(void *cookie, double progress, const char *message, bool *should_cancel) {
-    // The stream's producer reports progress; the importer only polls cancellation.
-    id<ProgressReporter> reporter = (__bridge id<ProgressReporter>) cookie;
-    if (reporter && [reporter shouldCancel]) *should_cancel = true;
-}
-// Imports a tar stream from a descriptor (the SteamOS image reader). Integrity
-// comes from the producer: it reads a SHA-256-pinned source image and verifies
-// every filesystem block checksum, so there is no archive to hash here.
-- (BOOL)importRootFromStream:(int)descriptor name:(NSString *)name metadata:(NSDictionary *)metadata error:(NSError **)error progressReporter:(id<ProgressReporter> _Nullable)progress {
-    if (!validRunnerRoot(name) || [self.roots containsObject:name] || descriptor < 0) {
-        if (error) *error = [NSError errorWithDomain:@"dev.linuxrunner.rootfs" code:EINVAL
-            userInfo:@{NSLocalizedDescriptionKey:@"Invalid or duplicate environment root identifier."}];
-        return NO;
-    }
-    struct fakefsify_error fs_err;
-    NSURL *destination = [self rootUrl:name];
-    // Beside (not inside) the roots directory, on the same volume, so the
-    // finished root is moved rather than copied and an interrupted import is
-    // never listed as an environment. Earlier interrupted imports are removed.
-    NSURL *staging = [destination.URLByDeletingLastPathComponent.URLByDeletingLastPathComponent URLByAppendingPathComponent:@"root-imports"];
-    [NSFileManager.defaultManager removeItemAtURL:staging error:nil];
-    if (![NSFileManager.defaultManager createDirectoryAtURL:staging withIntermediateDirectories:YES attributes:nil error:error]) return NO;
-    NSURL *tempDestination = [staging URLByAppendingPathComponent:NSProcessInfo.processInfo.globallyUniqueString];
-    BOOL imported = fakefs_import_fd(descriptor, tempDestination.fileSystemRepresentation, &fs_err,
-                                     (struct progress) {(__bridge void *) progress, root_stream_progress_callback});
-    if (!imported) {
-        if (error) {
-            *error = fs_err.type == ERR_CANCELLED ? [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil] :
-                [NSError errorWithDomain:fs_err.type == ERR_SQLITE ? @"SQLite" : NSPOSIXErrorDomain code:fs_err.code
-                    userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"%s, line %d", fs_err.message ?: "import failed", fs_err.line]}];
-        }
-        free(fs_err.message);
-        [NSFileManager.defaultManager removeItemAtURL:tempDestination error:nil];
-        return NO;
-    }
-    NSData *installation = [NSJSONSerialization dataWithJSONObject:metadata options:NSJSONWritingPrettyPrinted error:error];
-    if (!installation || ![installation writeToURL:[tempDestination URLByAppendingPathComponent:@"environment-install.json"] options:NSDataWritingAtomic error:error] ||
-        ![NSFileManager.defaultManager moveItemAtURL:tempDestination toURL:destination error:error]) {
-        [NSFileManager.defaultManager removeItemAtURL:tempDestination error:nil];
-        return NO;
-    }
-    void (^addRoot)(void) = ^{ [[self mutableOrderedSetValueForKey:@"roots"] addObject:name]; };
-    if (!NSThread.isMainThread) dispatch_sync(dispatch_get_main_queue(), addRoot); else addRoot();
-    return YES;
-}
-#endif
 
 - (BOOL)exportRootNamed:(NSString *)name toArchive:(NSURL *)archive error:(NSError **)error progressReporter:(id<ProgressReporter> _Nullable)progress {
     NSAssert([self.roots containsObject:name], @"trying to export a root that doesn't exist: %@", name);

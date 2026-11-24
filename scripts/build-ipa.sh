@@ -3,52 +3,33 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mode=signed
 diagnostic=NO
-gui_test=NO
-qt_test=NO
-browser_test=NO
 for option in "$@"; do
     case "$option" in
         --unsigned) mode=unsigned ;;
         --diagnostic) diagnostic=YES ;;
-        --browser-test) browser_test=YES; qt_test=YES; gui_test=YES; diagnostic=YES ;;
-        --qt-test) qt_test=YES; gui_test=YES; diagnostic=YES ;;
-        --gui-test) gui_test=YES; diagnostic=YES ;;
-        *) echo 'Usage: scripts/build-ipa.sh [--unsigned] [--diagnostic | --gui-test | --qt-test | --browser-test]' >&2; exit 2 ;;
+        *) echo 'Usage: scripts/build-ipa.sh [--unsigned] [--diagnostic]' >&2; exit 2 ;;
     esac
 done
-artifact=LinuxRunner
-if [[ $diagnostic == YES ]]; then artifact=LinuxRunner-Debug; fi
-if [[ $gui_test == YES ]]; then artifact=LinuxRunner-GUI-Test; fi
-if [[ $qt_test == YES ]]; then artifact=LinuxRunner-Qt-Test; fi
-if [[ $browser_test == YES ]]; then artifact=LinuxRunner-Browser-Test; fi
+artifact=DebianRunner
+if [[ $diagnostic == YES ]]; then artifact=DebianRunner-Debug; fi
 artifact="${ARTIFACT_NAME:-$artifact}"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
-python3 scripts/generate-gui-support-manifest.py --check
+python3 scripts/generate-support-manifest.py --check
 scripts/bootstrap-macos.sh
 release="${RELEASE_DIR:-$PWD/build/releases}"
 if [[ $diagnostic == YES && -z ${RELEASE_DIR:-} ]]; then release="$PWD/build/device-diagnostics/release"; fi
-if [[ $gui_test == YES && -z ${RELEASE_DIR:-} ]]; then release="$PWD/build/gui/release"; fi
-if [[ $qt_test == YES && -z ${RELEASE_DIR:-} ]]; then release="$PWD/build/qt/release"; fi
-if [[ $browser_test == YES && -z ${RELEASE_DIR:-} ]]; then release="$PWD/build/browser/release"; fi
 mkdir -p "$release"
 release=$(cd "$release" && pwd)
 archive="$release/$artifact.xcarchive"
-cmake_path=${LINUXRUNNER_CMAKE:-$(command -v cmake || true)}
-[[ -n $cmake_path ]] || { echo "CMake required for pinned shader compiler" >&2; exit 1; }
-args=("LINUXRUNNER_CMAKE=$cmake_path" -project iSH.xcodeproj -scheme LinuxRunner -configuration Release
+args=(-project iSH.xcodeproj -scheme LinuxRunner -configuration Release
       -destination 'generic/platform=iOS' -archivePath "$archive"
       -derivedDataPath "$PWD/build/release-derived"
       "LINUXRUNNER_SOURCE_COMMIT=$(git rev-parse HEAD)"
       IPHONEOS_DEPLOYMENT_TARGET=15.0 "LINUXRUNNER_DIAGNOSTIC=$diagnostic"
-      "ROOT_BUNDLE_IDENTIFIER=${BUNDLE_ID:-dev.linuxrunner.app}")
+      "ROOT_BUNDLE_IDENTIFIER=${BUNDLE_ID:-dev.debianrunner.app}")
 if [[ $diagnostic == YES ]]; then args+=(CODE_SIGN_ENTITLEMENTS=app/LinuxRunner/PrivateContainer.entitlements); fi
-# Optional variants (app/AppARM64.xcconfig): JIT-capable runtime, GPU device
-# (needs scripts/build-gpu-deps.sh iphoneos first). Both stay off until enabled in Settings.
+# Optional variant (app/AppARM64.xcconfig): JIT-capable runtime (off until enabled in Settings).
 if [[ ${LINUXRUNNER_JIT:-NO} == YES ]]; then args+=(LINUXRUNNER_JIT=YES); fi
-if [[ ${LINUXRUNNER_VIRGL:-NO} == YES ]]; then
-    test -f build/gpu/iphoneos/lib/libangle.a || { echo "GPU dependencies missing: run scripts/build-gpu-deps.sh iphoneos" >&2; exit 1; }
-    args+=(LINUXRUNNER_VIRGL=YES)
-fi
 if [[ $mode == unsigned ]]; then
     args+=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO)
 else
@@ -70,30 +51,21 @@ if [[ $mode == unsigned ]]; then
     mkdir "$staging/Payload"
     app="$archive/Products/Applications/LinuxRunner.app"
     test -d "$app" || { echo "Missing archived app: $app" >&2; exit 1; }
-    # Ad-hoc signature with the resolved entitlements. Not an Apple signature: it
-    # gives installers that keep or extend an existing signature (TrollStore,
-    # LiveContainer, AltSign/zsign-based tools) a well-formed code signature and
-    # entitlements to work from; re-signing tools replace it. 1.0.0 shipped with
-    # no signature at all.
-    python3 - "$staging/entitlements.plist" "${BUNDLE_ID:-dev.linuxrunner.app}" "$diagnostic" <<'PYADHOC'
+    python3 - "$staging/entitlements.plist" "${BUNDLE_ID:-dev.debianrunner.app}" "$diagnostic" <<'PYADHOC'
 import plistlib, sys
 with open(sys.argv[1], 'wb') as out:
     plistlib.dump({} if sys.argv[3] == 'YES' else {'com.apple.security.application-groups': ['group.' + sys.argv[2]]}, out)
 PYADHOC
-    # Retain exactly the signed executable shipped in the IPA, so the archive
-    # provenance check remains byte-for-byte strict after ad-hoc signing.
     codesign --force --sign - --timestamp=none --generate-entitlement-der --entitlements "$staging/entitlements.plist" "$app"
     codesign --verify --strict "$app"
     ditto --norsrc --noextattr --noacl --noqtn "$app" "$staging/Payload/LinuxRunner.app"
     codesign --verify --strict "$staging/Payload/LinuxRunner.app"
-    # Info-ZIP: sizes in local headers (no data descriptors) and no platform extra
-    # fields, which streaming ZIP readers in some installers require.
     (cd "$staging" && zip -q -r -X -y LinuxRunner.ipa Payload)
     mv "$staging/LinuxRunner.ipa" "$ipa"
     python3 scripts/validate-ipa.py "$ipa" --report "$release/$artifact.validation.json" ||
         { echo 'IPA validation failed; do not publish this artifact.' >&2; exit 1; }
     printf 'UNSIGNED IPA (ad-hoc signed, no Apple signature). Requires signing and provisioning before physical-device installation.\nBundle ID: %s\nApp group: group.%s\nEmbedded extensions: none in this ARM64 scheme\nPrivate Application Support fallback: supported\n' \
-        "${BUNDLE_ID:-dev.linuxrunner.app}" "${BUNDLE_ID:-dev.linuxrunner.app}" > "$release/SIGNING-STATUS.txt"
+        "${BUNDLE_ID:-dev.debianrunner.app}" "${BUNDLE_ID:-dev.debianrunner.app}" > "$release/SIGNING-STATUS.txt"
 else
     options="${EXPORT_OPTIONS_PLIST:-$release/ExportOptions.plist}"
     if [[ -z ${EXPORT_OPTIONS_PLIST:-} ]]; then
@@ -113,7 +85,7 @@ PY
     cp "$exported" "$ipa"
     printf 'Signed by Xcode export method %s. Verify on the intended physical device.\n' "${EXPORT_METHOD:-custom ExportOptions.plist}" > "$release/SIGNING-STATUS.txt"
 fi
-python3 - "$release/$artifact.entitlements.plist" "${BUNDLE_ID:-dev.linuxrunner.app}" "$diagnostic" <<'PYENT'
+python3 - "$release/$artifact.entitlements.plist" "${BUNDLE_ID:-dev.debianrunner.app}" "$diagnostic" <<'PYENT'
 import plistlib, sys
 with open(sys.argv[1], 'wb') as out:
     plistlib.dump({} if sys.argv[3] == 'YES' else {'com.apple.security.application-groups': ['group.' + sys.argv[2]]}, out)

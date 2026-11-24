@@ -148,7 +148,8 @@ def main():
         check('entitlements-valid', ok, detail or 'none')
     # --- LinuxRunner requirements -------------------------------------------
     check('guest-vdso-present', has_guest_vdso(binary), 'embedded aarch64 ELF vDSO exporting __kernel_rt_sigreturn (issue #3)')
-    check('rootfs-present', app + 'root.tar.gz' in names, '')
+    check('debian-support-present', app + 'DebianSupport.bundle/manifest.json' in names and app + 'DebianSupport.bundle/manifest.sha256' in names, '')
+    check('support-bundle-present', app + 'Support.bundle/support-manifest.json' in names, '')
     return finish(a, sha, len(raw))
 
 def finish(a, sha, size):

@@ -3,19 +3,19 @@ import UIKit
 import CoreImage
 
 // MARK: - LinuxRunner Modes (Settings › Modes)
-// Opt-in ways to use the active distribution. Nothing installs or starts
-// until the user taps it; modes.sh (GUISupport) runs the services and
-// desktop-profile.sh mode-* installs them from the distribution's packages.
+// Opt-in headless services for Debian minimal. Nothing installs or starts
+// until the user taps it; modes.sh (Support.bundle) runs the services and
+// debian-support.sh mode-* installs them from Debian's APT packages.
 
 private struct ModeTerminal: Identifiable { let id = UUID(); let controller: TerminalViewController }
 
 struct LRMode: Identifiable {
-    let id: String              // agent | rdp | ssh
+    let id: String              // agent | ssh | liftoff | pocket
     let title: String
     let tagline: String
     let symbol: String
     let colors: [Color]
-    let installMode: String     // desktop-profile.sh verb
+    let installMode: String     // debian-support.sh verb
 }
 
 struct ModesView: View {
@@ -31,18 +31,14 @@ struct ModesView: View {
     private let refreshTimer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
     static let modes: [LRMode] = [
-        LRMode(id: "agent", title: "Agent Mode", tagline: "AI coding agents in your Linux terminal",
+        LRMode(id: "agent", title: "Agent Mode", tagline: "AI coding agents in your Debian terminal",
                symbol: "sparkles", colors: [Color(red: 0.85, green: 0.45, blue: 0.25), .pink], installMode: "mode-agent"),
-        LRMode(id: "rdp", title: "RDP Mode", tagline: "Use this desktop from a PC or Mac",
-               symbol: "display.2", colors: [.blue, .indigo], installMode: "mode-rdp"),
         LRMode(id: "ssh", title: "SSH Mode", tagline: "Terminal, VS Code Remote and file transfer",
                symbol: "terminal.fill", colors: [.green, .teal], installMode: "mode-ssh"),
         LRMode(id: "liftoff", title: "Liftoff", tagline: "Build web apps and preview them in Safari",
                symbol: "paperplane.fill", colors: [.purple, .orange], installMode: "mode-liftoff"),
         LRMode(id: "pocket", title: "Pocket Cloud", tagline: "Your iPhone as a Wi-Fi file server",
                symbol: "externaldrive.fill.badge.wifi", colors: [.cyan, .blue], installMode: "mode-pocket"),
-        LRMode(id: "arcadia", title: "Arcadia", tagline: "A retro game lab with RetroArch",
-               symbol: "gamecontroller.fill", colors: [.pink, .purple], installMode: "mode-arcadia"),
     ]
 
     var body: some View {
@@ -50,10 +46,10 @@ struct ModesView: View {
             VStack(alignment: .leading, spacing: 16) {
                 hero
                 if !running {
-                    notice("Start Linux on the Home screen to install or use a mode.", symbol: "power", color: .orange)
+                    notice("Start Debian minimal on the Home screen to install or use a mode.", symbol: "power", color: .orange)
                 }
                 ForEach(Self.modes) { mode in card(mode) }
-                Text("Modes are off until you start them and stop when Linux stops. Installs use \(DesktopCatalog.distributionName(DesktopCatalog.activeDistribution()))'s own packages (network needed once). Network modes are reachable only by devices on the same Wi-Fi while LinuxRunner is open or running in the background.")
+                Text("Modes are off until you start them and stop when Linux stops. Installs use Debian's own APT packages (network needed once). Network modes are reachable only by devices on the same Wi-Fi while DebianRunner is open or running in the background.")
                     .font(.footnote).foregroundColor(.secondary).padding(.horizontal, 4)
             }
             .padding(16)
@@ -69,7 +65,7 @@ struct ModesView: View {
     private var hero: some View {
         HStack(spacing: 14) {
             ZStack {
-                ForEach(Array(Self.modes.filter { ["agent", "liftoff", "arcadia"].contains($0.id) }.enumerated()), id: \.offset) { index, mode in
+                ForEach(Array(Self.modes.filter { ["agent", "ssh", "liftoff"].contains($0.id) }.enumerated()), id: \.offset) { index, mode in
                     LRIconTile(symbol: mode.symbol, colors: mode.colors, size: 38)
                         .rotationEffect(.degrees(Double(index - 1) * 12))
                         .offset(x: CGFloat(index - 1) * 14, y: index == 1 ? -4 : 4)
@@ -78,8 +74,8 @@ struct ModesView: View {
             }
             .frame(width: 84, height: 64)
             VStack(alignment: .leading, spacing: 4) {
-                Text("LinuxRunner Modes").font(.title3.weight(.bold))
-                Text("Turn \(DesktopCatalog.distributionName(DesktopCatalog.activeDistribution())) into an AI workstation, a remote desktop, a web lab, a file server or a retro console, only when you want.")
+                Text("DebianRunner Modes").font(.title3.weight(.bold))
+                Text("Turn Debian minimal into an AI workstation, an SSH host, a web lab, or a Wi-Fi file server, only when you want.")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
@@ -94,7 +90,6 @@ struct ModesView: View {
     private func installed(_ mode: LRMode) -> Bool {
         switch mode.id {
         case "agent": return !(status["agents"] ?? "").trimmingCharacters(in: .whitespaces).isEmpty
-        case "rdp": return status["rdp_installed"] == "1"
         case "ssh": return status["ssh_installed"] == "1"
         default: return status["\(mode.id)_installed"] == "1"
         }
@@ -157,13 +152,6 @@ struct ModesView: View {
                     .background(Capsule().fill(Color(.tertiarySystemGroupedBackground)))
                 }
             }
-        case "rdp" where active(mode):
-            connectionBox(rows: [("Computer", "\(Self.wifiAddress() ?? "iPhone Wi-Fi address"):\(status["rdp.port"] ?? "3389")"),
-                                 ("Password", LRRuntimeBridge.desktopSessionPassword() ?? "Open the desktop first")])
-            Text("Connect with any Remote Desktop app, then type this password on the LinuxRunner login screen that appears (leave the app's own user name and password empty). It changes every time the desktop starts.")
-                .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
-        case "rdp" where installed(mode) && status["desktop"] != "running":
-            notice("Open Desktop first; RDP Mode shares the desktop that is running.", symbol: "macwindow", color: .blue)
         case "ssh" where active(mode):
             let user = LRRuntimeBridge.defaultLinuxUser()
             connectionBox(rows: [("Command", "ssh -p \(status["ssh.port"] ?? "2222") \(user == "root" || user.isEmpty ? "user" : user)@\(Self.wifiAddress() ?? "iPhone-IP")"),
@@ -183,13 +171,6 @@ struct ModesView: View {
             connectionBox(rows: [("Address", "http://\(Self.wifiAddress() ?? "iPhone-IP"):\(status["pocket.port"] ?? "8081")"),
                                  ("User", status["pocket.user"] ?? "linuxrunner"),
                                  ("Password", status["pocket.password"] ?? "…")])
-        case "arcadia" where installed(mode):
-            HStack(spacing: 8) {
-                ForEach(["NES", "Game Boy", "GBA"], id: \.self) { system in
-                    Text(system).font(.caption2.weight(.semibold)).padding(.horizontal, 8).padding(.vertical, 5)
-                        .background(Capsule().fill(Color(.tertiarySystemGroupedBackground)))
-                }
-            }
         default: EmptyView()
         }
     }
@@ -221,9 +202,6 @@ struct ModesView: View {
         HStack(spacing: 10) {
             if !installed(mode) {
                 primary("Install", symbol: "arrow.down.circle.fill", colors: mode.colors) { install(mode) }.disabled(disabled)
-            } else if mode.id == "arcadia" {
-                primary("Play", symbol: "gamecontroller.fill", colors: mode.colors) { launchArcadia() }.disabled(!running)
-                secondary("Update", symbol: "arrow.triangle.2.circlepath") { install(mode) }.disabled(disabled)
             } else if mode.id == "liftoff" && active(mode) {
                 primary("Open in Safari", symbol: "safari.fill", colors: mode.colors) {
                     if let url = URL(string: "http://localhost:\(status["liftoff.port"] ?? "8080")") { UIApplication.shared.open(url) }
@@ -235,8 +213,7 @@ struct ModesView: View {
             } else if active(mode) {
                 primary(busy == mode.id ? "Stopping…" : "Stop", symbol: "stop.fill", colors: [.red, .orange]) { command(["stop", mode.id], mode) }.disabled(disabled)
             } else {
-                primary(busy == mode.id ? "Starting…" : "Start", symbol: "play.fill", colors: mode.colors) { command(["start", mode.id], mode) }
-                    .disabled(disabled || (mode.id == "rdp" && status["desktop"] != "running"))
+                primary(busy == mode.id ? "Starting…" : "Start", symbol: "play.fill", colors: mode.colors) { command(["start", mode.id], mode) }.disabled(disabled)
             }
         }
     }
@@ -264,15 +241,11 @@ struct ModesView: View {
     private func help(_ mode: LRMode) -> String {
         switch mode.id {
         case "agent":
-            return "Installs Node.js, git, ripgrep and Python, then Claude Code, Codex CLI and OpenCode from npm. Open Agent Terminal shows a menu of the installed agents and starts them in ~/Projects as your Linux user. Each agent asks you to sign in with your own account the first time; LinuxRunner does not see or store your keys. Agents run on LinuxRunner's interpreter, so they start slower than on a computer."
-        case "rdp":
-            return "Shares the desktop that is open in LinuxRunner with Remote Desktop clients: Windows Remote Desktop Connection, Microsoft's Windows App on Mac, iPad and Android, or Remmina on Linux. On a device on the same Wi-Fi, connect to the Computer address; when the LinuxRunner login screen appears, type the Password there (not in the app's own sign-in box). It changes each time the desktop starts. The iPhone and the computer see and control the same desktop."
+            return "Installs Node.js, git, ripgrep and Python, then Claude Code, Codex CLI and OpenCode from npm. Open Agent Terminal shows a menu of the installed agents and starts them in ~/Projects as your Linux user. Each agent asks you to sign in with your own account the first time; DebianRunner does not see or store your keys. Agents run on DebianRunner's interpreter, so they start slower than on a computer."
         case "liftoff":
             return "Installs Python, Node.js and git. Start serves the ~/Sites folder of your Linux user on port 8080 (a starter page is created the first time). Open in Safari on this iPhone, or scan the QR code from another phone or computer on the same Wi-Fi. Any dev server you start in a terminal on 0.0.0.0 (npm run dev -- --host, Flask, Django) is reachable the same way on its own port."
         case "pocket":
-            return "Shares the ~/Pocket Cloud folder of your Linux user over WebDAV on port 8081, with a new password every start. Mac: Finder › Go › Connect to Server and enter the Address. iPhone/iPad: Files › … › Connect to Server. Windows and Android: any WebDAV app (or open the Address in a browser to browse and download). Put files there from Linux, or from Files › LinuxRunner."
-        case "arcadia":
-            return "Installs RetroArch with the classic-console cores your distribution offers: NES, Game Boy/Color and Game Boy Advance on Debian; other distributions may offer more (SNES, Mega Drive). Play opens RetroArch in the LinuxRunner desktop; connect a Bluetooth controller or use the keyboard. No games are included: load your own legally obtained game files from the Files app. Older consoles run best; LinuxRunner's interpreter limits speed."
+            return "Shares the ~/Pocket Cloud folder of your Linux user over WebDAV on port 8081, with a new password every start. Mac: Finder › Go › Connect to Server and enter the Address. iPhone/iPad: Files › … › Connect to Server. Windows and Android: any WebDAV app (or open the Address in a browser to browse and download). Put files there from Linux, or from Files › DebianRunner."
         default:
             return "Starts an OpenSSH server on port 2222. From a computer on the same Wi-Fi run the Command, or connect VS Code (Remote - SSH), scp, rsync or an SFTP app. Sign in as a Linux user with its password (set one in Settings › Linux Users); root login is refused."
         }
@@ -287,7 +260,7 @@ struct ModesView: View {
 
     private func install(_ mode: LRMode) {
         failure[mode.id] = nil; installing = mode.id; progress = "Starting"
-        LRRuntimeBridge.installDesktop(mode.installMode, progress: { progress = $0 }) { error in
+        LRRuntimeBridge.installMode(mode.installMode, progress: { progress = $0 }) { error in
             installing = nil; progress = nil
             if let error { failure[mode.id] = error.localizedDescription }
             refresh(runStatus: true)
@@ -303,7 +276,7 @@ struct ModesView: View {
             arguments.append(user.isEmpty ? "root" : user)
         }
         guard LRRuntimeBridge.modesCommand(arguments) != nil else {
-            busy = nil; failure[mode.id] = "LinuxRunner could not start the command. Restart Linux and try again."; return
+            busy = nil; failure[mode.id] = "DebianRunner could not start the command. Restart Linux and try again."; return
         }
         // modes.sh rewrites modes-status when it finishes (a few seconds).
         var checks = 0
@@ -315,17 +288,11 @@ struct ModesView: View {
                 timer.invalidate(); busy = nil
                 if status[mode.id] != wanted {
                     failure[mode.id] = arguments[0] == "start"
-                        ? "\(mode.title) did not start. Export the Desktop Report (Settings › Storage & Maintenance) and send it."
+                        ? "\(mode.title) did not start. Export Diagnostics (Settings › Storage & Maintenance) for details."
                         : "\(mode.title) did not stop yet. Try again."
                 }
             }
         }
-    }
-
-    /// RetroArch opens inside the LinuxRunner desktop (ManagerView presents it).
-    private func launchArcadia() {
-        NotificationCenter.default.post(name: Notification.Name("LinuxRunnerLaunchGraphicalApplication"), object: nil,
-                                        userInfo: ["executable": "retroarch", "arguments": [String](), "directory": "/root"])
     }
 
     static func qrCode(_ text: String) -> UIImage? {

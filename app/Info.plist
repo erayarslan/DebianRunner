@@ -32,8 +32,6 @@
 	<string>$(PRODUCT_APP_GROUP_IDENTIFIER)</string>
 	<key>LinuxRunnerDiagnostic</key>
 	<string>$(LINUXRUNNER_DIAGNOSTIC)</string>
-	<key>LinuxRunnerRootfsSHA256</key>
-	<string>$(ROOTFS_SHA256)</string>
 	<key>LinuxRunnerSourceCommit</key>
 	<string>$(LINUXRUNNER_SOURCE_COMMIT)</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
@@ -41,11 +39,11 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Allow Linux applications to connect to computers and services on your local network.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Linux programs you run (/dev/location) can read your location, and "Keep Linux Running in Background" uses a coarse location session so Linux keeps running while you use other apps. Your location is not stored or sent by LinuxRunner.</string>
+	<string>Linux programs you run (/dev/location) can read your location, and "Keep Linux Running in Background" uses a coarse location session so Linux keeps running while you use other apps. Your location is not stored or sent by DebianRunner.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
-	<string>Linux programs you run (/dev/location) can read your location, and "Keep Linux Running in Background" uses a coarse location session so Linux keeps running while you use other apps. Your location is not stored or sent by LinuxRunner.</string>
+	<string>Linux programs you run (/dev/location) can read your location, and "Keep Linux Running in Background" uses a coarse location session so Linux keeps running while you use other apps. Your location is not stored or sent by DebianRunner.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Linux programs you run (/dev/location) can read your location, and "Keep Linux Running in Background" uses a coarse location session so Linux keeps running while you use other apps. Your location is not stored or sent by LinuxRunner.</string>
+	<string>Linux programs you run (/dev/location) can read your location, and "Keep Linux Running in Background" uses a coarse location session so Linux keeps running while you use other apps. Your location is not stored or sent by DebianRunner.</string>
 	<key>NSUserActivityTypes</key>
 	<array>
 		<string>dev.linuxrunner.scene</string>
@@ -74,28 +72,6 @@
 					<string>SceneDelegate</string>
 					<key>UISceneStoryboardFile</key>
 					<string>Terminal</string>
-				</dict>
-			</array>
-			<key>UIWindowSceneSessionRoleExternalDisplay</key>
-			<array>
-				<dict>
-					<key>UISceneClassName</key>
-					<string>UIWindowScene</string>
-					<key>UISceneConfigurationName</key>
-					<string>External Display</string>
-					<key>UISceneDelegateClassName</key>
-					<string>LRExternalDisplaySceneDelegate</string>
-				</dict>
-			</array>
-			<key>UIWindowSceneSessionRoleExternalDisplayNonInteractive</key>
-			<array>
-				<dict>
-					<key>UISceneClassName</key>
-					<string>UIWindowScene</string>
-					<key>UISceneConfigurationName</key>
-					<string>External Display</string>
-					<key>UISceneDelegateClassName</key>
-					<string>LRExternalDisplaySceneDelegate</string>
 				</dict>
 			</array>
 		</dict>

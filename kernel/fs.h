@@ -208,7 +208,6 @@ bool is_adhoc_fd(struct fd *fd);
 
 // filesystems
 extern const struct fs_ops procfs;
-extern const struct fs_ops sysfs;
 extern const struct fs_ops fakefs;
 extern const struct fs_ops devptsfs;
 extern const struct fs_ops tmpfs;

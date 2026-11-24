@@ -21,7 +21,7 @@ void FsUpdateRepositories(void);
 /// An integer representing the current major version of the apk repositories. An upgrade will be run if the number in /ish/apk-version is smaller. After a successful upgrade, the newer number is copied into /ish/apk-version.
 /// To upgrade:
 /// - update the default rootfs to the same version
-/// - update gen_apk_repositories.py to generate the new version of /etc/apk/repositories
+/// Note: LinuxRunner uses Debian minimal (APT); legacy Alpine repo generation is removed.
 /// - set both of the following constants appropriately, making sure to use a larger number than the previous one
 #define CURRENT_APK_VERSION 31900
 #define CURRENT_APK_VERSION_STRING "Alpine v3.19"

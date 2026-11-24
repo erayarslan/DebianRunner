@@ -5,6 +5,7 @@ login_path=$(env -i HOME="$HOME" USER="$USER" SHELL="${SHELL:-/bin/zsh}" /bin/zs
 if [ -n "$login_path" ]; then
     export PATH="$PATH:$login_path"
 fi
+export PATH="/opt/homebrew/opt/lld/bin:/opt/homebrew/bin:/usr/local/opt/lld/bin:/usr/local/bin:$PATH"
 
 # Optional toolchain bundle; normal builds use tools already on PATH.
 if [ -n "${LINUXRUNNER_TOOLCHAIN_ROOT:-}" ]; then

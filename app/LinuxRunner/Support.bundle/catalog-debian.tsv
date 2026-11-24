@@ -1,0 +1,19 @@
+# package	name	category	gui. Shown only when Debian repositories offer it.
+htop	htop	System	0
+fastfetch	fastfetch	System	0
+git	Git	Development	0
+python3	Python 3	Development	0
+nodejs	Node.js	Development	0
+gcc	GCC compiler	Development	0
+vim	Vim	Development	0
+nano	GNU nano	Accessories	0
+tmux	tmux	System	0
+ripgrep	ripgrep	Development	0
+jq	jq	Development	0
+curl	cURL	Network	0
+openssh-client	OpenSSH Client	Network	0
+nmap	Nmap	Network	0
+platformio	PlatformIO Core	Embedded	0
+esptool	esptool	Embedded	0
+arduino-cli	Arduino CLI	Embedded	0
+picocom	picocom	Embedded	0

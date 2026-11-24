@@ -8,7 +8,7 @@ lock=(pathlib.Path(a.rootfs)/'.host-gui-test.lock').open('a');fcntl.flock(lock,f
 results=[]
 for label in ('old','fixed','corrupt'):
  fixture=out/label;fixture.mkdir(mode=0o755)
- helper=(subprocess.check_output(['git','show','checkpoint/875-unsigned:app/LinuxRunner/GUISupport.bundle/support-common.sh'],cwd=root) if label=='old' else (root/'app/LinuxRunner/GUISupport.bundle/support-common.sh').read_bytes())
+ helper=(subprocess.check_output(['git','show','checkpoint/875-unsigned:app/LinuxRunner/GUISupport.bundle/support-common.sh'],cwd=root) if label=='old' else (root/'app/LinuxRunner/Support.bundle/support-common.sh').read_bytes())
  (fixture/'support-common.sh').write_bytes(helper);(fixture/'support-version').write_text('1\n');(fixture/'resource.txt').write_text('verified content\n')
  (fixture/'check.sh').write_text('#!/bin/sh\nset -eu\n[ "$(id -u)" != 0 ]\n. "$(dirname "$0")/support-common.sh"\nverify_resources\n')
  (fixture/'check.sh').chmod(0o755);(fixture/'support-common.sh').chmod(0o755)

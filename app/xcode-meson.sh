@@ -30,6 +30,7 @@ login_path=$(env -i HOME="$HOME" USER="$USER" SHELL="${SHELL:-/bin/zsh}" /bin/zs
 if [[ -n "$login_path" ]]; then
     export PATH="$PATH:$login_path"
 fi
+export PATH="/opt/homebrew/opt/lld/bin:/opt/homebrew/bin:/usr/local/opt/lld/bin:/usr/local/bin:$PATH"
 
 # Optional toolchain bundle; normal builds use tools already on PATH.
 if [ -n "${LINUXRUNNER_TOOLCHAIN_ROOT:-}" ]; then
@@ -82,7 +83,7 @@ EOF
     if [[ -n "$GUEST_ARCH" ]]; then
         guest_arch_opt="-Dguest_arch=$GUEST_ARCH"
     fi
-    (set -x; meson "$SRCROOT" --cross-file "$crossfile" $guest_arch_opt \
+    (set -x; meson setup . "$SRCROOT" --cross-file "$crossfile" $guest_arch_opt \
         -Djit=$jit -Djit_emit=$jit_emit -Dcli_aot=) || exit $?
     config=$(meson introspect --buildoptions)
 fi

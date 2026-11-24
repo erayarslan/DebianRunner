@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible LinuxRunner problem.
+description: Report a reproducible DebianRunner problem.
 title: "[Bug] "
 body:
   - type: input
@@ -12,15 +12,15 @@ body:
   - type: input
     id: version
     attributes:
-      label: LinuxRunner version and build
-      description: Settings → About LinuxRunner. Include source revision or IPA checksum if known.
+      label: DebianRunner version and build
+      description: Settings → About DebianRunner. Include source revision or IPA checksum if known.
     validations:
       required: true
   - type: input
     id: environment
     attributes:
-      label: Distribution, package and desktop
-      placeholder: Distribution/version, affected package/version, desktop and graphics mode
+      label: Package and execution mode
+      placeholder: Affected Debian package/version, interpreter or JIT mode
     validations:
       required: true
   - type: textarea
