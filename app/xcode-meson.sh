@@ -61,10 +61,6 @@ if [[ $? -ne 0 ]]; then
     case "$meson_arch" in
         arm64) meson_arch=aarch64 ;;
     esac
-    if [[ $meson_arch == aarch64 && "$ARCHS" != *x86_64* ]]; then
-        # Dynamically use ARMv8.1+ LSE atomics on A13+ while staying iOS 15 compatible.
-        arch_args="${arch_args}'-moutline-atomics', "
-    fi
     arch_args="${arch_args%%, }"
     cat | tee $crossfile <<-EOF
     [binaries]
