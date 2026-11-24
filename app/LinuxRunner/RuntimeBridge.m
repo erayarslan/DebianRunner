@@ -1317,8 +1317,14 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
             if (completion) completion(err);
             return;
         }
+        void (^failLaunch)(int) = ^(int code) {
+            task_discard_unstarted(current);
+            current = NULL;
+            [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"headless exec failed err=%d", code]];
+            if (completion) completion(code);
+        };
         err = create_stdio("/dev/null", MEM_MAJOR, DEV_NULL_MINOR);
-        if (err < 0) goto headless_failed;
+        if (err < 0) { failLaunch(err); return; }
         if (directory.length) {
             struct fd *dir = generic_open(directory.UTF8String, O_RDONLY_ | O_DIRECTORY_, 0);
             if (!IS_ERR(dir)) fs_chdir(current->fs, dir);
@@ -1333,7 +1339,7 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
 #endif
             ;
         err = do_execve(command[0].UTF8String, command.count, argv, envp);
-        if (err < 0) goto headless_failed;
+        if (err < 0) { failLaunch(err); return; }
         int pid = current->pid;
         __block BOOL completed = NO;
         __block id observer = nil;
@@ -1362,15 +1368,11 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
         if (err < 0) {
             if (observer) { [NSNotificationCenter.defaultCenter removeObserver:observer]; observer = nil; }
             if (timeout) { [timeout invalidate]; timeout = nil; }
-            goto headless_failed;
+            failLaunch(err);
+            return;
         }
         current = NULL;
         return;
-headless_failed:
-        task_discard_unstarted(current);
-        current = NULL;
-        [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"headless exec failed err=%d", err]];
-        if (completion) completion(err);
 #else
         if (completion) completion(-1);
 #endif
