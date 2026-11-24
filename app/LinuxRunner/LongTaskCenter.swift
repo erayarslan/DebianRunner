@@ -96,7 +96,7 @@ import BackgroundTasks
         guard let index = entries.firstIndex(where: { $0.id == token }) else { return }
         if !detail.isEmpty { entries[index].detail = detail }
         if let fraction { entries[index].fraction = min(1, max(0, fraction)) }
-        #if canImport(BackgroundTasks)
+        #if canImport(BackgroundTasks) && compiler(>=6.2)
         if #available(iOS 26.0, *), let task = system[token] as? BGContinuedProcessingTask {
             if let fraction { task.progress.totalUnitCount = 1000; task.progress.completedUnitCount = Int64(min(1, max(0, fraction)) * 1000) }
             task.updateTitle(entries[index].title, subtitle: entries[index].detail)
@@ -109,7 +109,7 @@ import BackgroundTasks
         entries[index].state = success ? .completed : .failed
         entries[index].ended = Date()
         entries[index].detail = message
-        #if canImport(BackgroundTasks)
+        #if canImport(BackgroundTasks) && compiler(>=6.2)
         if #available(iOS 26.0, *), let task = system.removeValue(forKey: token) as? BGContinuedProcessingTask {
             task.progress.totalUnitCount = 1000; task.progress.completedUnitCount = 1000
             task.setTaskCompleted(success: success)
@@ -135,7 +135,7 @@ import BackgroundTasks
     }
 
     private func requestContinuedProcessing(_ token: String, title: String, detail: String) {
-        #if canImport(BackgroundTasks)
+        #if canImport(BackgroundTasks) && compiler(>=6.2)
         guard #available(iOS 26.0, *), let bundle = Bundle.main.bundleIdentifier else { return }
         let identifier = bundle + ".linuxtask." + token
         // Continued-processing registrations may happen after launch; each
