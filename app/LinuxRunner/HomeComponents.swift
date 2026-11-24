@@ -290,6 +290,28 @@ struct SystemResourcesView: View {
         } == KERN_SUCCESS ? Double(info.phys_footprint) : 0
         return (footprint + Double(available)) / 1_073_741_824
     }
+    /// Matches `guest_memory_total()` + `PLATFORM_GUEST_MEMORY_DEFAULT_CAP`:
+    /// half of what iOS allows DebianRunner (or host RAM on Simulator), capped at 4 GiB.
+    private var automaticMemoryGB: Double {
+        let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let limitGB: Double
+        if let allowance = iosAllowanceGB, allowance > 0, allowance < physicalGB {
+            limitGB = allowance
+        } else {
+            limitGB = physicalGB
+        }
+        return min(4.0, limitGB / 2.0)
+    }
+    private var automaticMemoryText: String {
+        let gb = automaticMemoryGB
+        if gb >= 1.0 {
+            let rounded = (gb * 10).rounded() / 10
+            return rounded.truncatingRemainder(dividingBy: 1) == 0
+                ? String(format: "%.0f GB", rounded)
+                : String(format: "%.1f GB", rounded)
+        }
+        return "\(Int((gb * 1024).rounded())) MB"
+    }
     private var pendingRestart: Bool { cores != appliedCores || memoryMB != appliedMemoryMB }
 
     var body: some View {
@@ -302,8 +324,8 @@ struct SystemResourcesView: View {
                     chips(options: [0] + Array(1...hostCores), selection: $cores) { $0 == 0 ? "Auto" : "\($0)" }
                 }
                 card(title: "Linux Memory", symbol: "memorychip.fill", colors: [.teal, .blue],
-                     value: memoryMB == 0 ? "Automatic" : "\(memoryMB / 1024) GB",
-                     detail: "The memory Linux programs see. Compilers, Java, and Node.js size their heaps from it. Up to \(maximumGB) GB on this \(deviceGB) GB device; the rest stays for iOS and DebianRunner.") {
+                     value: memoryMB == 0 ? "Automatic · \(automaticMemoryText)" : "\(memoryMB / 1024) GB",
+                     detail: "The memory Linux programs see. Compilers, Java, and Node.js size their heaps from it. Automatic chooses \(automaticMemoryText) (half of iOS's allowance, up to 4 GB); manual allows up to \(maximumGB) GB on this \(deviceGB) GB device.") {
                     chips(options: [0] + Array(1...maximumGB).map { $0 * 1024 }, selection: $memoryMB) { $0 == 0 ? "Auto" : "\($0 / 1024) GB" }
                     if memoryMB > 0, let allowance = iosAllowanceGB, Double(memoryMB) / 1024 > allowance {
                         Label(String(format: "iOS currently allows DebianRunner about %.1f GB. Programs that use more than that can be closed by iOS.", allowance), systemImage: "exclamationmark.triangle.fill")
