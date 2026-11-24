@@ -23,7 +23,7 @@
 //     new_db['stat ' + real_inode] = stat
 
 // ad hoc hashtable
-struct entry {
+struct fakefs_rebuild_entry {
     ino_t inode;
     char *path;
     struct list chain;
@@ -63,7 +63,7 @@ int fakefs_rebuild(struct fakefs_db *fs, int root_fd) {
 
         // restore hardlinks
         struct list *bucket = &hashtable[inode % HASH_SIZE];
-        struct entry *entry;
+        struct fakefs_rebuild_entry *entry;
         bool found = false;
         list_for_each_entry(bucket, entry, chain) {
             if (entry->inode == inode) {
@@ -74,7 +74,7 @@ int fakefs_rebuild(struct fakefs_db *fs, int root_fd) {
             }
         }
         if (!found) {
-            entry = malloc(sizeof(struct entry));
+            entry = malloc(sizeof(struct fakefs_rebuild_entry));
             entry->inode = inode;
             entry->path = strdup(path);
             list_add(bucket, &entry->chain);
@@ -103,7 +103,7 @@ int fakefs_rebuild(struct fakefs_db *fs, int root_fd) {
     }
 
     for (unsigned i = 0; i < HASH_SIZE; i++) {
-        struct entry *entry, *tmp;
+        struct fakefs_rebuild_entry *entry, *tmp;
         list_for_each_entry_safe(&hashtable[i], entry, tmp, chain) {
             list_remove(&entry->chain);
             free(entry->path);
