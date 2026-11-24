@@ -7,6 +7,7 @@
 #include <netinet/tcp.h>
 #include <net/if.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -25,6 +26,25 @@
 
 const struct fd_ops socket_fdops;
 extern volatile bool g_trace_syscalls;
+
+static _Atomic uint64_t sock_net_rx_bytes = 0;
+static _Atomic uint64_t sock_net_tx_bytes = 0;
+
+static inline void sock_account_io(const struct fd *sock, ssize_t bytes, bool is_tx) {
+    if (bytes <= 0 || sock == NULL)
+        return;
+    if (sock->socket.domain != AF_INET_ && sock->socket.domain != AF_INET6_)
+        return;
+    if (is_tx)
+        atomic_fetch_add_explicit(&sock_net_tx_bytes, (uint64_t) bytes, memory_order_relaxed);
+    else
+        atomic_fetch_add_explicit(&sock_net_rx_bytes, (uint64_t) bytes, memory_order_relaxed);
+}
+
+void sock_network_totals(uint64_t *rx_bytes, uint64_t *tx_bytes) {
+    if (rx_bytes) *rx_bytes = atomic_load_explicit(&sock_net_rx_bytes, memory_order_relaxed);
+    if (tx_bytes) *tx_bytes = atomic_load_explicit(&sock_net_tx_bytes, memory_order_relaxed);
+}
 
 // Opt-in, read-only route-netlink compatibility. One native readiness token
 // represents a bounded reply queue. Enqueue whole snapshots atomically: a
@@ -1146,6 +1166,7 @@ static int_t sock_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t 
         return errno_map();
     }
     free(buffer);
+    sock_account_io(sock, res, true);
     return res;
 
 error:
@@ -1342,6 +1363,8 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
     if (sockaddr_len_addr != 0)
         if (user_put(sockaddr_len_addr, sockaddr_len))
             return _EFAULT;
+    if (!(flags & MSG_PEEK_))
+        sock_account_io(sock, res, false);
     return res;
 }
 
@@ -2206,6 +2229,8 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     current->send_nosignal = saved || (flags & MSG_NOSIGNAL_);
     int_t result = sock_sendmsg(sock, msghdr_addr, flags);
     current->send_nosignal = saved;
+    if (result > 0)
+        sock_account_io(sock, result, true);
     fd_close(sock);
     return result;
 }
@@ -2616,6 +2641,8 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     struct fd *sock = sock_getfd_retain(sock_fd, &error);
     if (sock == NULL) return error;
     int_t result = sock_recvmsg(sock, msghdr_addr, flags);
+    if (result > 0 && !(flags & MSG_PEEK_))
+        sock_account_io(sock, result, false);
     fd_close(sock);
     return result;
 }
@@ -2755,6 +2782,8 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
                current->pid, current->comm, fd->real_fd, eintr_count, err);
     }
     sock_translate_err(fd, &err);
+    if (err > 0)
+        sock_account_io(fd, err, false);
     return err;
 }
 
@@ -2783,6 +2812,8 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
                current->pid, current->comm, fd->real_fd, eintr_count, err);
     }
     sock_translate_err(fd, &err);
+    if (err > 0)
+        sock_account_io(fd, err, true);
     return err;
 }
 

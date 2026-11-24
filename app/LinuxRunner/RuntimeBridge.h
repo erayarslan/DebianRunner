@@ -59,6 +59,8 @@ void LRSetDatalessMaterialization(void);
 + (BOOL)terminateProcess:(int)pid force:(BOOL)force;
 // The whole LinuxRunner app's memory as iOS accounts it (phys_footprint), 0 if unavailable.
 + (uint64_t)appFootprintBytes;
+// Cumulative IPv4/IPv6 network bytes transferred by guest Linux sockets: rx_bytes, tx_bytes.
++ (NSDictionary<NSString *, NSNumber *> *)networkIOBytes;
 + (NSString *)executionMode;            // interpreter | automatic | jit
 + (void)setExecutionMode:(NSString *)mode;
 + (BOOL)debuggerAttached;

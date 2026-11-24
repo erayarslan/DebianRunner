@@ -507,6 +507,12 @@ static NSString *LRThermalState(void) {
     task_vm_info_data_t info = {0}; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
     return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &info, &count) == KERN_SUCCESS ? info.phys_footprint : 0;
 }
++ (NSDictionary<NSString *, NSNumber *> *)networkIOBytes {
+    extern void sock_network_totals(uint64_t *rx_bytes, uint64_t *tx_bytes);
+    uint64_t rx = 0, tx = 0;
+    sock_network_totals(&rx, &tx);
+    return @{@"rx_bytes": @(rx), @"tx_bytes": @(tx)};
+}
 + (BOOL)terminateProcess:(int)pid force:(BOOL)force {
     if (pid <= 1) return NO;   // init (the session's root) is never terminated from here
     lock(&pids_lock);

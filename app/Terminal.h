@@ -39,6 +39,7 @@ struct tty;
 @property (nonatomic) BOOL enableVoiceOverAnnounce;
 // Use KVO on this
 @property (readonly) BOOL loaded;
+@property (readonly) BOOL bracketedPaste;
 
 @end
 

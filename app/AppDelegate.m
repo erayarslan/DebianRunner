@@ -297,6 +297,7 @@ static int bootError;
     [Terminal convertCommand:command toArgs:argv limitSize:sizeof(argv)];
     const char *envp =
         "TERM=xterm-256color\0"
+        "LANG=C.UTF-8\0"
         "HOME=/root\0"
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
 #if defined(GUEST_ARM64)

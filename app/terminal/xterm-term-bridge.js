@@ -999,6 +999,7 @@
                 ensureCursorVisible();
             return;
         }
+        const hadPrev = xtermAppActive !== null;
         xtermAppActive = active;
 
         const core = term._core;
@@ -1010,6 +1011,9 @@
                 ensureCursorVisible();
             } else {
                 core?._renderService?.handleBlur?.();
+            }
+            if (hadPrev && core?.coreService?.decPrivateModes?.sendFocus) {
+                native.sendInput(active ? '\x1b[I' : '\x1b[O');
             }
         } catch (error) {
             native.log(`terminal focus sync failed: ${error?.stack || error}`);
@@ -1085,6 +1089,7 @@
 
     function syncApplicationCursor() {
         syncProp('applicationCursor', !!term.modes?.applicationCursorKeysMode);
+        syncProp('bracketedPaste', !!term.modes?.bracketedPasteMode);
     }
 
     function syncProp(name, value) {

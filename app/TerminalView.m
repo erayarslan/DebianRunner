@@ -685,13 +685,12 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         }
     } else if (gesture.state == UIGestureRecognizerStateEnded) {
         CGFloat vy = [gesture velocityInView:self].y;
+        [self stopAltScrollMomentum];
         if (fabs(vy) > 140.0) {
             self.altScrollVelocity = MAX(-3600.0, MIN(3600.0, vy));
             self.altScrollLastTimestamp = 0;
             self.altScrollDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(stepAltScrollMomentum:)];
             [self.altScrollDisplayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-        } else {
-            [self stopAltScrollMomentum];
         }
     } else {
         [self stopAltScrollMomentum];
@@ -804,9 +803,25 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
 
 - (void)paste:(id)sender {
     NSString *string = UIPasteboard.generalPasteboard.string;
-    if (string) {
-        [self insertText:string];
+    if (string.length == 0)
+        return;
+#if USE_XTERM_RENDERER
+    if (self.selectionActive) {
+        [self clearTerminalSelection];
     }
+    if (self.terminal.bracketedPaste) {
+        // Strip embedded bracketed-paste end marker to prevent escape injection.
+        NSString *safe = [string stringByReplacingOccurrencesOfString:@"\x1b[201~" withString:@""];
+        safe = [safe stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\r"];
+        safe = [safe stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
+        NSString *wrapped = [NSString stringWithFormat:@"\x1b[200~%@\x1b[201~", safe];
+        NSData *data = [wrapped dataUsingEncoding:NSUTF8StringEncoding];
+        if (data)
+            [self.terminal sendInput:data];
+        return;
+    }
+#endif
+    [self insertText:string];
 }
 
 - (void)copy:(id)sender {

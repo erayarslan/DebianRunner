@@ -730,7 +730,6 @@ struct ManagerView: View {
         .preferredColorScheme(appearance == "system" ? nil : appearance == "light" ? .light : .dark)
         .onAppear {
             LongTaskCenter.shared.start()
-            InstallScreensaver.shared.start()
             runtimeRunning = LRRuntimeBridge.isRunning()
             wipeScheduled = LRRuntimeBridge.isWipePending()
             if runtimeRunning {
@@ -1099,9 +1098,6 @@ struct ManagerView: View {
                 Toggle(isOn: Binding(get: { LongTaskCenter.notificationsEnabled }, set: { LongTaskCenter.notificationsEnabled = $0 })) { SettingsLabel("Notify When Tasks Finish", "bell.badge.fill", .red) }
                 Toggle(isOn: $keepRunningInBackground) { SettingsLabel("Keep Linux Running in Background", "infinity", .green) }
                     .onChange(of: keepRunningInBackground) { BackgroundRunner.shared.apply($0) }
-                Picker(selection: Binding(get: { InstallScreensaver.minutes }, set: { InstallScreensaver.minutes = $0 })) {
-                    Text("Off").tag(0); Text("3 minutes").tag(3); Text("4 minutes").tag(4); Text("5 minutes").tag(5)
-                } label: { SettingsLabel("Install Screensaver", "moon.zzz.fill", .purple) }
             } header: { Text("General") } footer: {
                 Text("Keep Linux Running in Background uses a background location session so SSH connections and long tasks stay alive when you switch apps.")
             }
@@ -2609,9 +2605,17 @@ private struct GuestProcess: Identifiable {
     @Published var appMemoryHistory: [Double] = []
     @Published var guestMemoryHistory: [Double] = []
     @Published var memoryHistory: [Double] = []
+    @Published var netInHistory: [Double] = []   // KB/s
+    @Published var netOutHistory: [Double] = []  // KB/s
+    @Published var netInBytesPerSec: Double = 0
+    @Published var netOutBytesPerSec: Double = 0
+    @Published var netInTotalBytes: UInt64 = 0
+    @Published var netOutTotalBytes: UInt64 = 0
     @Published var footprint: UInt64 = 0
     @Published var iosAllowanceBytes: UInt64 = 0
     private var previousUs: [Int: Int] = [:]
+    private var previousRxBytes: UInt64 = 0
+    private var previousTxBytes: UInt64 = 0
     private var previousTime = Date.distantPast
     private var hasBaseline = false
     static let interval = 2.0
@@ -2633,6 +2637,25 @@ private struct GuestProcess: Identifiable {
             }
         }
         previousUs = Dictionary(uniqueKeysWithValues: list.map { ($0.id, $0.cpuUs) })
+
+        let net = LRRuntimeBridge.networkIOBytes()
+        let rxNow = net["rx_bytes"]?.uint64Value ?? 0
+        let txNow = net["tx_bytes"]?.uint64Value ?? 0
+        let elapsedSec = elapsedUs / 1_000_000.0
+        if !resetBaseline && elapsedSec > 0 {
+            let rxDelta = rxNow >= previousRxBytes ? (rxNow - previousRxBytes) : 0
+            let txDelta = txNow >= previousTxBytes ? (txNow - previousTxBytes) : 0
+            netInBytesPerSec = Double(rxDelta) / elapsedSec
+            netOutBytesPerSec = Double(txDelta) / elapsedSec
+        } else {
+            netInBytesPerSec = 0
+            netOutBytesPerSec = 0
+        }
+        previousRxBytes = rxNow
+        previousTxBytes = txNow
+        netInTotalBytes = rxNow
+        netOutTotalBytes = txNow
+
         previousTime = now
         let wasFirst = !hasBaseline
         hasBaseline = true
@@ -2646,15 +2669,59 @@ private struct GuestProcess: Identifiable {
         let guestAnonMB = Double(list.reduce(0) { $0 + $1.privateKB }) / 1024.0
         if !resetBaseline || cpuHistory.isEmpty {
             cpuHistory = Array((cpuHistory + [totalCPU]).suffix(60))
+            netInHistory = Array((netInHistory + [netInBytesPerSec / 1024.0]).suffix(60))
+            netOutHistory = Array((netOutHistory + [netOutBytesPerSec / 1024.0]).suffix(60))
         }
         appMemoryHistory = Array((appMemoryHistory + [appMB]).suffix(60))
         guestMemoryHistory = Array((guestMemoryHistory + [guestMappedMB]).suffix(60))
         memoryHistory = Array((memoryHistory + [guestAnonMB]).suffix(60))
         if wasFirst {
-            // Take a quick follow-up sample so CPU % populates immediately instead of waiting 2 seconds.
+            // Take a quick follow-up sample so CPU % and Network rates populate immediately instead of waiting 2 seconds.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
                 guard let self, UIApplication.shared.applicationState == .active else { return }
                 self.sample()
+            }
+        }
+    }
+}
+
+private struct DualAreaChart: View {
+    let primary: [Double]; let primaryColor: Color
+    let secondary: [Double]; let secondaryColor: Color
+    var body: some View {
+        GeometryReader { geo in
+            let maxPrimary = primary.max() ?? 0
+            let maxSecondary = secondary.max() ?? 0
+            let top = max(max(maxPrimary, maxSecondary), 1)
+            let count = max(primary.count, secondary.count)
+            let makePoints: ([Double]) -> [CGPoint] = { vals in
+                vals.enumerated().map { i, v in
+                    CGPoint(x: geo.size.width * CGFloat(i) / CGFloat(max(count - 1, 1)), y: geo.size.height * (1 - CGFloat(v / top)))
+                }
+            }
+            let p1 = makePoints(primary)
+            let p2 = makePoints(secondary)
+            ZStack {
+                Path { p in for f in [0.25, 0.5, 0.75] { p.move(to: CGPoint(x: 0, y: geo.size.height * f)); p.addLine(to: CGPoint(x: geo.size.width, y: geo.size.height * f)) } }
+                    .stroke(TaskStyle.line, style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
+                if p1.count > 1 {
+                    Path { p in
+                        p.move(to: CGPoint(x: p1[0].x, y: geo.size.height)); p1.forEach { p.addLine(to: $0) }
+                        p.addLine(to: CGPoint(x: p1[p1.count - 1].x, y: geo.size.height)); p.closeSubpath()
+                    }.fill(LinearGradient(colors: [primaryColor.opacity(0.28), primaryColor.opacity(0.02)], startPoint: .top, endPoint: .bottom))
+                    Path { p in p.move(to: p1[0]); p1.dropFirst().forEach { p.addLine(to: $0) } }
+                        .stroke(primaryColor, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    Circle().fill(primaryColor).frame(width: 6, height: 6).position(p1[p1.count - 1])
+                }
+                if p2.count > 1 {
+                    Path { p in
+                        p.move(to: CGPoint(x: p2[0].x, y: geo.size.height)); p2.forEach { p.addLine(to: $0) }
+                        p.addLine(to: CGPoint(x: p2[p2.count - 1].x, y: geo.size.height)); p.closeSubpath()
+                    }.fill(LinearGradient(colors: [secondaryColor.opacity(0.24), secondaryColor.opacity(0.02)], startPoint: .top, endPoint: .bottom))
+                    Path { p in p.move(to: p2[0]); p2.dropFirst().forEach { p.addLine(to: $0) } }
+                        .stroke(secondaryColor, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    Circle().fill(secondaryColor).frame(width: 6, height: 6).position(p2[p2.count - 1])
+                }
             }
         }
     }
@@ -2823,6 +2890,19 @@ struct TaskManagerView: View {
         if kb >= 1024 { return String(format: "%.1f MB", kb / 1024) }
         return String(format: "%.0f KB", kb)
     }
+    private static func byteCount(_ bytes: UInt64) -> String {
+        let b = Double(bytes)
+        if b >= 1_073_741_824 { return String(format: "%.2f GB", b / 1_073_741_824) }
+        if b >= 1_048_576 { return String(format: "%.1f MB", b / 1_048_576) }
+        if b >= 1024 { return String(format: "%.1f KB", b / 1024) }
+        return "\(bytes) B"
+    }
+    private static func rate(_ bytesPerSec: Double) -> String {
+        if bytesPerSec >= 1_048_576 { return String(format: "%.2f MB/s", bytesPerSec / 1_048_576) }
+        if bytesPerSec >= 1024 * 100 { return String(format: "%.0f KB/s", bytesPerSec / 1024) }
+        if bytesPerSec >= 1024 { return String(format: "%.1f KB/s", bytesPerSec / 1024) }
+        return String(format: "%.0f B/s", max(0, bytesPerSec))
+    }
 
     private var overview: some View {
         let execution = LRRuntimeBridge.executionBackendStatus()
@@ -2841,6 +2921,20 @@ struct TaskManagerView: View {
                 tile("\(sampler.processes.reduce(0) { $0 + $1.threads })", "Threads", "point.3.connected.trianglepath.dotted", Color(red: 0.75, green: 0.45, blue: 1))
                 tile(Self.bytes(guestMappedKB), "Linux mapped", "memorychip", TaskStyle.yellow)
                 tile(jit ? "JIT" : "Interpreter", "Execution", jit ? "bolt.fill" : "cpu", jit ? TaskStyle.green : TaskStyle.frost)
+            }
+            card("Network I/O", systemImage: "arrow.up.arrow.down") {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("In", systemImage: "arrow.down.circle.fill").font(.caption.weight(.semibold)).foregroundColor(TaskStyle.frost)
+                        Text(Self.rate(sampler.netInBytesPerSec)).font(.system(.title3, design: .rounded).weight(.bold).monospacedDigit()).foregroundColor(TaskStyle.text).lineLimit(1).minimumScaleFactor(0.7)
+                        Text("Total \(Self.byteCount(sampler.netInTotalBytes))").font(.caption).foregroundColor(TaskStyle.dim).monospacedDigit()
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("Out", systemImage: "arrow.up.circle.fill").font(.caption.weight(.semibold)).foregroundColor(TaskStyle.yellow)
+                        Text(Self.rate(sampler.netOutBytesPerSec)).font(.system(.title3, design: .rounded).weight(.bold).monospacedDigit()).foregroundColor(TaskStyle.text).lineLimit(1).minimumScaleFactor(0.7)
+                        Text("Total \(Self.byteCount(sampler.netOutTotalBytes))").font(.caption).foregroundColor(TaskStyle.dim).monospacedDigit()
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             card("Top processes", systemImage: "flame.fill") {
                 ForEach(sampler.processes.sorted { $0.cpuPercent > $1.cpuPercent }.prefix(4)) { p in
@@ -2936,8 +3030,25 @@ struct TaskManagerView: View {
                 Text("iOS app footprint: \(sampler.footprint > 0 ? Self.bytes(appFootprintKB) : "—") · Linux mapped: \(Self.bytes(guestMappedKB)) · Anonymous heap/stack: \(Self.bytes(privateKB))")
                     .font(.caption).foregroundColor(TaskStyle.dim)
             }
+            card("Network · last 2 minutes", systemImage: "arrow.up.arrow.down") {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("In", systemImage: "arrow.down.circle.fill").font(.caption.weight(.semibold)).foregroundColor(TaskStyle.frost)
+                        Text(Self.rate(sampler.netInBytesPerSec)).font(.system(.title2, design: .rounded).weight(.bold).monospacedDigit()).foregroundColor(TaskStyle.frost).lineLimit(1).minimumScaleFactor(0.7)
+                        Text("peak \(Self.rate((sampler.netInHistory.max() ?? 0) * 1024))").font(.caption2).foregroundColor(TaskStyle.dim).monospacedDigit()
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("Out", systemImage: "arrow.up.circle.fill").font(.caption.weight(.semibold)).foregroundColor(TaskStyle.yellow)
+                        Text(Self.rate(sampler.netOutBytesPerSec)).font(.system(.title2, design: .rounded).weight(.bold).monospacedDigit()).foregroundColor(TaskStyle.yellow).lineLimit(1).minimumScaleFactor(0.7)
+                        Text("peak \(Self.rate((sampler.netOutHistory.max() ?? 0) * 1024))").font(.caption2).foregroundColor(TaskStyle.dim).monospacedDigit()
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+                DualAreaChart(primary: sampler.netInHistory, primaryColor: TaskStyle.frost, secondary: sampler.netOutHistory, secondaryColor: TaskStyle.yellow).frame(height: 120)
+                Text("Session total: In \(Self.byteCount(sampler.netInTotalBytes)) · Out \(Self.byteCount(sampler.netOutTotalBytes)) (Linux IPv4/IPv6 sockets)")
+                    .font(.caption).foregroundColor(TaskStyle.dim).monospacedDigit()
+            }
             card("Notes", systemImage: "info.circle") {
-                Text("CPU tracks host Mach thread execution deltas across all guest threads. Memory plots iOS physical footprint (phys_footprint) alongside Linux mapped pages and private anonymous heap/stack.").font(.caption).foregroundColor(TaskStyle.dim)
+                Text("CPU tracks host Mach thread execution deltas across all guest threads. Memory plots iOS physical footprint (phys_footprint) alongside Linux mapped pages and private anonymous heap/stack. Network tracks live IPv4/IPv6 socket bytes sent and received by Linux processes.").font(.caption).foregroundColor(TaskStyle.dim)
             }
         }.padding(.horizontal).padding(.bottom, 16) }
     }
