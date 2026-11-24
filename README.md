@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="assets/branding/linuxrunner-icon.svg" alt="DebianRunner" width="144">
+  <img src="assets/branding/linuxrunner-icon.png" alt="DebianRunner" width="144">
 </p>
 <h1 align="center">DebianRunner</h1>
 <h2 align="center">Headless Debian Minimal ARM64 for iPhone and iPad</h2>
-<p align="center">Debian GNU/Linux 13 (trixie) minimal ARM64 userspace · Terminal · APT · Headless Modes</p>
+<p align="center">Debian GNU/Linux 13 (trixie) minimal ARM64 userspace · Terminal · Built-in SSH · APT · Apple Files</p>
 <p align="center">
   <img src="assets/branding/version-badge.svg" alt="DebianRunner">
   <img src="assets/branding/platform-badge.svg" alt="iOS and iPadOS">
@@ -28,9 +28,10 @@ DebianRunner runs **Debian GNU/Linux 13 (trixie) minimal ARM64** userspace on iP
 | **Debian 13 Minimal ARM64** | First-launch on-device download of official Debian trixie minimal packages verified against Debian's signed `InRelease` and SHA-256 package index (`DebianSupport.bundle`). |
 | **Interactive Terminal** | Native terminal with bash login shell, hardware keyboard support, custom font sharpness/size, and command launchers. |
 | **APT Package Management** | Native **Packages** front end for Debian `apt`/`dpkg` (curated CLI tools, full APT search, simulated transaction review, and Repair Center). |
-| **Headless Modes** | Opt-in **Agent Mode** (Claude Code, Codex CLI, OpenCode), **SSH Mode** (`sshd` on port 2222), **Liftoff** (web server on port 8080), and **Pocket Cloud** (WebDAV Wi-Fi file server on port 8081). |
-| **CPU, Memory & Task Manager** | Configure guest CPU core count and visible memory, and monitor or terminate live Linux processes. |
-| **Files, Users & Serial Devices** | Shared folder (`/mnt/LinuxRunnerShared`, `~/Shared`), linked Files folders (`/mnt/<name>`), Linux user management, Bluetooth LE serial (`/dev/ttyBLE0-3`), and USB-MIDI serial adapters (`/dev/ttyMIDI0-3`). |
+| **Built-in SSH Server** | OpenSSH server (`sshd` on port `2222`) installed and started by default for remote terminals, VS Code Remote-SSH, `scp`, `rsync`, and SFTP, with background keepalive support. |
+| **CPU, Memory & Task Manager** | Configure guest CPU core count and visible memory, monitor or terminate live Linux processes, and clear finished items from the Home task list. |
+| **Apple Files & Shared Folders** | Mount the Debian root filesystem directly in Apple's native **Files** app (**Locations → DebianRunner → Debian Minimal**), plus `/mnt/LinuxRunnerShared` (`~/Shared`), linked Files folders (`/mnt/<name>`), Linux user management, Bluetooth LE serial (`/dev/ttyBLE0-3`), and USB-MIDI serial adapters (`/dev/ttyMIDI0-3`). |
+| **Debian Minimal Settings & Wipe** | Dedicated **Debian** tab for managing your Debian Minimal environment and cleanly wiping/reinstalling it from scratch whenever needed. |
 | **Optional ARM64 JIT** | Interpreter by default; optional JIT when iOS permits executable memory (e.g., via StikDebug). |
 
 ## Supported Devices and Requirements
@@ -65,24 +66,17 @@ This repository includes a GitHub Actions workflow ([`.github/workflows/build-ip
 
 See [Building](docs/BUILDING.md) for local macOS/Xcode build commands as well.
 
-## Headless Modes
+## Built-in SSH Server
 
-Four optional headless services in **Home → Modes** (or **Settings → General → DebianRunner Modes**). Each mode stays off until installed and started:
-
-| Mode | What it does |
-| --- | --- |
-| **Agent Mode** | Claude Code, Codex CLI, and OpenCode in your Debian terminal, with Node.js, git, ripgrep, and Python. |
-| **SSH Mode** | OpenSSH server on port 2222 for remote terminals, VS Code Remote-SSH, `scp`, and `rsync`. |
-| **Liftoff** | Serves `~/Sites` on port 8080 for Safari preview and Wi-Fi testing with a QR code. |
-| **Pocket Cloud** | Shares `~/Pocket Cloud` over WebDAV on port 8081 with a per-session password. |
+DebianRunner installs and starts an **OpenSSH server** (`sshd` on TCP port `2222`) by default. Open **Home → SSH Server** (or **Debian → SSH Server**) to view the copyable `ssh` / `sftp` commands, toggle auto-start or root login, enable background execution for long-lived SSH sessions, and inspect SSH logs.
 
 ## CPU & Memory
 
 Open **Home → CPU & Memory** (or **Settings → Performance → CPU & Memory**) to configure how many CPU cores and how much memory Debian programs see. Changes apply on the next app launch. Use **Home → Task Manager** to inspect live CPU, memory, and guest processes.
 
-## Networking and Files
+## Networking and Apple Files
 
-Linux sockets use the host iOS network stack (`ip addr`, `ip link`, `ip route`, `ping`, `tracepath`). Use **Settings → Linux Environment → File Sharing** (or **Home → Files**) to share `/mnt/LinuxRunnerShared` (`~/Shared`) and link external iOS Files folders at `/mnt/<name>`.
+Linux sockets use the host iOS network stack (`ip addr`, `ip link`, `ip route`, `ping`, `tracepath`). Browse the full Debian root filesystem directly inside Apple's native **Files** app (**Browse → Locations → DebianRunner → Debian Minimal**) when signed with an App Group, or use **Home → Files** (`On My iPhone → DebianRunner → Shared`, mapped to `/mnt/LinuxRunnerShared` and `~/Shared`) and linked external folders at `/mnt/<name>`.
 
 [Files](docs/FILE_SHARING.md) · [Networking](docs/NETWORKING_AND_DISPLAYS.md)
 

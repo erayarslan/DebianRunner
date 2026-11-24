@@ -103,9 +103,10 @@ static NSString *kDefaultRoot = @"Default Root";
 
 - (void)syncFileProviderDomains {
 #ifdef LINUXRUNNER
-    // No extension is embedded in this target; avoid unrelated provider APIs.
-    return;
-#else
+    if (CurrentAppGroups().count == 0) {
+        return;
+    }
+#endif
     if (self.updatingDomains) {
         self.domainsNeedUpdate = YES;
         return;
@@ -119,30 +120,64 @@ static NSString *kDefaultRoot = @"Default Root";
                 NSLog(@"error adjusting domains: %@", error);
         };
         onError(error);
-        NSMutableOrderedSet<NSString *> *missingRoots = [self.roots mutableCopy];
+        NSOrderedSet<NSString *> *snapshot = [self.roots copy];
+        NSMutableOrderedSet<NSString *> *missingRoots = [snapshot mutableCopy];
         for (NSFileProviderDomain *domain in domains) {
             if ([missingRoots containsObject:domain.identifier]) {
                 [missingRoots removeObject:domain.identifier];
             } else {
-                [NSFileManager.defaultManager removeItemAtURL:
-                 [NSFileProviderManager.defaultManager.documentStorageURL
-                  URLByAppendingPathComponent:domain.pathRelativeToDocumentStorage]
-                                                        error:nil];
+                NSURL *storage = NSFileProviderManager.defaultManager.documentStorageURL;
+                if (storage != nil) {
+                    [NSFileManager.defaultManager removeItemAtURL:
+                     [storage URLByAppendingPathComponent:domain.pathRelativeToDocumentStorage]
+                                                            error:nil];
+                }
                 [NSFileProviderManager removeDomain:domain completionHandler:onError];
             }
         }
         for (NSString *rootId in missingRoots) {
+            NSString *displayName = (snapshot.count == 1) ? @"Debian Minimal" : rootId;
             [NSFileProviderManager addDomain:[[NSFileProviderDomain alloc] initWithIdentifier:rootId
-                                                                                  displayName:rootId
+                                                                                  displayName:displayName
                                                                 pathRelativeToDocumentStorage:rootId]
                            completionHandler:onError];
         }
+        self.updatingDomains = NO;
         if (self.domainsNeedUpdate)
             [self syncFileProviderDomains];
-        self.updatingDomains = NO;
     }];
-#endif
 }
+
+#ifdef LINUXRUNNER
+- (void)removeAllFileProviderDomains {
+    if (CurrentAppGroups().count == 0)
+        return;
+    [NSFileProviderManager removeAllDomainsWithCompletionHandler:^(NSError *error) {
+        if (error != nil)
+            NSLog(@"error removing file provider domains: %@", error);
+    }];
+}
+
+- (BOOL)forceDestroyAllRoots:(NSError **)error {
+    NSArray<NSString *> *allRoots = self.roots.array.copy;
+    NSError *firstError = nil;
+    for (NSString *name in allRoots) {
+        NSError *rmError = nil;
+        if (![NSFileManager.defaultManager removeItemAtURL:[self rootUrl:name] error:&rmError] &&
+            rmError.code != NSFileNoSuchFileError && firstError == nil) {
+            firstError = rmError;
+        }
+    }
+    void (^clear)(void) = ^{
+        self.defaultRoot = nil;
+        [[self mutableOrderedSetValueForKey:@"roots"] removeAllObjects];
+    };
+    if (NSThread.isMainThread) clear(); else dispatch_sync(dispatch_get_main_queue(), clear);
+    [self removeAllFileProviderDomains];
+    if (firstError && error) *error = firstError;
+    return firstError == nil;
+}
+#endif
 
 - (BOOL)accessInstanceVariablesDirectly {
     return YES;

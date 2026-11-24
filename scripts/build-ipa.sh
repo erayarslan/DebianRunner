@@ -56,6 +56,12 @@ import plistlib, sys
 with open(sys.argv[1], 'wb') as out:
     plistlib.dump({} if sys.argv[3] == 'YES' else {'com.apple.security.application-groups': ['group.' + sys.argv[2]]}, out)
 PYADHOC
+    for appex in "$app"/PlugIns/*.appex; do
+        if [[ -d "$appex" ]]; then
+            codesign --force --sign - --timestamp=none --generate-entitlement-der --entitlements "$staging/entitlements.plist" "$appex"
+            codesign --verify --strict "$appex"
+        fi
+    done
     codesign --force --sign - --timestamp=none --generate-entitlement-der --entitlements "$staging/entitlements.plist" "$app"
     codesign --verify --strict "$app"
     ditto --norsrc --noextattr --noacl --noqtn "$app" "$staging/Payload/LinuxRunner.app"
@@ -64,7 +70,7 @@ PYADHOC
     mv "$staging/LinuxRunner.ipa" "$ipa"
     python3 scripts/validate-ipa.py "$ipa" --report "$release/$artifact.validation.json" ||
         { echo 'IPA validation failed; do not publish this artifact.' >&2; exit 1; }
-    printf 'UNSIGNED IPA (ad-hoc signed, no Apple signature). Requires signing and provisioning before physical-device installation.\nBundle ID: %s\nApp group: group.%s\nEmbedded extensions: none in this ARM64 scheme\nPrivate Application Support fallback: supported\n' \
+    printf 'UNSIGNED IPA (ad-hoc signed, no Apple signature). Requires signing and provisioning before physical-device installation.\nBundle ID: %s\nApp group: group.%s\nEmbedded extensions: iSHFileProvider.appex (Apple Files rootfs provider)\nPrivate Application Support fallback: supported\n' \
         "${BUNDLE_ID:-dev.debianrunner.app}" "${BUNDLE_ID:-dev.debianrunner.app}" > "$release/SIGNING-STATUS.txt"
 else
     options="${EXPORT_OPTIONS_PLIST:-$release/ExportOptions.plist}"

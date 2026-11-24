@@ -72,12 +72,11 @@
             childIdent = [NSString stringWithFormat:@"%lu", (unsigned long) inode];
         }
 
-        NSLog(@"returning %s %@", dirent->d_name, childIdent);
         FileProviderItem *item = [[FileProviderItem alloc] initWithIdentifier:childIdent mount:_item.mount error:&error];
         if (item == nil) {
-            [observer finishEnumeratingWithError:error];
-            closedir(dir);
-            return;
+            NSLog(@"skipping unreadable entry %s: %@", dirent->d_name, error);
+            errno = 0;
+            continue;
         }
         [items addObject:item];
         errno = 0;

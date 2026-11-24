@@ -491,12 +491,22 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     //    process crashes (like FULL) but skips an fsync per commit,
     //    cheap when fakefs writes are infrequent.
     //  - PRAGMA temp_store=MEMORY: keeps sort/temp tables off disk.
+#ifdef ISH_FILE_PROVIDER
+    // Stay well within iOS File Provider extension Jetsam memory limits.
+    static const char *tuning[] = {
+        "pragma mmap_size=0",
+        "pragma cache_size=-2048",      // 2 MB in-process page cache
+        "pragma synchronous=NORMAL",
+        "pragma temp_store=MEMORY",
+    };
+#else
     static const char *tuning[] = {
         "pragma mmap_size=268435456",   // 256 MB
         "pragma cache_size=-65536",     // 64 MB in-process page cache
         "pragma synchronous=NORMAL",
         "pragma temp_store=MEMORY",
     };
+#endif
     for (size_t ti = 0; ti < sizeof(tuning)/sizeof(tuning[0]); ti++) {
         // Tuning pragmas are best-effort: a failure here only loses a perf knob,
         // not correctness, so log and continue rather than fail the mount.

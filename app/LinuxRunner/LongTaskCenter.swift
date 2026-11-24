@@ -81,7 +81,7 @@ import BackgroundTasks
         let token = UUID().uuidString.lowercased()
         entries.insert(Entry(id: token, title: title, detail: detail, fraction: nil, state: .running, started: Date()), at: 0)
         if entries.count > 20 { entries.removeLast(entries.count - 20) }
-        let assertion = UIApplication.shared.beginBackgroundTask(withName: "LinuxRunner: " + title) { [weak self] in
+        let assertion = UIApplication.shared.beginBackgroundTask(withName: "DebianRunner: " + title) { [weak self] in
             Task { @MainActor in self?.assertionExpired(token) }
         }
         if assertion != .invalid { assertions[token] = assertion }
@@ -121,6 +121,15 @@ import BackgroundTasks
     }
 
     var running: [Entry] { entries.filter { $0.ended == nil } }
+    var hasClearableEntries: Bool { entries.contains { $0.ended != nil || $0.state == .pausedByIOS } }
+
+    func clearFinished() {
+        entries.removeAll { $0.ended != nil || $0.state == .pausedByIOS }
+    }
+
+    func removeEntry(_ id: String) {
+        entries.removeAll { $0.id == id && ($0.ended != nil || $0.state == .pausedByIOS) }
+    }
 
     // MARK: - System mechanisms
 
@@ -323,13 +332,29 @@ struct InstallScreensaverView: View {
     static let defaultsKey = "LinuxRunner.keepRunningInBackground"
     @Published private(set) var status = "Off"
     private let manager = CLLocationManager()
+    private var activitySession: AnyObject?   // CLBackgroundActivitySession on iOS 17+
+    private var requestedAlwaysUpgrade = false
+    private var activeSession = false
+    private var observers: [NSObjectProtocol] = []
 
     private override init() {
         super.init()
         manager.delegate = self
+        manager.activityType = .other
         manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
-        manager.distanceFilter = CLLocationDistanceMax
+        // A finite distance filter (not CLLocationDistanceMax) prevents iOS 17/18
+        // from treating the location session as inert and suspending the process.
+        manager.distanceFilter = 500
         manager.pausesLocationUpdatesAutomatically = false
+        let nc = NotificationCenter.default
+        observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.reinforceForBackground() }
+        })
+        observers.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                if self?.enabled == true { self?.start() }
+            }
+        })
     }
 
     var enabled: Bool { UserDefaults.standard.bool(forKey: Self.defaultsKey) }
@@ -339,32 +364,87 @@ struct InstallScreensaverView: View {
     /// Call at launch: resumes the session when the user left it enabled.
     @objc func restore() { if enabled { start() } }
 
+    private func reinforceForBackground() {
+        guard enabled else { return }
+        switch manager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            manager.allowsBackgroundLocationUpdates = true
+            manager.showsBackgroundLocationIndicator = true
+            if #available(iOS 17.0, *), activitySession == nil {
+                activitySession = CLBackgroundActivitySession()
+            }
+            manager.startUpdatingLocation()
+        default:
+            break
+        }
+    }
+
     private func start() {
         switch manager.authorizationStatus {
         case .notDetermined:
             status = "Waiting for location permission"
             manager.requestWhenInUseAuthorization()
         case .denied, .restricted:
+            stopSessionObjects()
             status = "Location permission denied: allow it in iOS Settings > DebianRunner > Location"
-        default:
-            manager.allowsBackgroundLocationUpdates = true
-            manager.showsBackgroundLocationIndicator = true
-            manager.startUpdatingLocation()
+        case .authorizedWhenInUse:
+            beginLocationSession()
+            if !requestedAlwaysUpgrade {
+                requestedAlwaysUpgrade = true
+                manager.requestAlwaysAuthorization()
+            }
+            status = "On (While Using): Linux keeps running in background; Allow Always for longest uptime"
+        case .authorizedAlways:
+            beginLocationSession()
             status = "On: Linux keeps running when you leave DebianRunner"
-            LRRuntimeBridge.logCategory("BACKGROUND", event: "keep-running session started (coarse location, indicator shown)")
+        @unknown default:
+            beginLocationSession()
+            status = "On: Linux keeps running when you leave DebianRunner"
         }
     }
 
-    private func stop() {
+    private func beginLocationSession() {
+        manager.allowsBackgroundLocationUpdates = true
+        manager.showsBackgroundLocationIndicator = true
+        if #available(iOS 17.0, *), activitySession == nil {
+            activitySession = CLBackgroundActivitySession()
+        }
+        manager.startUpdatingLocation()
+        if !activeSession {
+            activeSession = true
+            LRRuntimeBridge.logCategory("BACKGROUND", event: "keep-running session started (coarse location + background activity session)")
+        }
+    }
+
+    private func stopSessionObjects() {
         manager.stopUpdatingLocation()
         manager.allowsBackgroundLocationUpdates = false
+        if #available(iOS 17.0, *), let session = activitySession as? CLBackgroundActivitySession {
+            session.invalidate()
+        }
+        activitySession = nil
+        activeSession = false
+    }
+
+    private func stop() {
+        let wasActive = activeSession
+        stopSessionObjects()
         status = "Off"
-        LRRuntimeBridge.logCategory("BACKGROUND", event: "keep-running session stopped")
+        if wasActive {
+            LRRuntimeBridge.logCategory("BACKGROUND", event: "keep-running session stopped")
+        }
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         Task { @MainActor in if self.enabled { self.start() } }
     }
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {}   // discarded
-    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {}
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        // Transient CLErrorLocationUnknown is normal indoors; only log persistent failures.
+        if (error as NSError).code != CLError.locationUnknown.rawValue {
+            Task { @MainActor in
+                LRRuntimeBridge.logCategory("BACKGROUND", event: "location error: \(error.localizedDescription)")
+            }
+        }
+    }
 }

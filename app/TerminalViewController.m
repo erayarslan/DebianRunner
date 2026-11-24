@@ -160,7 +160,10 @@
 #ifdef LINUXRUNNER
     [self.awakeTimer invalidate];
     __weak typeof(self) weakSelf = self;
-    self.awakeTimer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *timer) { [weakSelf updateAwake:YES]; }];
+    self.awakeTimer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *timer) {
+        if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive)
+            [weakSelf updateAwake:YES];
+    }];
     [self updateAwake:YES];
 #endif
     if (self.runnerLaunchError < 0) {

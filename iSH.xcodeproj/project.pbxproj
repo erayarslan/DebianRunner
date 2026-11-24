@@ -27,7 +27,6 @@
 		1C1100000000000000000F06 /* BluetoothSerialView.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F06; };
 		1C1100000000000000000F05 /* LongTaskCenter.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F05; };
 		1C1100000000000000000F04 /* HomeComponents.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F04; };
-		1C1100000000000000000F77 /* ModesView.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F77; };
 		1C1100000000000000000F03 /* AppStoreView.swift */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000F03; };
 		1C1100000000000000000B04 /* DistroLogos.bundle */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000B04; };
 		1C1100000000000000000002 /* DebianBootstrap.c */ = {isa = PBXBuildFile; fileRef = 1C1200000000000000000002; };
@@ -280,6 +279,10 @@
 		BB792B5B1F96D90D00FFB7A4 /* Terminal.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = BB792B591F96D90D00FFB7A4 /* Terminal.storyboard */; };
 		BB792B5D1F96D90D00FFB7A4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB792B5C1F96D90D00FFB7A4 /* Assets.xcassets */; };
 		BB792B601F96D90D00FFB7A4 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = BB792B5E1F96D90D00FFB7A4 /* LaunchScreen.storyboard */; };
+		AA0000F11F96D90D00FFB7A4 /* fake-db.c in Sources */ = {isa = PBXBuildFile; fileRef = BBBF9CC227C448D5002A30F7 /* fake-db.c */; };
+		AA0000F21F96D90D00FFB7A4 /* fake-migrate.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6BEA254E5C0D00C82F46 /* fake-migrate.c */; };
+		AA0000F31F96D90D00FFB7A4 /* fake-rebuild.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6BEF254E5C0D00C82F46 /* fake-rebuild.c */; };
+		AA0000F41F96D90D00FFB7A4 /* iSHFileProvider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = BB88F4902154760800A341FD /* iSHFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		BB88F4942154760800A341FD /* FileProviderExtension.m in Sources */ = {isa = PBXBuildFile; fileRef = BB88F4932154760800A341FD /* FileProviderExtension.m */; };
 		BB88F4972154760800A341FD /* FileProviderItem.m in Sources */ = {isa = PBXBuildFile; fileRef = BB88F4962154760800A341FD /* FileProviderItem.m */; };
 		BB88F49A2154760800A341FD /* FileProviderEnumerator.m in Sources */ = {isa = PBXBuildFile; fileRef = BB88F4992154760800A341FD /* FileProviderEnumerator.m */; };
@@ -399,6 +402,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = BB13F7DB200AD81D003D1C4D;
 			remoteInfo = libish;
+		};
+		AA0000F51F96D90D00FFB7A4 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = BB792B461F96D8E000FFB7A4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = BB88F48F2154760800A341FD;
+			remoteInfo = iSHFileProvider;
 		};
 		AA000070AF96D90D00FFB7A4 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -537,6 +547,7 @@
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
+				AA0000F41F96D90D00FFB7A4 /* iSHFileProvider.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -561,7 +572,6 @@
 		1C1200000000000000000F06 /* BluetoothSerialView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/BluetoothSerialView.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000F05 /* LongTaskCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/LongTaskCenter.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000F04 /* HomeComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/HomeComponents.swift; sourceTree = SOURCE_ROOT; };
-		1C1200000000000000000F77 /* ModesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/ModesView.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000F03 /* AppStoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app/LinuxRunner/AppStoreView.swift; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000B04 /* DistroLogos.bundle */ = {isa = PBXFileReference; lastKnownFileType = wrapper.cfbundle; path = app/LinuxRunner/DistroLogos.bundle; sourceTree = SOURCE_ROOT; };
 		1C1200000000000000000002 /* DebianBootstrap.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = app/LinuxRunner/DebianBootstrap.c; sourceTree = SOURCE_ROOT; };
@@ -973,8 +983,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				BB21A1862689500000BD19B4 /* libish_emu.a in Frameworks */,
-				BB21A1702689048200BD19B4 /* libfakefs.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1216,7 +1224,6 @@
 				1C1200000000000000000F06 /* BluetoothSerialView.swift */,
 				1C1200000000000000000F05 /* LongTaskCenter.swift */,
 				1C1200000000000000000F04 /* HomeComponents.swift */,
-				1C1200000000000000000F77 /* ModesView.swift */,
 				1C1200000000000000000F03 /* AppStoreView.swift */,
 				1C1200000000000000000B04 /* DistroLogos.bundle */,
 				1C1200000000000000000002 /* DebianBootstrap.c */,
@@ -1700,6 +1707,7 @@
 			dependencies = (
 				AA000060AF96D90D00FFB7A4 /* PBXTargetDependency */,
 				AA000062AF96D90D00FFB7A4 /* PBXTargetDependency */,
+				AA0000F61F96D90D00FFB7A4 /* PBXTargetDependency */,
 			);
 			name = "iSH-ARM64";
 			productName = "iSH ARM64";
@@ -2445,7 +2453,6 @@
 				1C1100000000000000000F06 /* BluetoothSerialView.swift */,
 				1C1100000000000000000F05 /* LongTaskCenter.swift */,
 				1C1100000000000000000F04 /* HomeComponents.swift */,
-				1C1100000000000000000F77 /* ModesView.swift */,
 				1C1100000000000000000F03 /* AppStoreView.swift */,
 				1C1100000000000000000002 /* DebianBootstrap.c */,
 				AA000020AF96D90D00FFB7A4 /* main.m in Sources */,
@@ -2535,6 +2542,9 @@
 				BB88F4942154760800A341FD /* FileProviderExtension.m in Sources */,
 				BBE64AC22A198FCC00589372 /* ExceptionExfiltrator.m in Sources */,
 				BB88F4972154760800A341FD /* FileProviderItem.m in Sources */,
+				AA0000F11F96D90D00FFB7A4 /* fake-db.c in Sources */,
+				AA0000F21F96D90D00FFB7A4 /* fake-migrate.c in Sources */,
+				AA0000F31F96D90D00FFB7A4 /* fake-rebuild.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -2608,6 +2618,11 @@
 			isa = PBXTargetDependency;
 			target = BB13F7DB200AD81D003D1C4D /* libish */;
 			targetProxy = 497F6D5A254E609000C82F46 /* PBXContainerItemProxy */;
+		};
+		AA0000F61F96D90D00FFB7A4 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = BB88F48F2154760800A341FD /* iSHFileProvider */;
+			targetProxy = AA0000F51F96D90D00FFB7A4 /* PBXContainerItemProxy */;
 		};
 		AA000060AF96D90D00FFB7A4 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
@@ -3016,10 +3031,17 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB0B86D52587009D00208600 /* iOS.xcconfig */;
 			buildSettings = {
+				ARCHS = arm64;
 				CODE_SIGN_ENTITLEMENTS = app/FileProvider/iSHFileProvider.entitlements;
+				CURRENT_PROJECT_VERSION = 910;
 				DEVELOPMENT_TEAM = "";
+				GCC_PREPROCESSOR_DEFINITIONS = "$(inherited) ISH_FILE_PROVIDER=1";
 				INFOPLIST_FILE = app/FileProvider/Info.plist;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).FileProvider";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.1.2;
+				OTHER_LDFLAGS = "-lsqlite3 -framework FileProvider -framework MobileCoreServices";
+				PRODUCT_APP_GROUP_IDENTIFIER = "group.$(ROOT_BUNDLE_IDENTIFIER)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(ROOT_BUNDLE_IDENTIFIER).FileProvider";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 			};
@@ -3094,10 +3116,17 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB0B86D52587009D00208600 /* iOS.xcconfig */;
 			buildSettings = {
+				ARCHS = arm64;
 				CODE_SIGN_ENTITLEMENTS = app/FileProvider/iSHFileProvider.entitlements;
+				CURRENT_PROJECT_VERSION = 910;
 				DEVELOPMENT_TEAM = "";
+				GCC_PREPROCESSOR_DEFINITIONS = "$(inherited) ISH_FILE_PROVIDER=1";
 				INFOPLIST_FILE = app/FileProvider/Info.plist;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).FileProvider";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.1.2;
+				OTHER_LDFLAGS = "-lsqlite3 -framework FileProvider -framework MobileCoreServices";
+				PRODUCT_APP_GROUP_IDENTIFIER = "group.$(ROOT_BUNDLE_IDENTIFIER)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(ROOT_BUNDLE_IDENTIFIER).FileProvider";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 			};
@@ -3107,10 +3136,17 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB0B86D52587009D00208600 /* iOS.xcconfig */;
 			buildSettings = {
+				ARCHS = arm64;
 				CODE_SIGN_ENTITLEMENTS = app/FileProvider/iSHFileProvider.entitlements;
+				CURRENT_PROJECT_VERSION = 910;
 				DEVELOPMENT_TEAM = "";
+				GCC_PREPROCESSOR_DEFINITIONS = "$(inherited) ISH_FILE_PROVIDER=1";
 				INFOPLIST_FILE = app/FileProvider/Info.plist;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).FileProvider";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.1.2;
+				OTHER_LDFLAGS = "-lsqlite3 -framework FileProvider -framework MobileCoreServices";
+				PRODUCT_APP_GROUP_IDENTIFIER = "group.$(ROOT_BUNDLE_IDENTIFIER)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(ROOT_BUNDLE_IDENTIFIER).FileProvider";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 			};
@@ -3266,10 +3302,17 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB0B86D52587009D00208600 /* iOS.xcconfig */;
 			buildSettings = {
+				ARCHS = arm64;
 				CODE_SIGN_ENTITLEMENTS = app/FileProvider/iSHFileProvider.entitlements;
+				CURRENT_PROJECT_VERSION = 910;
 				DEVELOPMENT_TEAM = "";
+				GCC_PREPROCESSOR_DEFINITIONS = "$(inherited) ISH_FILE_PROVIDER=1";
 				INFOPLIST_FILE = app/FileProvider/Info.plist;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).FileProvider";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.1.2;
+				OTHER_LDFLAGS = "-lsqlite3 -framework FileProvider -framework MobileCoreServices";
+				PRODUCT_APP_GROUP_IDENTIFIER = "group.$(ROOT_BUNDLE_IDENTIFIER)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(ROOT_BUNDLE_IDENTIFIER).FileProvider";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 			};

@@ -14,27 +14,17 @@
     },
     {
       "name": "debian-support.sh",
-      "sha256": "8ce180f6d2711ced80a8ac90146203aa08bb882b00900ced57137c0bc7cd60d9",
+      "sha256": "efded5fb3b9c6e8b47e278711803f1f7a8f9acbf732799e393c7862b5a4c36a4",
       "mode": "0755"
     },
     {
       "name": "installer-run.sh",
-      "sha256": "58c19632783eebe183806ff11089e56dd4a7abba0a5e47df8994d2e14630a4a1",
-      "mode": "0755"
-    },
-    {
-      "name": "liftoff-index.html",
-      "sha256": "b531ae6a2207ff60b73a081cc226cecd896ee00344b25e7db936d78969a96cac",
-      "mode": "0644"
-    },
-    {
-      "name": "lr-agent.sh",
-      "sha256": "71cca60c02bc7a3a64b4dd96808b10212c022c83e7971d5223b15df1354c485b",
+      "sha256": "970b269ad8dfae4cd0007ea52ce05c4927597fd21dcf1c03f93b39d0d08f07c3",
       "mode": "0755"
     },
     {
       "name": "modes.sh",
-      "sha256": "198a54f2255dcaf6e91b228de70895367bbebbe290905e45019dd5b65ee173d0",
+      "sha256": "36e696f87ae6cd5a98f9c9410aabaf082b36bacb7d08b388d39cf949908b21a9",
       "mode": "0755"
     },
     {

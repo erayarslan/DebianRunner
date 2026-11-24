@@ -392,11 +392,20 @@ static void configureGuestHostAlias(void) {
 
 - (void)configureDns {
 #if !ISH_LINUX
-#ifdef LINUXRUNNER
-    // Reachability fires even in native-only mode. Never borrow a missing init.
-    lock(&pids_lock); BOOL hasInit = pid_get_task(1) != NULL; unlock(&pids_lock);
-    if (!hasInit) return;
-#endif
+    struct fs_info *fs = NULL;
+    lock(&pids_lock);
+    struct task *initTask = pid_get_task(1);
+    if (initTask != NULL) {
+        lock(&initTask->general_lock);
+        fs = initTask->fs;
+        if (fs != NULL)
+            atomic_fetch_add(&fs->refcount, 1);
+        unlock(&initTask->general_lock);
+    }
+    unlock(&pids_lock);
+    if (fs == NULL)
+        return;
+
     struct __res_state res;
     BOOL resolverInitialized = EXIT_SUCCESS == res_ninit(&res);
     if (!resolverInitialized) {
@@ -436,8 +445,12 @@ static void configureGuestHostAlias(void) {
 #ifdef LINUXRUNNER
     [LRRuntimeBridge logCategory:@"NETWORK" event:[NSString stringWithFormat:@"DNS configured; system resolver count=%d", nameserversWritten]];
 #endif
-    
-    current = pid_get_task(1);
+
+    // Never borrow live PID 1 on the main thread (concurrently races with init's
+    // pthread and leaks current). Use a private stack context with retained fs.
+    struct task context = {.uid = 0, .euid = 0, .gid = 0, .egid = 0, .fs = fs};
+    struct task *previous = current;
+    current = &context;
 #ifdef LINUXRUNNER
     configureGuestHostAlias();
 #endif
@@ -446,6 +459,8 @@ static void configureGuestHostAlias(void) {
         fd->ops->write(fd, resolvConf.UTF8String, [resolvConf lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
         fd_close(fd);
     }
+    current = previous;
+    fs_info_release(fs);
 #endif
 }
 
@@ -465,6 +480,7 @@ static void configureGuestHostAlias(void) {
 
 #ifdef LINUXRUNNER
     LRBootEvent("application delegate initialized");
+    [LRRuntimeBridge performPendingWipeIfNeeded];
     if (![LRRuntimeBridge autoStart]) { LRBootEvent("runtime auto start OFF: native workspace available before boot"); return YES; }
     if (!Roots.instance.defaultRoot) { LRBootEvent("no Debian environment installed yet: waiting for initial setup"); return YES; }
     [self startLinuxRuntime];
@@ -623,18 +639,27 @@ void NetworkReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkReach
 
 - (void)exitApp {
     NSLog(@"APP_SHUTDOWN: user-requested exit");
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Close LinuxRunner"
-        message:@"Close the app from the app switcher, then reopen it to start the selected environment. Files are preserved."
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Close DebianRunner"
+        message:@"Close the app from the app switcher, then reopen it to apply the change. Files are preserved."
         preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [currentTerminalViewController presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)applicationDidEnterBackground:(UIApplication *)application {
+#if !ISH_LINUX && defined(LINUXRUNNER)
+    [LRRuntimeBridge handleDidEnterBackground];
+#endif
     if (self.exiting) {
         NSLog(@"APP_SHUTDOWN: exiting after background transition");
         exit(0);
     }
+}
+
+- (void)applicationWillEnterForeground:(UIApplication *)application {
+#if !ISH_LINUX && defined(LINUXRUNNER)
+    [LRRuntimeBridge handleWillEnterForeground];
+#endif
 }
 
 - (void)applicationDidReceiveMemoryWarning:(UIApplication *)application {

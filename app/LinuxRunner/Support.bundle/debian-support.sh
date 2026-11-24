@@ -1,11 +1,8 @@
 #!/bin/sh
-# LinuxRunner Debian minimal support installer, run as root inside Debian via
+# DebianRunner Debian minimal support installer, run as root inside Debian via
 # installer-run.sh.
 #   debian-support.sh accounts [sudo]   ensure account tools (and sudo) exist
-#   debian-support.sh mode-agent        install Agent Mode developer tools & CLI agents
-#   debian-support.sh mode-ssh          install OpenSSH server
-#   debian-support.sh mode-liftoff      install Liftoff web development tools
-#   debian-support.sh mode-pocket       install Pocket Cloud (WsgiDAV) server
+#   debian-support.sh mode-ssh          install OpenSSH server and generate host keys
 set -u
 cd "$(dirname "$0")"
 . ./support-common.sh
@@ -105,60 +102,18 @@ case "$mode" in
             sudo -V > /dev/null 2>&1 || { echo 'PROFILE_FAILURE: category=ACCOUNT_TOOL_BROKEN stage=verify detail=sudo -V failed'; support_fail PROFILE sudo-broken; }
         fi
         echo 'PROFILE: accounts=PASS';;
-    mode-agent)
-        stage "Installing developer tools"
-        if ! { have node && have npm && have git && have rg; }; then
-            install_packages "developer tools" nodejs npm git curl ca-certificates ripgrep python3 build-essential || support_fail PROFILE agent-tools
-        fi
-        have node && have npm || support_fail PROFILE node-missing
-        node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
-        echo "PROFILE: node=$(node --version 2>/dev/null) npm=$(npm --version 2>/dev/null)"
-        agents_ok=
-        for spec in "Claude Code:@anthropic-ai/claude-code:claude:18" "Codex CLI:@openai/codex:codex:18" "OpenCode:opencode-ai:opencode:18"; do
-            title=${spec%%:*}; rest=${spec#*:}; package=${rest%%:*}; rest=${rest#*:}; command=${rest%%:*}; need=${rest#*:}
-            stage "Installing $title"
-            if have "$command"; then echo "PROFILE: agent $command already installed"; agents_ok="$agents_ok $command"; continue; fi
-            if [ "$node_major" -lt "$need" ]; then echo "PROFILE: agent $command skipped: needs Node $need+, found $node_major"; continue; fi
-            if npm install -g --no-fund --no-audit --loglevel=error "$package"; then
-                have "$command" && agents_ok="$agents_ok $command" && echo "PROFILE: agent $command=PASS"
-            else
-                echo "PROFILE: agent $command install failed; the other agents are kept"
-            fi
-        done
-        [ -n "$agents_ok" ] || support_fail PROFILE agents-missing
-        install -m 755 ./lr-agent.sh /usr/local/bin/lr-agent || support_fail PROFILE agent-launcher
-        echo "PROFILE: agents=$agents_ok"
-        echo 'PROFILE: mode-agent=PASS';;
     mode-ssh)
-        stage "Installing SSH server"
+        stage "Installing OpenSSH server"
         if [ ! -x /usr/sbin/sshd ]; then
             install_packages "OpenSSH server" openssh-server || support_fail PROFILE ssh-packages
         fi
         [ -x /usr/sbin/sshd ] || support_fail PROFILE sshd-missing
+        stage "Generating SSH host keys"
+        mkdir -p /run/sshd /etc/ssh
+        chown 0:0 /run/sshd 2>/dev/null || true
+        chmod 755 /run/sshd
+        ssh-keygen -A >/dev/null 2>&1 || true
         echo 'PROFILE: mode-ssh=PASS';;
-    mode-liftoff)
-        stage "Installing web development tools"
-        if ! { have python3 && have node && have npm && have git; }; then
-            install_packages "web development tools" python3 nodejs npm git curl ca-certificates || support_fail PROFILE liftoff-tools
-        fi
-        have python3 && have node || support_fail PROFILE liftoff-missing
-        mkdir -p /var/lib/linuxrunner && touch /var/lib/linuxrunner/mode-liftoff
-        echo 'PROFILE: mode-liftoff=PASS';;
-    mode-pocket)
-        stage "Installing Python"
-        if ! { have python3 && python3 -c 'import ensurepip, venv' >/dev/null 2>&1; }; then
-            install_packages "Python" python3 python3-venv python3-pip || support_fail PROFILE pocket-python
-        fi
-        stage "Installing Pocket Cloud server"
-        venv=/opt/linuxrunner/pocket-cloud
-        if [ ! -x "$venv/bin/wsgidav" ]; then
-            rm -rf "$venv"
-            python3 -m venv "$venv" || support_fail PROFILE pocket-venv
-            "$venv/bin/pip" install --disable-pip-version-check --no-cache-dir -q wsgidav cheroot || support_fail PROFILE pocket-server
-        fi
-        [ -x "$venv/bin/wsgidav" ] || support_fail PROFILE pocket-missing
-        mkdir -p /var/lib/linuxrunner && touch /var/lib/linuxrunner/mode-pocket
-        echo 'PROFILE: mode-pocket=PASS';;
     *)
         echo "PROFILE: unknown mode '$mode'" >&2
         exit 2;;

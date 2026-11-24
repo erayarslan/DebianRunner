@@ -73,6 +73,14 @@ void LRSetDatalessMaterialization(void);
 // The mounted root stays in use until app relaunch, even after guest init exits.
 + (nullable NSString *)environmentDeletionUnavailableReason:(NSString *)root;
 + (void)deleteEnvironment:(NSString *)root completion:(void (^)(NSError * _Nullable))completion;
++ (void)performPendingWipeIfNeeded;
++ (BOOL)isWipePending;
++ (void)wipeEnvironmentWithCompletion:(void (^)(BOOL needsRestart, NSError * _Nullable error))completion NS_SWIFT_NAME(wipeEnvironment(completion:));
++ (void)handleDidEnterBackground;
++ (void)handleWillEnterForeground;
++ (BOOL)fileProviderEnabled;
++ (NSString *)activeAppGroup;
++ (void)refreshFileProviderDomains;
 + (NSArray<NSDictionary<NSString *, NSString *> *> *)discoverApplications;
 /// Read at most 256 KiB before allocation, refusing symlinks and non-regular files.
 + (NSString *)boundedDiagnosticTail:(NSURL *)url maxBytes:(NSUInteger)bytes;
@@ -102,10 +110,16 @@ void LRSetDatalessMaterialization(void);
                progress:(void (^)(NSString *message))progress completion:(void (^)(NSError * _Nullable error))completion;
 + (BOOL)accountToolsPresent;
 + (void)setLinuxPassword:(NSString *)name password:(NSString *)password progress:(void (^)(NSString *message))progress completion:(void (^)(NSError * _Nullable error))completion;
-// LinuxRunner Modes (Settings > Modes): opt-in headless services run by modes.sh.
-+ (void)installMode:(NSString *)mode progress:(void (^)(NSString *stage))progress completion:(void (^)(NSError * _Nullable error))completion;
-+ (nullable TerminalViewController *)modesCommand:(NSArray<NSString *> *)arguments;   // status | start/stop ssh|liftoff|pocket | agent <user>
-+ (NSDictionary<NSString *, NSString *> *)modesStatus;   // parsed modes-status (key=value lines)
+// Built-in OpenSSH Server (managed headlessly without spawning WebViews or PTYs).
++ (BOOL)sshBinaryInstalled;
++ (BOOL)sshAutoStart;
++ (void)setSshAutoStart:(BOOL)enabled;
++ (BOOL)sshAllowRootLogin;
++ (void)setSshAllowRootLogin:(BOOL)enabled;
++ (void)installSSHWithProgress:(void (^)(NSString *stage))progress completion:(void (^)(NSError * _Nullable error))completion NS_SWIFT_NAME(installSSH(progress:completion:));
++ (void)runSSHAction:(NSString *)action completion:(void (^ _Nullable)(NSDictionary<NSString *, NSString *> *status))completion NS_SWIFT_NAME(runSSHAction(_:completion:));
++ (NSDictionary<NSString *, NSString *> *)sshStatus;
++ (NSString *)sshLogTail;
 /// True while a support installation (account tools, mode packages) runs; a
 /// second one is refused until it finishes.
 + (BOOL)installationRunning;

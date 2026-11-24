@@ -31,38 +31,50 @@
     @synchronized (self) {
         if (!_mounted) {
             if (self.domain == nil) {
-                *error = [NSError errorWithDomain:NSFileProviderErrorDomain code:NSFileProviderErrorNotAuthenticated userInfo:nil];
+                if (error) *error = [NSError errorWithDomain:NSFileProviderErrorDomain code:NSFileProviderErrorNotAuthenticated userInfo:nil];
                 return NO;
             }
             NSURL *container = ContainerURL();
+            if (container == nil) {
+                if (error) *error = [NSError errorWithDomain:NSFileProviderErrorDomain code:NSFileProviderErrorNotAuthenticated userInfo:nil];
+                return NO;
+            }
             NSURL *fs_dir = [[container URLByAppendingPathComponent:@"roots"]
                       URLByAppendingPathComponent:self.domain.identifier];
             _root = [fs_dir URLByAppendingPathComponent:@"data"];
-            _mount.source = strdup(_root.fileSystemRepresentation);
+            char resolved[PATH_MAX];
+            const char *sourcePath = realpath(_root.fileSystemRepresentation, resolved) ? resolved : _root.fileSystemRepresentation;
+            _mount.source = strdup(sourcePath);
             _mount.root_fd = open(_mount.source, O_RDONLY | O_DIRECTORY);
+            if (_mount.root_fd < 0) {
+                free((void *)_mount.source);
+                _mount.source = NULL;
+                if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+                return NO;
+            }
             int err = fake_db_init(&_mount.db, [fs_dir URLByAppendingPathComponent:@"meta.db"].fileSystemRepresentation, _mount.root_fd);
             if (err < 0) {
                 NSLog(@"error opening root: %d", err);
                 close(_mount.root_fd);
-                *error = [NSError errorWithISHErrno:err itemIdentifier:NSFileProviderRootContainerItemIdentifier];
+                free((void *)_mount.source);
+                _mount.source = NULL;
+                if (error) *error = [NSError errorWithISHErrno:err itemIdentifier:NSFileProviderRootContainerItemIdentifier];
                 return NO;
             }
             *mount = &_mount;
             _mounted = YES;
+        } else if (mount) {
+            *mount = &_mount;
         }
 
-        // Run a cleanup every once in a while. The idea here is that this
-        // function gets called while the file provider is being interacted
-        // with, so this should generally get time to run at that point, but we
-        // don't want to do this when the user is not interacting with the file
-        // provider.
+        // Run a cleanup every once in a while while the user is interacting with the provider.
         NSDate *lastCleanup = [NSUserDefaults.standardUserDefaults objectForKey:@"LastCleanup"];
-        lastCleanup = lastCleanup ? lastCleanup : NSDate.distantPast;
-        if ([lastCleanup timeIntervalSinceDate:NSDate.date] > 60 * 60 /* 1 hour */) {
+        lastCleanup = [lastCleanup isKindOfClass:NSDate.class] ? lastCleanup : NSDate.distantPast;
+        if ([NSDate.date timeIntervalSinceDate:lastCleanup] > 60 * 60 /* 1 hour */) {
             [self cleanupStorage];
+            [NSUserDefaults.standardUserDefaults setObject:NSDate.date forKey:@"LastCleanup"];
         }
-        [NSUserDefaults.standardUserDefaults setObject:NSDate.date forKey:@"LastCleanup"];
-        
+
         return YES;
     }
 }
@@ -179,14 +191,15 @@
                                                  attributes:@{NSFilePosixPermissions: @0777}
                                                       error:error]) {
         db_rollback(&_mount.db);
-        return nil;
+        return NO;
     }
     struct ish_stat stat;
-    NSString *parentPath = [path substringToIndex:[path rangeOfString:@"/" options:NSBackwardsSearch].location];
+    NSRange slash = [path rangeOfString:@"/" options:NSBackwardsSearch];
+    NSString *parentPath = slash.location == NSNotFound ? @"" : [path substringToIndex:slash.location];
     if (!path_read_stat(&_mount.db, parentPath.fileSystemRepresentation, &stat, NULL)) {
         db_rollback(&_mount.db);
-        *error = [NSError errorWithDomain:NSFileProviderErrorDomain code:NSFileProviderErrorNoSuchItem userInfo:nil];
-        return nil;
+        if (error) *error = [NSError errorWithDomain:NSFileProviderErrorDomain code:NSFileProviderErrorNoSuchItem userInfo:nil];
+        return NO;
     }
     stat.mode = (stat.mode & ~S_IFMT) | S_IFDIR;
     path_create(&_mount.db, path.fileSystemRepresentation, &stat);
@@ -203,14 +216,15 @@
                                                toURL:url
                                                error:error]) {
         db_rollback(&_mount.db);
-        return nil;
+        return NO;
     }
     struct ish_stat stat;
-    NSString *parentPath = [path substringToIndex:[path rangeOfString:@"/" options:NSBackwardsSearch].location];
+    NSRange slash = [path rangeOfString:@"/" options:NSBackwardsSearch];
+    NSString *parentPath = slash.location == NSNotFound ? @"" : [path substringToIndex:slash.location];
     if (!path_read_stat(&_mount.db, parentPath.fileSystemRepresentation, &stat, NULL)) {
         db_rollback(&_mount.db);
-        *error = [NSError errorWithDomain:NSFileProviderErrorDomain code:NSFileProviderErrorNoSuchItem userInfo:nil];
-        return nil;
+        if (error) *error = [NSError errorWithDomain:NSFileProviderErrorDomain code:NSFileProviderErrorNoSuchItem userInfo:nil];
+        return NO;
     }
     stat.mode = (stat.mode & ~S_IFMT & ~0111) | S_IFREG;
     path_create(&_mount.db, path.fileSystemRepresentation, &stat);
@@ -263,15 +277,19 @@
         return;
     }
     
-    [fileURL startAccessingSecurityScopedResource];
-    BOOL isDir;
-    assert([NSFileManager.defaultManager fileExistsAtPath:fileURL.path isDirectory:&isDir] && !isDir);
+    BOOL scoped = [fileURL startAccessingSecurityScopedResource];
+    BOOL isDir = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:fileURL.path isDirectory:&isDir] || isDir) {
+        if (scoped) [fileURL stopAccessingSecurityScopedResource];
+        completionHandler(nil, [NSError errorWithDomain:NSPOSIXErrorDomain code:isDir ? EISDIR : ENOENT userInfo:nil]);
+        return;
+    }
     ino_t inode;
     BOOL worked = [self doCreateFileAt:[parentPath stringByAppendingFormat:@"/%@", fileURL.lastPathComponent]
                             importFrom:fileURL
                                  inode:&inode
                                  error:&error];
-    [fileURL stopAccessingSecurityScopedResource];
+    if (scoped) [fileURL stopAccessingSecurityScopedResource];
     if (!worked) {
         completionHandler(nil, error);
         return;
@@ -311,7 +329,7 @@
         err = unlinkat(_mount.root_fd, fix_path(path.fileSystemRepresentation), AT_REMOVEDIR);
     if (err < 0) {
         db_rollback(&_mount.db);
-        *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
         return NO;
     }
     db_commit(&_mount.db);
@@ -337,7 +355,7 @@
     int err = renameat(_mount.root_fd, fix_path(src.fileSystemRepresentation), _mount.root_fd, fix_path(dst.fileSystemRepresentation));
     if (err < 0) {
         db_rollback(&_mount.db);
-        *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
         return NO;
     }
     db_commit(&_mount.db);

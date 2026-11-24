@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 case "${1:-}" in debian-support.sh) installer=$1;; *) exit 2;; esac
 shift
 for arg in "$@"; do
-    case "$arg" in accounts|sudo|mode-agent|mode-ssh|mode-liftoff|mode-pocket) ;; *) exit 2;; esac
+    case "$arg" in accounts|sudo|mode-ssh) ;; *) exit 2;; esac
 done
 . ./package-lock.sh
 # Refuse duplicates before altering the active operation's output.

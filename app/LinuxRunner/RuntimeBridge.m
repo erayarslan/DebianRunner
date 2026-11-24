@@ -1,4 +1,5 @@
 #import "RuntimeBridge.h"
+#import <FileProvider/FileProvider.h>
 #import <CommonCrypto/CommonDigest.h>
 NSString *const LRSystemCPUCoresKey = @"LinuxRunnerSystem.cpuCores";
 NSString *const LRSystemMemoryMBKey = @"LinuxRunnerSystem.memoryMB";
@@ -27,6 +28,8 @@ NSString *const LRSystemMemoryMBKey = @"LinuxRunnerSystem.memoryMB";
 #include <stdio.h>
 #include <time.h>
 #include "fs/netlink.h"
+#include "fs/sockrestart.h"
+#include "fs/devices.h"
 #include <mach/mach.h>
 #include <archive.h>
 #include <archive_entry.h>
@@ -34,6 +37,7 @@ NSString *const LRSystemMemoryMBKey = @"LinuxRunnerSystem.memoryMB";
 #import "../AppGroup.h"
 #import "../AppDelegate.h"
 #import "../iOSFS.h"
+#import "../Terminal.h"
 #include "PasswordHash.h"
 @class TerminalViewController;
 static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval timeout, void (^done)(BOOL ended));
@@ -49,7 +53,9 @@ static int LRTransferStaging(void);
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include "kernel/init.h"
 #include "kernel/task.h"
+#include "kernel/calls.h"
 #include "kernel/mm.h"
 #include "kernel/resource.h"
 #include "kernel/signal.h"
@@ -111,7 +117,7 @@ void LRStartupInitialize(void) {
     [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"InstallerActive"];
     [LRDiagnosticCenter configure:[[NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject URLByAppendingPathComponent:@"LinuxRunnerDiagnostics" isDirectory:YES]];
     [LRGuestCrashCenter configure:[[NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject URLByAppendingPathComponent:@"LinuxRunnerDiagnostics/application-crashes" isDirectory:YES]];
-    bootLogDirectory = [[NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject URLByAppendingPathComponent:@"LinuxRunnerLogs" isDirectory:YES];
+    bootLogDirectory = [[NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject URLByAppendingPathComponent:@"LinuxRunnerLogs" isDirectory:YES];
     NSError *error = nil;
     if (![NSFileManager.defaultManager createDirectoryAtURL:bootLogDirectory withIntermediateDirectories:YES attributes:nil error:&error]) { LRBootEvent("persistent startup log unavailable"); return; }
     for (NSString *name in @[@"startup.log", @"runtime-snapshot.bin"]) {
@@ -726,6 +732,134 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
     LRInstallProgress *reporter=[LRInstallProgress new];reporter.progress=progress;reporter.cancel=cancel;
     return [Roots.instance importVerifiedRootFromArchive:archive name:root sha256:sha256 metadata:@{@"distributionID":@"debian",@"distribution":@"Debian GNU/Linux",@"version":@"13.7",@"packageManager":@"apt",@"defaultShell":@"/bin/bash"} error:error progressReporter:reporter];
 }
+static NSString * const LRPendingWipeKey = @"DebianRunner.pendingWipe";
+
++ (BOOL)isWipePending {
+    return [NSUserDefaults.standardUserDefaults boolForKey:LRPendingWipeKey];
+}
+
+static void LRClearAllEnvironmentUserDefaults(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults removeObjectForKey:@"Default Root"];
+    [defaults removeObjectForKey:@"LinuxRunnerSetup.root"];
+    [defaults setObject:@"welcome" forKey:@"LinuxRunnerSetup.step"];
+    for (NSString *key in defaults.dictionaryRepresentation.allKeys) {
+        if ([key hasPrefix:@"LinuxRunnerDefaultUser."])
+            [defaults removeObjectForKey:key];
+    }
+    [defaults synchronize];
+}
+
++ (void)performPendingWipeIfNeeded {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (![defaults boolForKey:LRPendingWipeKey]) return;
+    [defaults removeObjectForKey:LRPendingWipeKey];
+    [defaults synchronize];
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *container = ContainerURL();
+    for (NSString *item in @[@"roots", @"exchanges", @"environments.json", @"downloads", @"installer-temporary"]) {
+        [fm removeItemAtURL:[container URLByAppendingPathComponent:item] error:nil];
+    }
+    NSURL *docs = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+    if (docs) [fm removeItemAtURL:[docs URLByAppendingPathComponent:@"Shared"] error:nil];
+    LRClearAllEnvironmentUserDefaults();
+    @synchronized(NSFileManager.class) {
+        LRPreparedSupportFolder = nil;
+        LRPreparedSupportRoot = nil;
+    }
+    if (CurrentAppGroups().count > 0) {
+        [NSFileProviderManager removeAllDomainsWithCompletionHandler:^(NSError * _Nullable error) {
+            if (error) NSLog(@"wipe file provider domain cleanup error: %@", error);
+        }];
+    }
+    LRBootEvent("[WIPE] completed pending Debian Minimal wipe before runtime mount");
+}
+
++ (void)wipeEnvironmentWithCompletion:(void (^)(BOOL needsRestart, NSError * _Nullable error))completion {
+    NSAssert(NSThread.isMainThread, @"Environment wipe starts on the main thread");
+    if (environmentDeletionActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"]) {
+        completion(NO, lrError(EBUSY, @"Wait for the current environment operation to finish."));
+        return;
+    }
+    if (bootAttempted) {
+        // Root filesystem is mounted in this process. Schedule clean wipe at next launch
+        // before Roots/mount_root opens meta.db, and politely stop guest daemons first.
+        [NSUserDefaults.standardUserDefaults setBool:YES forKey:LRPendingWipeKey];
+        [NSUserDefaults.standardUserDefaults synchronize];
+        if (self.isRunning) {
+            lock(&pids_lock);
+            for (int i = 2; i < MAX_PID; i++) {
+                struct task *task = pid_get_task(i);
+                if (task && task->pid == task->tgid && !task->zombie && !task->exiting)
+                    send_signal(task, SIGTERM_, SIGINFO_NIL);
+            }
+            unlock(&pids_lock);
+        }
+        [self logCategory:@"WIPE" event:@"scheduled Debian Minimal wipe for next launch (runtime mounted)"];
+        completion(YES, nil);
+        return;
+    }
+
+    environmentDeletionActive = YES;
+    [self beginAwake:@"environment-wipe"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSError *error = nil;
+        [Roots.instance forceDestroyAllRoots:&error];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSURL *container = ContainerURL();
+        for (NSString *item in @[@"exchanges", @"environments.json", @"downloads", @"installer-temporary"]) {
+            [fm removeItemAtURL:[container URLByAppendingPathComponent:item] error:nil];
+        }
+        NSURL *docs = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+        if (docs) [fm removeItemAtURL:[docs URLByAppendingPathComponent:@"Shared"] error:nil];
+        @synchronized(NSFileManager.class) {
+            LRPreparedSupportFolder = nil;
+            LRPreparedSupportRoot = nil;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            environmentDeletionActive = NO;
+            [self endAwake:@"environment-wipe"];
+            LRClearAllEnvironmentUserDefaults();
+            [self logCategory:@"WIPE" event:error ? [NSString stringWithFormat:@"immediate wipe finished with error: %@", error.localizedDescription] : @"immediate Debian Minimal wipe completed"];
+            completion(NO, error);
+        });
+    });
+}
+
++ (void)handleDidEnterBackground {
+    [self logCategory:@"LIFECYCLE" event:@"entered background"];
+    if (self.isRunning) {
+        sockrestart_on_suspend();
+    }
+}
+
++ (void)handleWillEnterForeground {
+    [self logCategory:@"LIFECYCLE" event:@"returning to foreground"];
+    if (!self.isRunning) return;
+    sockrestart_recover_dead_listeners();
+    if (self.sshAutoStart && self.sshBinaryInstalled) {
+        [self runSSHAction:@"status" completion:^(NSDictionary<NSString *, NSString *> *status) {
+            if (![status[@"ssh"] isEqualToString:@"running"] && self.sshAutoStart && self.sshBinaryInstalled) {
+                [self logCategory:@"SSH" event:@"sshd stopped while backgrounded; restarting"];
+                [self runSSHAction:@"start" completion:nil];
+            }
+        }];
+    }
+}
+
++ (BOOL)fileProviderEnabled {
+    return CurrentAppGroups().count > 0;
+}
+
++ (NSString *)activeAppGroup {
+    return CurrentAppGroups().firstObject ?: @"";
+}
+
++ (void)refreshFileProviderDomains {
+    [Roots.instance syncFileProviderDomains];
+}
+
 + (NSString *)environmentDeletionUnavailableReason:(NSString *)root {
     if (!validRoot(root) || ![Roots.instance.roots containsObject:root]) return @"This environment is no longer installed.";
     if (environmentDeletionActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"])
@@ -1157,27 +1291,182 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
     } failure:completion];
 }
 
-// ---- Headless Modes --------------------------------------------------------
-+ (void)installMode:(NSString *)mode progress:(void (^)(NSString *stage))progress completion:(void (^)(NSError * _Nullable error))completion {
-    NSString *title = [mode isEqual:@"mode-agent"] ? @"Installing Agent Mode"
-        : [mode isEqual:@"mode-ssh"] ? @"Installing SSH Mode"
-        : [mode isEqual:@"mode-liftoff"] ? @"Installing Liftoff"
-        : [mode isEqual:@"mode-pocket"] ? @"Installing Pocket Cloud"
-        : @"Installing Mode";
-    [self runSupportInstall:@[mode] title:title progress:progress completion:completion];
+// ---- Headless Guest Command Runner & Built-in OpenSSH Server ---------------
+// Spawns short-lived guest commands attached to /dev/null with zero WebViews
+// and zero PTYs so polling or restarting sshd never leaks WKWebViews or
+// triggers SIGHUP when a helper shell exits.
++ (void)runHeadlessCommand:(NSArray<NSString *> *)command directory:(NSString *)directory completion:(void (^ _Nullable)(int exitCode))completion {
+    void (^launch)(void) = ^{
+        if (!self.isRunning || command.count == 0) {
+            if (completion) completion(-1);
+            return;
+        }
+        size_t bytes = 1;
+        for (NSString *argument in command) {
+            size_t length = [argument lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+            if (length + 1 > 4096 - bytes || strlen(argument.UTF8String) != length) {
+                if (completion) completion(-1);
+                return;
+            }
+            bytes += length + 1;
+        }
+#if !ISH_LINUX
+        int err = become_new_init_child();
+        if (err < 0) {
+            [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"headless child failed err=%d", err]];
+            if (completion) completion(err);
+            return;
+        }
+        err = create_stdio("/dev/null", MEM_MAJOR, DEV_NULL_MINOR);
+        if (err < 0) goto headless_failed;
+        if (directory.length) {
+            struct fd *dir = generic_open(directory.UTF8String, O_RDONLY_ | O_DIRECTORY_, 0);
+            if (!IS_ERR(dir)) fs_chdir(current->fs, dir);
+        }
+        char argv[4096];
+        [Terminal convertCommand:command toArgs:argv limitSize:sizeof(argv)];
+        const char *envp = "TERM=dumb\0"
+            "HOME=/root\0"
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
+#if defined(GUEST_ARM64)
+            "PYTHONMALLOC=malloc\0"
+#endif
+            ;
+        err = do_execve(command[0].UTF8String, command.count, argv, envp);
+        if (err < 0) goto headless_failed;
+        int pid = current->pid;
+        __block BOOL completed = NO;
+        __block id observer = nil;
+        __block NSTimer *timeout = nil;
+        void (^finish)(int) = ^(int code) {
+            if (completed) return;
+            completed = YES;
+            if (observer) { [NSNotificationCenter.defaultCenter removeObserver:observer]; observer = nil; }
+            if (timeout) { [timeout invalidate]; timeout = nil; }
+            if (completion) completion(code);
+        };
+        if (completion) {
+            observer = [NSNotificationCenter.defaultCenter addObserverForName:ProcessExitedNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+                if ([note.userInfo[@"pid"] intValue] == pid) {
+                    int rawCode = [note.userInfo[@"code"] intValue];
+                    int exitStatus = (rawCode & 0x7f) ? -(rawCode & 0x7f) : ((rawCode >> 8) & 255);
+                    finish(exitStatus);
+                }
+            }];
+            timeout = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:NO block:^(NSTimer * _Nonnull t) {
+                (void)t;
+                finish(-ETIMEDOUT);
+            }];
+        }
+        err = task_start(current);
+        if (err < 0) {
+            if (observer) { [NSNotificationCenter.defaultCenter removeObserver:observer]; observer = nil; }
+            if (timeout) { [timeout invalidate]; timeout = nil; }
+            goto headless_failed;
+        }
+        current = NULL;
+        return;
+headless_failed:
+        task_discard_unstarted(current);
+        current = NULL;
+        [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"headless exec failed err=%d", err]];
+        if (completion) completion(err);
+#else
+        if (completion) completion(-1);
+#endif
+    };
+    if (NSThread.isMainThread) launch();
+    else dispatch_async(dispatch_get_main_queue(), launch);
 }
-+ (TerminalViewController *)modesCommand:(NSArray<NSString *> *)arguments {
-    NSError *error = nil; if (!LRPrepareSupport(&error)) return nil;
-    return [self terminalForCommand:[@[@"/bin/sh", @"/home/mobile/Downloads/.linuxrunner/support/modes.sh"] arrayByAddingObjectsFromArray:arguments] directory:@"/root"];
+
+static NSString * const LRSSHAutoStartKey = @"DebianRunner.sshAutoStart";
+static NSString * const LRSSHAllowRootKey = @"DebianRunner.sshAllowRootLogin";
+static BOOL LRSSHActionInFlight = NO;
+static NSMutableArray<void (^)(void)> *LRSSHActionQueue = nil;
+
++ (BOOL)sshBinaryInstalled {
+    if (!self.isRunning) return NO;
+    return LRAccountTool(@[@"/usr/sbin/sshd", @"/usr/bin/sshd"]) != nil;
 }
-+ (NSDictionary<NSString *, NSString *> *)modesStatus {
+
++ (BOOL)sshAutoStart {
+    id stored = [NSUserDefaults.standardUserDefaults objectForKey:LRSSHAutoStartKey];
+    return stored ? [stored boolValue] : YES;
+}
+
++ (void)setSshAutoStart:(BOOL)enabled {
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:LRSSHAutoStartKey];
+}
+
++ (BOOL)sshAllowRootLogin {
+    return [NSUserDefaults.standardUserDefaults boolForKey:LRSSHAllowRootKey];
+}
+
++ (void)setSshAllowRootLogin:(BOOL)enabled {
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:LRSSHAllowRootKey];
+}
+
++ (void)installSSHWithProgress:(void (^)(NSString *stage))progress completion:(void (^)(NSError * _Nullable error))completion {
+    [self runSupportInstall:@[@"mode-ssh"] title:@"Installing OpenSSH Server" progress:progress completion:completion];
+}
+
++ (void)runNextSSHActionLocked {
+    if (LRSSHActionInFlight || LRSSHActionQueue.count == 0) return;
+    void (^next)(void) = LRSSHActionQueue.firstObject;
+    [LRSSHActionQueue removeObjectAtIndex:0];
+    LRSSHActionInFlight = YES;
+    next();
+}
+
++ (void)runSSHAction:(NSString *)action completion:(void (^ _Nullable)(NSDictionary<NSString *, NSString *> *status))completion {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!LRSSHActionQueue) LRSSHActionQueue = [NSMutableArray new];
+        // Collapse duplicate queued status checks so timers never pile up.
+        if ([action isEqualToString:@"status"] && LRSSHActionInFlight && LRSSHActionQueue.count > 0) {
+            if (completion) completion(self.sshStatus);
+            return;
+        }
+        [LRSSHActionQueue addObject:^{
+            NSError *error = nil;
+            if (!self.isRunning || !LRPrepareSupport(&error)) {
+                LRSSHActionInFlight = NO;
+                if (completion) completion(self.sshStatus);
+                [self runNextSSHActionLocked];
+                return;
+            }
+            NSMutableArray<NSString *> *args = [NSMutableArray arrayWithObjects:@"/bin/sh", @"/home/mobile/Downloads/.linuxrunner/support/modes.sh", nil];
+            NSString *permitRoot = self.sshAllowRootLogin ? @"yes" : @"no";
+            if ([action isEqualToString:@"start"]) {
+                [args addObjectsFromArray:@[@"start", @"ssh", permitRoot]];
+            } else if ([action isEqualToString:@"restart"]) {
+                [args addObjectsFromArray:@[@"restart", @"ssh", permitRoot]];
+            } else if ([action isEqualToString:@"stop"]) {
+                [args addObjectsFromArray:@[@"stop", @"ssh"]];
+            } else {
+                [args addObject:@"status"];
+            }
+            [self runHeadlessCommand:args directory:@"/root" completion:^(int exitCode) {
+                (void)exitCode;
+                LRSSHActionInFlight = NO;
+                NSDictionary<NSString *, NSString *> *status = self.sshStatus;
+                if (![action isEqualToString:@"status"]) {
+                    [self logCategory:@"SSH" event:[NSString stringWithFormat:@"action=%@ state=%@ port=%@", action, status[@"ssh"] ?: @"unknown", status[@"ssh.port"] ?: @"2222"]];
+                }
+                if (completion) completion(status);
+                [self runNextSSHActionLocked];
+            }];
+        }];
+        [self runNextSSHActionLocked];
+    });
+}
+
++ (NSDictionary<NSString *, NSString *> *)sshStatus {
     NSError *error = nil; NSURL *support = LRPrepareSupport(&error);
     NSString *text = support ? [NSString stringWithContentsOfURL:[support URLByAppendingPathComponent:@"modes-status"] encoding:NSUTF8StringEncoding error:nil] : nil;
-    NSMutableDictionary *status = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSString *> *status = [NSMutableDictionary dictionary];
     for (NSString *line in [text ?: @"" componentsSeparatedByString:@"\n"]) {
         NSRange eq = [line rangeOfString:@"="]; if (eq.location == NSNotFound) continue;
         NSString *owner = [line substringToIndex:eq.location];
-        if ([owner isEqualToString:@"agents"]) { status[owner] = [line substringFromIndex:NSMaxRange(eq)]; continue; }
         NSArray<NSString *> *fields = [line componentsSeparatedByString:@" "];
         for (NSUInteger i = 0; i < fields.count; i++) {
             NSRange e = [fields[i] rangeOfString:@"="]; if (e.location == NSNotFound) continue;
@@ -1185,7 +1474,20 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
             status[i == 0 ? key : [NSString stringWithFormat:@"%@.%@", owner, key]] = [fields[i] substringFromIndex:NSMaxRange(e)];
         }
     }
+    if (self.isRunning) {
+        status[@"ssh_installed"] = self.sshBinaryInstalled ? @"1" : @"0";
+    } else {
+        status[@"ssh"] = @"stopped";
+    }
+    if (!status[@"ssh.port"]) status[@"ssh.port"] = @"2222";
     return status;
+}
+
++ (NSString *)sshLogTail {
+    NSError *error = nil;
+    NSURL *support = LRPrepareSupport(&error);
+    if (!support) return @"";
+    return [self boundedDiagnosticTail:[support URLByAppendingPathComponent:@"modes.log"] maxBytes:16384];
 }
 
 // ---- Support installations: one runner, real progress ----------------------

@@ -7,4 +7,5 @@
 
 #import <Foundation/Foundation.h>
 
+NSArray<NSString *> *CurrentAppGroups(void);
 NSURL *ContainerURL(void);

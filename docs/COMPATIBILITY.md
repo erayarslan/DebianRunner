@@ -6,16 +6,17 @@ DebianRunner runs **Debian GNU/Linux 13 (trixie) minimal ARM64** in headless ter
 
 - **Target architecture**: ARM64 (iPhone and iPad, minimum iOS/iPadOS deployment target 15.0).
 - **Distribution**: Debian GNU/Linux 13 (trixie) minimal ARM64 (`apt`, `dpkg`, `bash`).
-- **Multiple environments**: You can create multiple isolated Debian minimal environments under **Environments**. Only one environment runs per app launch; switch via **Use on Next Launch** and a full relaunch.
+- **Single Debian Minimal environment**: DebianRunner manages a single Debian Minimal environment in the **Debian** tab, where you can configure services or wipe and reinstall cleanly at any time.
 
 ## Workloads
 
 | Workload | Scope |
 | --- | --- |
-| Shells & coreutils (`bash`, `sh`, `tmux`, `vim`, `nano`, `jq`, `ripgrep`) | Supported in the native terminal and over SSH Mode. |
+| Shells & coreutils (`bash`, `sh`, `tmux`, `vim`, `nano`, `jq`, `ripgrep`) | Supported in the native terminal and over built-in SSH. |
 | Package management (`apt`, `apt-get`, `dpkg`) | Supported via **Packages** or directly in the terminal. |
 | Languages & runtimes (`python3`, `nodejs`, `npm`, `gcc`, `git`) | Supported under the ARM64 interpreter; compute-heavy builds are slower than native execution. |
-| Headless services (`Agent Mode`, `SSH Mode`, `Liftoff`, `Pocket Cloud`) | Opt-in via **Home → Modes** / **Settings → General → DebianRunner Modes**. |
+| Built-in OpenSSH server (`sshd` on port `2222`) | Installed and started by default; controlled via **Home → SSH Server** and **Debian → SSH Server**. |
+| Apple Files rootfs mount | Full Linux `/` browsable in Apple **Files** via embedded `iSHFileProvider.appex` when signed with an App Group. |
 | Embedded serial (`/dev/ttyBLE0-3`, `/dev/ttyMIDI0-3`) | Bluetooth LE serial and USB-MIDI serial adapters exposed under **Devices**. Direct USB serial chips (CH340/CP210x/FTDI) are not exposed by iOS. |
 | Graphical desktop / GUI apps (X11, Wayland, GPU) | **Not supported.** Desktop and GPU components are removed in this headless build. |
 

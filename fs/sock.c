@@ -319,6 +319,10 @@ static lock_t peer_lock = LOCK_INITIALIZER;
 
 static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol, struct fd **retained) {
     if (retained) *retained = NULL;
+#if defined(__APPLE__) && defined(SO_NOSIGPIPE)
+    int no_sigpipe = 1;
+    (void) setsockopt(sock_fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
     struct fd *fd = adhoc_fd_create(&socket_fdops);
     if (fd == NULL) {
         close(sock_fd);

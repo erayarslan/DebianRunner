@@ -4,7 +4,7 @@ Preserve your Debian environment first. Do not uninstall DebianRunner, delete it
 
 ## Repair Center and APT Diagnostics
 
-Open **Home → Packages → `⋯` → Repair Center & Advanced** (or **Environments → <environment> → Packages (APT)**):
+Open **Home → Packages → `⋯` → Repair Center & Advanced** (or **Debian → Packages (APT)**):
 
 1. Run **Diagnose Package State** and **Check Dependencies** first.
 2. Review the terminal output.
@@ -22,21 +22,22 @@ If **Restart DebianRunner** appears (for example when installing a second enviro
 
 Only one modifying `dpkg`/`apt` operation can run in an environment at a time. On first boot, `/usr/lib/linuxrunner/initialize-debian.sh` runs `dpkg --configure -a` and builds the CA trust store; managed package and mode installers automatically wait for it. Never delete `/var/lib/dpkg/lock*` while a package process is active.
 
-## Terminal Does Not Start or Uses the Wrong Environment
+## Terminal Does Not Start
 
-Check the Home header status pill. Tap **Start Debian Minimal** if the runtime is stopped. To switch between multiple Debian environments, open **Environments → <environment> → Use on Next Launch**, fully close DebianRunner, and reopen it.
+Check the Home header status pill. Tap **Start Debian Minimal** if the runtime is stopped. If you want to start over cleanly, open the **Debian** tab and tap **Wipe Debian Minimal…**.
 
 Check the active user in **Settings → Linux Environment → Linux Users**, and verify with `id` and `pwd` inside the terminal.
 
-## Headless Modes (SSH, Liftoff, Pocket Cloud, Agent Mode)
+## Built-in SSH Server
 
-- Ensure Debian minimal is running before installing or starting a mode.
-- For **SSH Mode**, root login is disabled; create a regular user in **Settings → Linux Environment → Linux Users** and connect with `ssh -p 2222 <user>@<iPhone-IP>`.
-- For LAN modes (**SSH**, **Liftoff**, **Pocket Cloud**), verify both devices share the same Wi-Fi network and that DebianRunner has Local Network permission in iOS Settings.
+- Ensure Debian Minimal is running before connecting. Open **Home → SSH Server** to check status and expand **SSH Server Log**.
+- Root login is disabled by default; create a regular user in **Settings → Linux Environment → Linux Users** (or toggle **Allow Root Login** in **SSH Server** and set a root password) and connect with `ssh -p 2222 <user>@<iPhone-IP>`.
+- Verify both devices share the same Wi-Fi network and that DebianRunner has Local Network permission in iOS Settings.
+- Enable **Keep Linux Running in Background** (in **SSH Server** or **Settings → General**) and allow **Always** location permission when prompted so iOS keeps SSH sessions active when you lock your iPhone or switch apps.
 
-## Environments Seem Missing After Re-signing
+## Debian Minimal Data After Re-signing
 
-DebianRunner stores data in its App Group container (`group.dev.debianrunner.app`) when provisioned, or in its private Application Support directory otherwise. Changing bundle identifier or App Group entitlements changes which container iOS provides. Preserve the installed app and backups when changing signing settings.
+DebianRunner stores data in its App Group container (`group.<bundle-id>`) when provisioned — which also enables mounting the full Linux rootfs in Apple **Files** — and falls back to its private Application Support directory otherwise. Changing bundle identifier or App Group entitlements changes which container iOS provides. Preserve the installed app and backups when changing signing settings.
 
 ## JIT Is Unavailable
 

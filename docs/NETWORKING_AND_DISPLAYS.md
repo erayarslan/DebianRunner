@@ -24,15 +24,14 @@ Routes reflect available host routing information, not a separate Linux network 
 
 Bluetooth networking, raw packet capture, Wi-Fi scanning/monitor mode, and host interface/route administration are unsupported.
 
-## Headless Network Modes
+## Built-in SSH Server
 
-Optional LAN services are managed in **Home → Modes** (or **Settings → General → DebianRunner Modes**):
+DebianRunner includes an OpenSSH server managed in **Home → SSH Server** (or **Debian → SSH Server** / **Settings → Linux Environment → SSH Server**):
 
-- **SSH Mode**: OpenSSH server on TCP port `2222` (regular user login; root login disabled).
-- **Liftoff**: HTTP server for `~/Sites` on TCP port `8080`.
-- **Pocket Cloud**: WebDAV server for `~/Pocket Cloud` on TCP port `8081` with a freshly generated password per start.
+- **SSH Server**: OpenSSH (`sshd`) listening on TCP port `2222` (`0.0.0.0:2222`), installed and started by default with TCP/SSH keepalives (`ClientAliveInterval=15`, `UsePAM=no`, `UseDNS=no`).
+- Regular Linux users can log in with password or `~/.ssh/authorized_keys`; root login is off by default and can be toggled in **SSH Server**.
 
-Network modes are reachable on the same Wi-Fi network while DebianRunner is active or running in the background.
+The SSH server is reachable on the same Wi-Fi network while DebianRunner is active or running with **Keep Linux Running in Background** enabled.
 
 ## Diagnose a Connection
 

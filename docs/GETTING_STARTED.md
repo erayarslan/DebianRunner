@@ -8,7 +8,7 @@ Install the built/signed IPA using AltStore, SideStore, Sideloadly, TrollStore, 
 
 ## 2. First Launch & Debian Minimal Setup
 
-The app has three tabs: **Home**, **Environments**, and **Settings**.
+The app has three tabs: **Home**, **Debian**, and **Settings**.
 
 When no Debian environment is installed yet, the setup wizard opens automatically (or tap **Install Debian Minimal** on Home):
 
@@ -46,20 +46,19 @@ apt-get update
 apt-get install --no-install-recommends git nano curl
 ```
 
-## 5. Enable Optional Headless Modes
+## 5. Connect via Built-in SSH Server
 
-Open **Home → Modes** (or **Settings → General → DebianRunner Modes**) to install and toggle:
+DebianRunner installs `openssh-server` automatically and starts `sshd` on port `2222` by default. Open **Home → SSH Server** (or **Debian → SSH Server**) to:
 
-- **Agent Mode**: Node.js, git, ripgrep, Python, and CLI coding agents (`claude`, `codex`, `opencode`).
-- **SSH Mode**: OpenSSH server on port `2222` (non-root user login).
-- **Liftoff**: HTTP server for `~/Sites` on port `8080` with Safari link and LAN QR code.
-- **Pocket Cloud**: WebDAV file server for `~/Pocket Cloud` on port `8081`.
+- Copy the ready-to-run `ssh -p 2222 <user>@<iPhone-IP>` and `sftp -P 2222 <user>@<iPhone-IP>` commands.
+- Start, stop, or restart `sshd`, toggle **Start SSH Automatically on Launch**, or enable **Allow Root Login**.
+- Turn on **Keep Linux Running in Background** so SSH connections stay alive while using other apps or locking your screen.
 
-## 6. Manage Multiple Debian Environments
+## 6. Manage or Wipe Debian Minimal
 
-Open the **Environments** tab to view storage usage, create an additional fresh Debian minimal environment, select which environment boots on next launch (**Use on Next Launch**), or delete inactive environments.
+Open the **Debian** tab to inspect Debian Minimal status and storage usage, access SSH Server, APT packages, Linux users, and Apple Files settings, or tap **Wipe Debian Minimal…** to cleanly erase and reinstall Debian Minimal from scratch.
 
-A mounted environment cannot be deleted while running; switch to another environment, fully close and reopen DebianRunner, then delete the inactive one.
+Finished or paused entries in the Home **Tasks** list can be removed individually or cleared all at once with **Clear**.
 
 ## 7. CPU, Memory, and Optional JIT
 

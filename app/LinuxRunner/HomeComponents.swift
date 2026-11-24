@@ -113,8 +113,18 @@ struct HomeTasks: View {
     var body: some View {
         if !center.entries.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Tasks").font(.headline)
-                ForEach(center.entries.prefix(4)) { entry in
+                HStack {
+                    Text("Tasks").font(.headline)
+                    Spacer()
+                    if center.hasClearableEntries {
+                        Button("Clear") {
+                            withAnimation(.easeOut(duration: 0.2)) { center.clearFinished() }
+                        }
+                        .font(.subheadline.weight(.semibold))
+                        .accessibilityIdentifier("Clear Tasks")
+                    }
+                }
+                ForEach(center.entries.prefix(6)) { entry in
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         HStack(spacing: 12) {
                             ZStack {
@@ -131,6 +141,17 @@ struct HomeTasks: View {
                             VStack(alignment: .trailing, spacing: 2) {
                                 Text(entry.state.rawValue).font(.caption2.weight(.semibold)).foregroundColor(color(entry))
                                 Text(elapsed(entry, now: context.date)).font(.caption2.monospacedDigit()).foregroundColor(.secondary)
+                            }
+                            if entry.ended != nil || entry.state == .pausedByIOS {
+                                Button {
+                                    withAnimation(.easeOut(duration: 0.2)) { center.removeEntry(entry.id) }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 16))
+                                        .foregroundColor(Color(.tertiaryLabel))
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Remove \(entry.title)")
                             }
                         }
                         .padding(12)

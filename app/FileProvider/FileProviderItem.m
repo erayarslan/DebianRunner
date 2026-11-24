@@ -49,7 +49,7 @@
         while (db_exec(&_mount->db, stmt)) {
             const char *path = (const char *) sqlite3_column_text(stmt, 0);
             fd = openat(_mount->root_fd, fix_path(path), O_RDWR);
-            if (fd == -1 && errno == EISDIR)
+            if (fd == -1 && (errno == EISDIR || errno == EACCES || errno == EROFS))
                 fd = openat(_mount->root_fd, fix_path(path), O_RDONLY);
             if (fd == -1 && errno != ENOENT)
                 break;
@@ -58,13 +58,14 @@
         db_commit(&_mount->db);
     }
     if (fd == -1) {
-        if (error != nil) {
-            if (errno == ENOENT)
-                *error = [NSError fileProviderErrorForNonExistentItemWithIdentifier:_identifier];
-            else
-                *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
-        }
-        NSLog(@"opening %@ failed: %@", self.identifier, *error);
+        NSError *openError = nil;
+        if (errno == ENOENT)
+            openError = [NSError fileProviderErrorForNonExistentItemWithIdentifier:_identifier];
+        else
+            openError = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        if (error != nil)
+            *error = openError;
+        NSLog(@"opening %@ failed: %@", self.identifier, openError);
         return -1;
     }
     return fd;
@@ -73,8 +74,10 @@
 - (NSString *)path {
     char path[PATH_MAX] = "";
     int err = fcntl(_fd, F_GETPATH, path);
-    [self handleError:err inFunction:@"getpath"];
-    const char *myPath = path + strlen(_mount->source);
+    if (err < 0)
+        return @"";
+    size_t sourceLen = strlen(_mount->source);
+    const char *myPath = (strncmp(path, _mount->source, sourceLen) == 0) ? (path + sourceLen) : "";
     return [NSFileManager.defaultManager stringWithFileSystemRepresentation:myPath length:strlen(myPath)];
 }
 
@@ -91,14 +94,18 @@
     inode_t inode = _identifier.longLongValue;
     if ([_identifier isEqualToString:NSFileProviderRootContainerItemIdentifier])
         inode = path_get_inode(&_mount->db, "");
-    inode_read_stat_or_die(&_mount->db, inode, &stat);
+    if (!inode_read_stat(&_mount->db, inode, &stat)) {
+        struct stat st;
+        if (fstat(_fd, &st) == 0)
+            stat.mode = st.st_mode;
+    }
     db_commit(&_mount->db);
     return stat;
 }
 - (struct stat)realStat {
-    struct stat statbuf;
-    int err = fstat(_fd, &statbuf);
-    [self handleError:err inFunction:@"realStat"];
+    struct stat statbuf = {};
+    if (fstat(_fd, &statbuf) < 0)
+        return statbuf;
     return statbuf;
 }
 
@@ -113,12 +120,13 @@
         return NSFileProviderRootContainerItemIdentifier;
     }
     NSString *parentPath = self.path.stringByDeletingLastPathComponent;
-    if ([parentPath isEqualToString:@"/"])
+    if (parentPath.length == 0 || [parentPath isEqualToString:@"/"])
         return NSFileProviderRootContainerItemIdentifier;
     db_begin_read(&_mount->db);
     inode_t parentInode = path_get_inode(&_mount->db, parentPath.UTF8String);
     db_commit(&_mount->db);
-    assert(parentInode != 0);
+    if (parentInode == 0)
+        return NSFileProviderRootContainerItemIdentifier;
     NSString *parent = [NSString stringWithFormat:@"%lu", (unsigned long) parentInode];
     NSLog(@"parent of %@ is %@", self.path, parent);
     return parent;

@@ -55,37 +55,36 @@ struct SetupWizardView: View {
         case .welcome:
             Section {
                 Text("DebianRunner runs Debian GNU/Linux 13 (trixie) minimal ARM64 on this iPhone with its own userspace runtime — no virtual machine.")
-                Text("Setup downloads and verifies official Debian minimal packages and optionally creates your Linux account. Everything can be changed later in Settings.")
+                Text("Setup downloads and verifies official Debian minimal packages, installs OpenSSH server by default, and optionally creates your Linux account. Everything can be changed later in Debian or Settings.")
                     .foregroundStyle(.secondary)
             }
-            if !manager.environments.isEmpty {
-                Section("Installed Environments") {
-                    ForEach(manager.environments) { environment in
-                        Button("Configure " + environment.name) { configureExisting(environment) }
-                    }
-                    Text("Uses the existing Debian environment, accounts, and files. Switching environments takes effect after relaunch.")
+            if let existing = manager.environments.first {
+                Section("Debian Minimal") {
+                    Button("Configure " + existing.name) { configureExisting(existing) }
+                    Text("Uses your existing Debian Minimal installation, accounts, and files. To start fresh, wipe Debian Minimal from the Debian tab.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-            }
-            Section {
-                Button(manager.environments.isEmpty ? "Continue" : "Install Another Debian Environment") {
-                    stepRaw = SetupStep.install.rawValue
+            } else {
+                Section {
+                    Button("Continue") {
+                        stepRaw = SetupStep.install.rawValue
+                    }
                 }
             }
         case .install: install
         case .relaunch:
             Section {
-                Text("Debian minimal is installed and selected. Close DebianRunner completely (swipe it away in the app switcher) and open it again — setup continues with your account.")
+                Text("Debian minimal is installed. Close DebianRunner completely (swipe it away in the app switcher) and open it again — setup continues with your account.")
             }
             Section {
-                Text("iOS allows one Linux runtime per app launch, so this restart is needed once when switching from an already running environment.")
+                Text("iOS allows one Linux runtime per app launch, so this restart is needed once after installing.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
         case .account: account
         case .done:
             Section {
                 Label("Debian minimal is ready", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                Text("Install command-line packages any time from Packages, or enable SSH, Agent Mode, Liftoff, and Pocket Cloud in Settings › Modes.")
+                Text("Install command-line packages any time from Packages, connect remotely using the built-in SSH Server, or browse Debian files directly from the Apple Files app.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section {

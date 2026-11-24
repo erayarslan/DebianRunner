@@ -144,6 +144,25 @@ import Darwin
         }
     }
 
+    func wipeAll(completion: @escaping (Bool, String?) -> Void) {
+        guard !busy else { completion(false, "Wait for the current operation to finish."); return }
+        busy = true
+        LRRuntimeBridge.wipeEnvironment { [weak self] needsRestart, failure in
+            Task { @MainActor in
+                guard let self else { return }
+                defer { self.busy = false }
+                if !needsRestart && failure == nil {
+                    self.environments = []
+                    self.storage = [:]
+                    self.detected = []
+                    try? self.persist()
+                }
+                self.refresh()
+                completion(needsRestart, failure?.localizedDescription)
+            }
+        }
+    }
+
     func size(_ environment: LinuxEnvironment) -> String {
         storage[environment.id].map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "Calculating…"
     }
@@ -310,8 +329,363 @@ private struct TerminalPresentation: Identifiable {
     let controller: TerminalViewController
 }
 
+// MARK: - Built-in OpenSSH Server Controller & Screen
+@MainActor final class SSHServiceController: ObservableObject {
+    @Published var status: [String: String] = [:]
+    @Published var installing = false
+    @Published var installProgress: String?
+    @Published var busy = false
+    @Published var error: String?
+    @Published var logTail = ""
+    private var autoBootAttempted = false
+
+    var isInstalled: Bool { status["ssh_installed"] == "1" || LRRuntimeBridge.sshBinaryInstalled() }
+    var isRunning: Bool { LRRuntimeBridge.isRunning() && status["ssh"] == "running" }
+    var port: String { status["ssh.port"] ?? "2222" }
+
+    func refresh(queryGuest: Bool = true) {
+        status = LRRuntimeBridge.sshStatus()
+        logTail = LRRuntimeBridge.sshLogTail()
+        guard queryGuest, LRRuntimeBridge.isRunning(), !installing, !busy else { return }
+        LRRuntimeBridge.runSSHAction("status") { [weak self] updated in
+            Task { @MainActor in
+                guard let self else { return }
+                self.status = updated
+                self.logTail = LRRuntimeBridge.sshLogTail()
+            }
+        }
+    }
+
+    func ensureDefaultSSHIfNeeded() {
+        guard !autoBootAttempted, !installing, !busy, LRRuntimeBridge.isRunning(), LRRuntimeBridge.sshAutoStart() else { return }
+        let root = LRRuntimeBridge.activeRootName()
+        if !root.isEmpty {
+            let marker = LRRuntimeBridge.rootURL(root).appendingPathComponent("data/var/lib/linuxrunner/initialized").path
+            if !FileManager.default.fileExists(atPath: marker) {
+                // First-boot Debian initialization installs openssh-server itself; avoid racing dpkg/apt.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                    self?.ensureDefaultSSHIfNeeded()
+                }
+                return
+            }
+        }
+        autoBootAttempted = true
+        if LRRuntimeBridge.sshBinaryInstalled() {
+            start()
+        } else if !LRRuntimeBridge.installationRunning() {
+            installAndStart()
+        }
+    }
+
+    func start() {
+        guard LRRuntimeBridge.isRunning(), !busy, !installing else { return }
+        error = nil; busy = true
+        LRRuntimeBridge.runSSHAction("start") { [weak self] updated in
+            Task { @MainActor in
+                guard let self else { return }
+                self.busy = false
+                self.status = updated
+                self.logTail = LRRuntimeBridge.sshLogTail()
+                if updated["ssh"] != "running" {
+                    self.error = "OpenSSH server did not start. Expand SSH Server Log below for details."
+                }
+            }
+        }
+    }
+
+    func stop() {
+        guard LRRuntimeBridge.isRunning(), !busy, !installing else { return }
+        error = nil; busy = true
+        LRRuntimeBridge.runSSHAction("stop") { [weak self] updated in
+            Task { @MainActor in
+                guard let self else { return }
+                self.busy = false
+                self.status = updated
+                self.logTail = LRRuntimeBridge.sshLogTail()
+            }
+        }
+    }
+
+    func restart() {
+        guard LRRuntimeBridge.isRunning(), !busy, !installing else { return }
+        error = nil; busy = true
+        LRRuntimeBridge.runSSHAction("restart") { [weak self] updated in
+            Task { @MainActor in
+                guard let self else { return }
+                self.busy = false
+                self.status = updated
+                self.logTail = LRRuntimeBridge.sshLogTail()
+                if updated["ssh"] != "running" {
+                    self.error = "OpenSSH server did not restart. Expand SSH Server Log below for details."
+                }
+            }
+        }
+    }
+
+    func installAndStart() {
+        guard LRRuntimeBridge.isRunning(), !installing else { return }
+        error = nil; installing = true; installProgress = "Preparing OpenSSH installation"
+        LRRuntimeBridge.installSSH(progress: { [weak self] stage in
+            Task { @MainActor in self?.installProgress = stage }
+        }) { [weak self] failure in
+            Task { @MainActor in
+                guard let self else { return }
+                self.installing = false
+                self.installProgress = nil
+                if let failure {
+                    self.error = failure.localizedDescription
+                    self.refresh(queryGuest: false)
+                    return
+                }
+                self.status = LRRuntimeBridge.sshStatus()
+                if LRRuntimeBridge.sshAutoStart() {
+                    self.start()
+                } else {
+                    self.refresh(queryGuest: true)
+                }
+            }
+        }
+    }
+
+    static func wifiAddress() -> String? {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0 else { return nil }
+        defer { freeifaddrs(list) }
+        var cursor = list
+        while let entry = cursor {
+            defer { cursor = entry.pointee.ifa_next }
+            guard let address = entry.pointee.ifa_addr, address.pointee.sa_family == UInt8(AF_INET),
+                  String(cString: entry.pointee.ifa_name) == "en0" else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                return String(cString: host)
+            }
+        }
+        return nil
+    }
+}
+
+private struct SSHServerView: View {
+    @ObservedObject var ssh: SSHServiceController
+    @State private var autoStart = LRRuntimeBridge.sshAutoStart()
+    @State private var allowRootLogin = LRRuntimeBridge.sshAllowRootLogin()
+    @AppStorage(BackgroundRunner.defaultsKey) private var keepRunningInBackground = false
+    @State private var copied: String?
+    @State private var runtimeRunning = LRRuntimeBridge.isRunning()
+    @Environment(\.scenePhase) private var scenePhase
+    private let timer = Timer.publish(every: 8, on: .main, in: .common).autoconnect()
+
+    private var loginUser: String {
+        let user = LRRuntimeBridge.defaultLinuxUser()
+        if !user.isEmpty && (user != "root" || allowRootLogin) { return user }
+        if let firstNonRoot = LRRuntimeBridge.linuxAccounts().first(where: { $0["name"] != "root" && ($0["uid"].flatMap(Int.init) ?? 0) >= 1000 })?["name"] {
+            return firstNonRoot
+        }
+        return allowRootLogin ? "root" : "<user>"
+    }
+
+    private var needsNonRootUserNotice: Bool {
+        runtimeRunning && !allowRootLogin && loginUser == "<user>"
+    }
+
+    private var statusPill: (String, Color) {
+        if ssh.installing { return ("Installing", .orange) }
+        if ssh.busy { return ("Updating", .orange) }
+        if !runtimeRunning { return ("Debian Stopped", .secondary) }
+        if ssh.isRunning { return ("Running", .green) }
+        if ssh.isInstalled { return ("Stopped", .secondary) }
+        return ("Not Installed", .orange)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                heroCard
+                if !runtimeRunning {
+                    notice("Start Debian Minimal from the Home or Debian tab to run the OpenSSH server.", symbol: "power", color: .orange)
+                }
+                if needsNonRootUserNotice {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Create a Linux user or enable Allow Root Login", systemImage: "person.badge.key.fill")
+                            .font(.subheadline.weight(.semibold)).foregroundColor(.orange)
+                        Text("Root SSH login is off by default. Create a user account with a password in Linux Users (or enable Allow Root Login below and set a root password).")
+                            .font(.caption).foregroundColor(.secondary)
+                        NavigationLink(destination: LinuxUsersView()) {
+                            Label("Open Linux Users", systemImage: "person.2.fill").font(.caption.weight(.semibold))
+                        }.buttonStyle(.bordered).controlSize(.small)
+                    }
+                    .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.orange.opacity(0.12)))
+                }
+                if ssh.isRunning {
+                    connectionCard
+                }
+                controlsCard
+                optionsCard
+                logCard
+            }
+            .padding(.horizontal, 20).padding(.vertical, 12).padding(.bottom, 96)
+        }
+        .background(Color(.systemGroupedBackground).ignoresSafeArea())
+        .navigationTitle("SSH Server")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            runtimeRunning = LRRuntimeBridge.isRunning()
+            autoStart = LRRuntimeBridge.sshAutoStart()
+            allowRootLogin = LRRuntimeBridge.sshAllowRootLogin()
+            ssh.refresh(queryGuest: true)
+        }
+        .onReceive(timer) { _ in
+            guard scenePhase == .active else { return }
+            runtimeRunning = LRRuntimeBridge.isRunning()
+            ssh.refresh(queryGuest: true)
+        }
+    }
+
+    private var heroCard: some View {
+        let pill = statusPill
+        return HStack(spacing: 14) {
+            LRIconTile(symbol: "network", colors: [.green, .teal], size: 48)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("OpenSSH Server").font(.headline)
+                Text("Remote shell, VS Code Remote, scp & SFTP on port \(ssh.port)")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 4)
+            HStack(spacing: 5) {
+                if ssh.isRunning { Circle().fill(Color.green).frame(width: 7, height: 7) }
+                LRStatusPill(text: pill.0, color: pill.1)
+            }
+        }
+        .padding(16)
+        .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private var connectionCard: some View {
+        let ip = SSHServiceController.wifiAddress() ?? "iPhone-IP"
+        let cmd = "ssh -p \(ssh.port) \(loginUser)@\(ip)"
+        let sftpCmd = "sftp -P \(ssh.port) \(loginUser)@\(ip)"
+        return LRCard(title: "Connect", symbol: "terminal.fill", colors: [.green, .mint], value: ":\(ssh.port)") {
+            VStack(spacing: 0) {
+                copyRow("SSH", cmd)
+                Divider().padding(.leading, 12)
+                copyRow("SFTP", sftpCmd)
+                Divider().padding(.leading, 12)
+                copyRow("Wi-Fi IP", ip)
+            }
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color(.tertiarySystemGroupedBackground)))
+            Text("Connect from any Mac, PC, or SSH client on the same Wi-Fi network using your Linux user's password or ~/.ssh/authorized_keys.")
+                .font(.caption).foregroundColor(.secondary)
+        }
+    }
+
+    private func copyRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).font(.caption).foregroundColor(.secondary).frame(width: 58, alignment: .leading)
+            Text(value).font(.system(.footnote, design: .monospaced).weight(.semibold)).lineLimit(1).minimumScaleFactor(0.7).textSelection(.enabled)
+            Spacer(minLength: 4)
+            Button {
+                UIPasteboard.general.string = value
+                withAnimation { copied = value }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { if copied == value { withAnimation { copied = nil } } }
+            } label: {
+                Image(systemName: copied == value ? "checkmark" : "doc.on.doc").font(.caption.weight(.semibold))
+            }.buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+    }
+
+    private var controlsCard: some View {
+        let disabled = !runtimeRunning || ssh.installing || ssh.busy
+        return LRCard(title: "Server Control", symbol: "bolt.horizontal.circle.fill", colors: [.blue, .teal]) {
+            if ssh.installing {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text(ssh.installProgress ?? "Installing OpenSSH server…").font(.footnote).foregroundColor(.secondary)
+                }
+            }
+            if let err = ssh.error {
+                notice(err, symbol: "exclamationmark.triangle.fill", color: .orange)
+            }
+            HStack(spacing: 10) {
+                if !ssh.isInstalled {
+                    Button { ssh.installAndStart() } label: {
+                        Label("Install & Start SSH", systemImage: "arrow.down.circle.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent).disabled(disabled)
+                } else if ssh.isRunning {
+                    Button { ssh.restart() } label: {
+                        Label(ssh.busy ? "Restarting…" : "Restart", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered).disabled(disabled)
+                    Button(role: .destructive) { ssh.stop() } label: {
+                        Label("Stop", systemImage: "stop.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent).tint(.red).disabled(disabled)
+                } else {
+                    Button { ssh.start() } label: {
+                        Label(ssh.busy ? "Starting…" : "Start SSH Server", systemImage: "play.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent).tint(.green).disabled(disabled)
+                }
+            }
+            .font(.subheadline.weight(.semibold))
+        }
+    }
+
+    private var optionsCard: some View {
+        LRCard(title: "Settings", symbol: "gearshape.fill", colors: [.indigo, .purple]) {
+            Toggle("Start SSH Automatically on Launch", isOn: $autoStart)
+                .onChange(of: autoStart) { value in
+                    LRRuntimeBridge.setSshAutoStart(value)
+                }
+            Divider()
+            Toggle("Allow Root Login", isOn: $allowRootLogin)
+                .onChange(of: allowRootLogin) { value in
+                    LRRuntimeBridge.setSshAllowRootLogin(value)
+                    if ssh.isRunning { ssh.restart() }
+                }
+            Divider()
+            Toggle("Keep Linux Running in Background", isOn: $keepRunningInBackground)
+                .onChange(of: keepRunningInBackground) { BackgroundRunner.shared.apply($0) }
+            Text("Enable background execution so active SSH sessions stay alive when you lock your iPhone or switch apps. OpenSSH uses TCP keepalives and skips PAM/DNS lookups for responsive userspace logins.")
+                .font(.caption).foregroundColor(.secondary)
+        }
+    }
+
+    private var logCard: some View {
+        LRCard(title: "Diagnostics", symbol: "doc.text.fill", colors: [.gray, Color(.darkGray)]) {
+            LRMoreInfo(title: "SSH Server Log") {
+                if ssh.logTail.isEmpty {
+                    Text("No SSH log entries yet.").font(.caption).foregroundColor(.secondary)
+                } else {
+                    ScrollView {
+                        Text(ssh.logTail).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(maxHeight: 180)
+                }
+            }
+            HStack(spacing: 10) {
+                Button { ssh.refresh(queryGuest: true) } label: { Label("Refresh Status", systemImage: "arrow.clockwise") }
+                    .buttonStyle(.bordered).controlSize(.small).disabled(!runtimeRunning || ssh.busy)
+                if ssh.isInstalled {
+                    Button { ssh.installAndStart() } label: { Label("Repair SSH", systemImage: "wrench") }
+                        .buttonStyle(.bordered).controlSize(.small).disabled(!runtimeRunning || ssh.installing || ssh.busy)
+                }
+            }
+        }
+    }
+
+    private func notice(_ text: String, symbol: String, color: Color) -> some View {
+        Label(text, systemImage: symbol).font(.footnote).foregroundColor(color)
+            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(color.opacity(0.12)))
+    }
+}
+
 struct ManagerView: View {
     @StateObject private var manager = EnvironmentManager()
+    @StateObject private var ssh = SSHServiceController()
     let terminal: TerminalViewController
     @State private var selectedTab = 0
     @State private var runtimeRunning = LRRuntimeBridge.isRunning()
@@ -332,15 +706,17 @@ struct ManagerView: View {
     @State private var session: TerminalPresentation?
     @State private var share: ExportItem?
     @State private var importRoot: String?
-    @State private var pendingEnvironmentDeletion: LinuxEnvironment?
+    @State private var confirmWipe = false
+    @State private var wipeScheduledAlert = false
+    @State private var wipeScheduled = LRRuntimeBridge.isWipePending()
     @Environment(\.scenePhase) private var phase
 
     var body: some View {
         TabView(selection: $selectedTab) {
             NavigationView { home }.navigationViewStyle(.stack)
                 .tabItem { Label("Home", systemImage: "house") }.tag(0)
-            NavigationView { environmentsView }.navigationViewStyle(.stack)
-                .tabItem { Label("Environments", systemImage: "square.stack.3d.up") }.tag(1)
+            NavigationView { debianEnvironmentView }.navigationViewStyle(.stack)
+                .tabItem { Label("Debian", systemImage: "server.rack") }.tag(1)
             NavigationView { preferences }.navigationViewStyle(.stack)
                 .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }.tag(2)
         }
@@ -351,6 +727,11 @@ struct ManagerView: View {
             LongTaskCenter.shared.start()
             InstallScreensaver.shared.start()
             runtimeRunning = LRRuntimeBridge.isRunning()
+            wipeScheduled = LRRuntimeBridge.isWipePending()
+            if runtimeRunning {
+                ssh.ensureDefaultSSHIfNeeded()
+                ssh.refresh(queryGuest: false)
+            }
             // First launch without Debian minimal installed, or setup waiting for its relaunch/account step.
             if !SetupAutoPresentation.shown && !simulatorSuppressesSetup &&
                 (manager.environments.isEmpty || (setupStep == "relaunch" && LRRuntimeBridge.isRunning() && LRRuntimeBridge.activeRootName() == UserDefaults.standard.string(forKey: "LinuxRunnerSetup.root"))) {
@@ -369,6 +750,7 @@ struct ManagerView: View {
         .fullScreenCover(isPresented: $setup, onDismiss: {
             runtimeRunning = LRRuntimeBridge.isRunning()
             manager.refresh()
+            if runtimeRunning { ssh.ensureDefaultSSHIfNeeded() }
             if terminalAfterSetup {
                 terminalAfterSetup = false
                 if let environment = activeEnvironment { openTerminal(environment) }
@@ -376,14 +758,30 @@ struct ManagerView: View {
         }) {
             SetupWizardView(manager: manager, openTerminal: { terminalAfterSetup = true })
         }
-        .alert("Delete Environment?", isPresented: Binding(get: { pendingEnvironmentDeletion != nil }, set: { if !$0 { pendingEnvironmentDeletion = nil } })) {
-            Button("Cancel", role: .cancel) { pendingEnvironmentDeletion = nil }
-            Button("Delete Environment", role: .destructive) {
-                if let environment = pendingEnvironmentDeletion { manager.delete(environment) }
-                pendingEnvironmentDeletion = nil
+        .alert("Wipe Debian Minimal?", isPresented: $confirmWipe) {
+            Button("Cancel", role: .cancel) { }
+            Button("Wipe Everything", role: .destructive) {
+                manager.wipeAll { needsRestart, failure in
+                    if let failure {
+                        manager.error = failure
+                    } else if needsRestart {
+                        wipeScheduled = true
+                        wipeScheduledAlert = true
+                    } else {
+                        runtimeRunning = LRRuntimeBridge.isRunning()
+                        wipeScheduled = false
+                        ssh.status = [:]
+                    }
+                }
             }
         } message: {
-            Text("Permanently delete \(pendingEnvironmentDeletion?.name ?? "this environment"), including its packages, Linux home files, and exchange files? Export anything you need first. The Shared folder in iOS Files, linked external folders, and other environments are kept.")
+            Text("Permanently erase Debian Minimal, including all installed APT packages, Linux home files, SSH keys, and DebianRunner Shared files? Export anything you need first. You can reinstall a clean Debian Minimal environment afterwards.")
+        }
+        .alert("Restart to Complete Wipe", isPresented: $wipeScheduledAlert) {
+            Button("Close DebianRunner Now", role: .destructive) { exit(0) }
+            Button("Later", role: .cancel) { }
+        } message: {
+            Text("Debian Minimal is currently mounted. Close DebianRunner now and reopen it — the old filesystem will be wiped cleanly before startup so you can install fresh.")
         }
         .sheet(isPresented: $diagnostics) { DeveloperDiagnosticsView() }
         .fullScreenCover(item: $session) { item in
@@ -397,9 +795,12 @@ struct ManagerView: View {
         .alert("DebianRunner", isPresented: Binding(get: { manager.error != nil }, set: { if !$0 { DispatchQueue.main.async { manager.error = nil } } })) {
             Button("OK") { manager.error = nil }
         } message: { Text(manager.error ?? "") }
-        .onChange(of: phase) { _ in
+        .onChange(of: phase) { newPhase in
+            guard newPhase == .active else { return }
             runtimeRunning = LRRuntimeBridge.isRunning()
+            wipeScheduled = LRRuntimeBridge.isWipePending()
             manager.refresh()
+            if runtimeRunning { ssh.refresh(queryGuest: true) }
         }
     }
 
@@ -410,6 +811,10 @@ struct ManagerView: View {
         if runtimeRunning { return .running }
         if startingRuntime { return .starting }
         return .stopped
+    }
+
+    private var currentEnvironment: LinuxEnvironment? {
+        activeEnvironment ?? manager.environments.first
     }
 
     private func startRuntime() {
@@ -425,6 +830,7 @@ struct ManagerView: View {
                     terminal.loadViewIfNeeded()
                     terminal.startNewSession()
                 }
+                ssh.ensureDefaultSSHIfNeeded()
             } else {
                 manager.error = "Runtime initialization failed (\(result)). " + LRRuntimeBridge.runtimeStatus()
             }
@@ -464,10 +870,10 @@ struct ManagerView: View {
                         HomeTile(title: "Packages", symbol: "shippingbox.fill", colors: [.blue, .indigo], large: true)
                     }
                     .buttonStyle(HomeTileStyle()).disabled(activeEnvironment == nil).accessibilityIdentifier("Packages")
-                    NavigationLink(destination: ModesView()) {
-                        HomeTile(title: "Modes", symbol: "sparkles", colors: [.purple, .pink], large: true)
+                    NavigationLink(destination: SSHServerView(ssh: ssh)) {
+                        HomeTile(title: "SSH Server", symbol: "network", colors: [.green, .teal], large: true, badge: ssh.isRunning)
                     }
-                    .buttonStyle(HomeTileStyle()).accessibilityIdentifier("Modes")
+                    .buttonStyle(HomeTileStyle()).accessibilityIdentifier("SSH Server")
                 }
                 HStack(spacing: 14) {
                     NavigationLink(destination: SystemResourcesView()) {
@@ -478,8 +884,8 @@ struct ManagerView: View {
                 }
                 .fullScreenCover(isPresented: $showTaskManager) { TaskManagerView() }
                 HStack(alignment: .top, spacing: 14) {
-                    if let environment = activeEnvironment {
-                        NavigationLink(destination: files(environment)) { HomeTile(title: "Files", symbol: "folder.fill", colors: [.cyan, .blue]) }.buttonStyle(HomeTileStyle())
+                    if let environment = currentEnvironment {
+                        NavigationLink(destination: FileSharingView(environment: environment, manager: manager, share: $share)) { HomeTile(title: "Files", symbol: "folder.fill", colors: [.cyan, .blue]) }.buttonStyle(HomeTileStyle())
                     } else { HomeTile(title: "Files", symbol: "folder.fill", colors: [.cyan, .blue]).opacity(0.4) }
                     NavigationLink(destination: LinuxUsersView()) { HomeTile(title: "Users", symbol: "person.2.fill", colors: [.green, .teal]) }.buttonStyle(HomeTileStyle())
                     NavigationLink(destination: DevicesView()) { HomeTile(title: "Devices", symbol: "cable.connector", colors: [.orange, .red]) }.buttonStyle(HomeTileStyle())
@@ -533,64 +939,136 @@ struct ManagerView: View {
         setup = true
     }
 
-    private var environmentsView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Installed").font(.title3.weight(.semibold))
-                    if manager.environments.isEmpty {
-                        Text("No Debian minimal environment installed yet. Install Debian 13 (trixie) minimal below.").font(.subheadline).foregroundColor(.secondary)
-                            .padding(16).frame(maxWidth: .infinity, alignment: .leading)
-                            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
-                    }
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 14)], spacing: 14) {
-                        ForEach(manager.environments) { environment in
-                            NavigationLink(destination: environmentDetail(environment)) {
-                                InstalledDistributionCard(name: environment.name,
-                                    version: environment.rootfsVersion, size: manager.size(environment),
-                                    active: manager.active(environment),
-                                    nextLaunch: LRRuntimeBridge.nextRootName() == environment.rootfsName && !manager.active(environment))
-                            }
-                            .buttonStyle(HomeTileStyle())
-                            .contextMenu {
-                                if !manager.active(environment) {
-                                    Button { LRRuntimeBridge.setNextRootName(environment.rootfsName); manager.refresh() } label: { Label("Use on Next Launch", systemImage: "arrow.uturn.right") }
-                                }
-                                Button(role: .destructive) { pendingEnvironmentDeletion = environment } label: { Label("Delete…", systemImage: "trash") }
-                                    .disabled(manager.busy || LRRuntimeBridge.environmentDeletionUnavailableReason(environment.rootfsName) != nil)
-                            }
-                        }
-                    }
-                }
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Debian Minimal").font(.title3.weight(.semibold))
-                    Button { startSetup() } label: {
+    private var debianEnvironmentView: some View {
+        Group {
+            if let environment = currentEnvironment {
+                let active = manager.active(environment)
+                List {
+                    Section {
                         HStack(spacing: 14) {
-                            DistroBadge(size: 48)
+                            DistroBadge(size: 56)
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("Debian 13 (trixie) Minimal").font(.headline).foregroundColor(.primary)
-                                Text("Official ARM64 minimal userspace with APT and bash, verified against Debian's signed index.")
-                                    .font(.caption).foregroundColor(.secondary).multilineTextAlignment(.leading)
-                                Label(manager.environments.isEmpty ? "Install Debian Minimal" : "Add Another Environment", systemImage: manager.environments.isEmpty ? "arrow.down.circle.fill" : "plus.circle.fill")
-                                    .font(.caption.weight(.semibold)).foregroundColor(.accentColor)
+                                Text("Debian Minimal").font(.title3.weight(.semibold))
+                                Text("\(environment.distribution) \(environment.rootfsVersion) · ARM64").font(.subheadline).foregroundColor(.secondary)
+                                HStack(spacing: 6) {
+                                    if wipeScheduled { StatusChip(text: "Wipe Pending", color: .orange) }
+                                    else if active { StatusChip(text: "Running", color: .green) }
+                                    else { StatusChip(text: "Stopped", color: .secondary) }
+                                    Text(manager.size(environment)).font(.caption).foregroundColor(.secondary)
+                                }
                             }
-                            Spacer(minLength: 0)
+                        }.padding(.vertical, 4)
+                        if active {
+                            Button { openTerminal(environment) } label: { Label("Open Terminal", systemImage: "terminal") }
+                        } else {
+                            Button { startRuntime() } label: {
+                                Label(startingRuntime ? "Starting Debian…" : "Start Debian Minimal", systemImage: "power")
+                            }
+                            .disabled(startingRuntime || !LRRuntimeBridge.canStartRuntime())
                         }
-                        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
                     }
-                    .buttonStyle(HomeTileStyle()).disabled(manager.busy).accessibilityIdentifier("Install Debian Minimal")
-                    if manager.busy { ProgressView("Preparing environment…") }
+
+                    if wipeScheduled {
+                        Section {
+                            Label("Wipe scheduled for next launch. Close DebianRunner and reopen it to erase Debian Minimal cleanly.", systemImage: "exclamationmark.triangle.fill")
+                                .font(.footnote).foregroundColor(.orange)
+                            Button("Close DebianRunner Now", role: .destructive) { exit(0) }
+                        }
+                    }
+
+                    Section("Environment") {
+                        NavigationLink(destination: SSHServerView(ssh: ssh)) {
+                            HStack {
+                                Label("SSH Server", systemImage: "network")
+                                Spacer()
+                                Text(ssh.isRunning ? "Running · :\(ssh.port)" : ssh.installing ? "Installing…" : ssh.isInstalled ? "Stopped" : "Not Installed")
+                                    .font(.caption).foregroundColor(ssh.isRunning ? .green : .secondary)
+                            }
+                        }
+                        if active {
+                            NavigationLink(destination: PackageView(environment: environment, manager: manager, run: run)) { Label("Packages (APT)", systemImage: "shippingbox") }
+                            NavigationLink(destination: LinuxUsersView()) { Label("Linux Users", systemImage: "person.2") }
+                        }
+                        NavigationLink(destination: FileSharingView(environment: environment, manager: manager, share: $share)) { Label("Files & Apple Files", systemImage: "folder") }
+                        NavigationLink(destination: StorageManagementView(environments: manager.environments)) { Label("Storage", systemImage: "internaldrive") }
+                        if !active {
+                            Text("Start Debian Minimal to manage APT packages and Linux users.").font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+
+                    Section {
+                        Button {
+                            UserDefaults.standard.set(environment.rootfsName, forKey: "LinuxRunnerSetup.root")
+                            LRRuntimeBridge.setNextRootName(environment.rootfsName)
+                            setupStep = active ? SetupStep.account.rawValue : SetupStep.relaunch.rawValue
+                            setup = true
+                        } label: { Label("Continue Setup / Account", systemImage: "wrench.and.screwdriver") }
+                    } footer: { Text("Re-runs Linux account setup without deleting files. APT checks and repairs are in Packages.") }
+
+                    Section("Details & Launchers") {
+                        DisclosureGroup("Installation Details") {
+                            detailRow("Home", environment.homePath)
+                            detailRow("Apple Files Mount", LRRuntimeBridge.fileProviderEnabled() ? "Enabled (\(LRRuntimeBridge.activeAppGroup()))" : "Shared folder only")
+                            if let state = environment.installationState { detailRow("Installation", state) }
+                            if let result = environment.lastBootResult { detailRow("Last boot result", result) }
+                            detailRow("Created", environment.createdAt.formatted(date: .abbreviated, time: .shortened))
+                            if let last = environment.lastBootedAt { detailRow("Last started", last.formatted(date: .abbreviated, time: .shortened)) }
+                        }
+                        DisclosureGroup("Command Launchers") {
+                            ForEach(manager.environments.first(where: { $0.id == environment.id })?.applications ?? []) { app in
+                                Button { run(app) } label: { VStack(alignment: .leading) { Text(app.name); Text(([app.command] + app.arguments).joined(separator: " ")).font(.caption).foregroundColor(.secondary) } }
+                                    .disabled(!active).accessibilityIdentifier("run-\(app.name)")
+                            }
+                            NavigationLink("Create Command Launcher", destination: LauncherEditor { manager.add(application: $0, to: environment) })
+                            if active && !manager.detected.isEmpty { ForEach(manager.detected) { app in Button(app.name) { run(app) } } }
+                        }
+                    }
+
+                    Section {
+                        Button(role: .destructive) { confirmWipe = true } label: {
+                            Label(manager.busy ? "Wiping…" : "Wipe Debian Minimal…", systemImage: "trash")
+                        }
+                        .disabled(manager.busy)
+                        .accessibilityIdentifier("Wipe Debian Minimal")
+                    } header: { Text("Reset Environment") } footer: {
+                        Text("Erases your Debian Minimal root filesystem, packages, Linux home files, SSH host keys, and Shared files so you can reinstall from scratch. Export any files you want to keep first.")
+                    }
                 }
-                Text("Each environment keeps its own APT packages and files. One runs at a time; switching takes effect when DebianRunner is reopened.")
-                    .font(.footnote).foregroundColor(.secondary)
+                .listStyle(.insetGrouped)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        Button { startSetup() } label: {
+                            HStack(spacing: 14) {
+                                DistroBadge(size: 56)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Debian 13 (trixie) Minimal").font(.headline).foregroundColor(.primary)
+                                    Text("Official ARM64 minimal userspace with APT, bash, built-in OpenSSH server, and Apple Files access.")
+                                        .font(.caption).foregroundColor(.secondary).multilineTextAlignment(.leading)
+                                    Label("Install Debian Minimal", systemImage: "arrow.down.circle.fill")
+                                        .font(.subheadline.weight(.semibold)).foregroundColor(.accentColor)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(18).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
+                        }
+                        .buttonStyle(HomeTileStyle()).disabled(manager.busy).accessibilityIdentifier("Install Debian Minimal")
+                        if manager.busy { ProgressView("Preparing environment…") }
+                    }
+                    .padding(.horizontal, 20).padding(.top, 16).padding(.bottom, 96)
+                }
+                .background(Color(.systemGroupedBackground).ignoresSafeArea())
             }
-            .padding(.horizontal, 20).padding(.top, 12).padding(.bottom, 96)
-            .frame(maxWidth: 980).frame(maxWidth: .infinity)
         }
-        .background(Color(.systemGroupedBackground).ignoresSafeArea())
-        .navigationTitle("Environments")
-        .toolbar { Button { manager.refresh() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh Environments") }
+        .navigationTitle("Debian Minimal")
+        .toolbar {
+            Button {
+                runtimeRunning = LRRuntimeBridge.isRunning()
+                manager.refresh()
+                if runtimeRunning { ssh.refresh(queryGuest: true) }
+            } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh Debian Minimal")
+        }
     }
 
     private var appVersion: String {
@@ -611,13 +1089,6 @@ struct ManagerView: View {
                 }.padding(.vertical, 6)
             }
             Section {
-                NavigationLink(destination: ModesView()) {
-                    HStack {
-                        SettingsLabel("DebianRunner Modes", "sparkles", .purple)
-                        Spacer()
-                        Text("Agent · SSH · Liftoff · Pocket").font(.caption).foregroundColor(.secondary)
-                    }
-                }
                 Picker(selection: $appearance) { Text("Dark").tag("dark"); Text("Light").tag("light"); Text("System").tag("system") } label: { SettingsLabel("Appearance", "circle.lefthalf.filled", .indigo) }
                 Toggle(isOn: $keepScreenAwake) { SettingsLabel("Keep Screen Awake", "sun.max.fill", .orange) }
                 Toggle(isOn: Binding(get: { LongTaskCenter.notificationsEnabled }, set: { LongTaskCenter.notificationsEnabled = $0 })) { SettingsLabel("Notify When Tasks Finish", "bell.badge.fill", .red) }
@@ -626,7 +1097,9 @@ struct ManagerView: View {
                 Picker(selection: Binding(get: { InstallScreensaver.minutes }, set: { InstallScreensaver.minutes = $0 })) {
                     Text("Off").tag(0); Text("3 minutes").tag(3); Text("4 minutes").tag(4); Text("5 minutes").tag(5)
                 } label: { SettingsLabel("Install Screensaver", "moon.zzz.fill", .purple) }
-            } header: { Text("General") }
+            } header: { Text("General") } footer: {
+                Text("Keep Linux Running in Background uses a background location session so SSH connections and long tasks stay alive when you switch apps.")
+            }
             Section("Performance") {
                 NavigationLink(destination: SystemResourcesView()) { SettingsLabel("CPU & Memory", "speedometer", .indigo) }
             }
@@ -634,10 +1107,11 @@ struct ManagerView: View {
                 NavigationLink(destination: TerminalSettingsView()) { SettingsLabel("Terminal & Keyboard", "keyboard.fill", .gray) }
             }
             Section("Linux Environment") {
+                NavigationLink(destination: SSHServerView(ssh: ssh)) { SettingsLabel("SSH Server", "network", .green) }
                 NavigationLink(destination: LinuxUsersView()) { SettingsLabel("Linux Users", "person.2.fill", .blue) }
-                NavigationLink(destination: FileSharingView(environment: activeEnvironment, manager: manager, share: $share)) { SettingsLabel("File Sharing", "folder.fill", .cyan) }
+                NavigationLink(destination: FileSharingView(environment: currentEnvironment, manager: manager, share: $share)) { SettingsLabel("File Sharing", "folder.fill", .cyan) }
                 NavigationLink(destination: DevicesView()) { SettingsLabel("Devices", "cable.connector", .orange) }
-                NavigationLink(destination: NetworkDiagnosticsView()) { SettingsLabel("Network", "network", .blue) }
+                NavigationLink(destination: NetworkDiagnosticsView()) { SettingsLabel("Network", "wifi", .blue) }
             }
             Section("Storage & Maintenance") {
                 NavigationLink(destination: StorageManagementView(environments: manager.environments)) { SettingsLabel("Storage", "internaldrive.fill", .gray) }
@@ -682,77 +1156,6 @@ struct ManagerView: View {
             let controller = LRRuntimeBridge.terminal(forCommand: [application.command] + application.arguments, directory: application.workingDirectory)
             session = TerminalPresentation(controller: controller)
         } catch { manager.error = error.localizedDescription }
-    }
-
-    private func environmentDetail(_ environment: LinuxEnvironment) -> some View {
-        let active = manager.active(environment)
-        return List {
-            Section {
-                HStack(spacing: 14) {
-                    DistroBadge(size: 54)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(environment.name).font(.title3.weight(.semibold))
-                        Text("\(environment.distribution) \(environment.rootfsVersion) · ARM64").font(.subheadline).foregroundColor(.secondary)
-                        HStack(spacing: 6) {
-                            if active { StatusChip(text: "Active", color: .green) }
-                            else if LRRuntimeBridge.nextRootName() == environment.rootfsName { StatusChip(text: "Next launch", color: .accentColor) }
-                            else { StatusChip(text: "Installed", color: .secondary) }
-                            Text(manager.size(environment)).font(.caption).foregroundColor(.secondary)
-                        }
-                    }
-                }.padding(.vertical, 4)
-                if active {
-                    Button { openTerminal(environment) } label: { Label("Open Terminal", systemImage: "terminal") }
-                } else {
-                    Button {
-                        LRRuntimeBridge.setNextRootName(environment.rootfsName)
-                        manager.error = "\(environment.name) will start next time. Close DebianRunner from the app switcher and open it again. Files are kept."
-                    } label: { Label("Use on Next Launch", systemImage: "arrow.uturn.right.circle") }
-                }
-            }
-            Section("Manage") {
-                if active {
-                    NavigationLink(destination: PackageView(environment: environment, manager: manager, run: run)) { Label("Packages (APT)", systemImage: "shippingbox") }
-                    NavigationLink(destination: LinuxUsersView()) { Label("Linux Users", systemImage: "person.2") }
-                }
-                NavigationLink(destination: files(environment)) { Label("Files", systemImage: "folder") }
-                NavigationLink(destination: StorageManagementView(environments: manager.environments)) { Label("Storage", systemImage: "internaldrive") }
-                if !active { Text("Packages and users are available while this environment is running.").font(.caption).foregroundColor(.secondary) }
-            }
-            Section {
-                Button {
-                    UserDefaults.standard.set(environment.rootfsName, forKey: "LinuxRunnerSetup.root")
-                    LRRuntimeBridge.setNextRootName(environment.rootfsName)
-                    setupStep = active ? SetupStep.account.rawValue : SetupStep.relaunch.rawValue
-                    setup = true
-                } label: { Label("Continue Setup / Account", systemImage: "wrench.and.screwdriver") }
-            } footer: { Text("Re-runs account setup without deleting files. APT package checks are in Packages.") }
-            Section("Advanced") {
-                DisclosureGroup("Installation Details") {
-                    detailRow("Home", environment.homePath)
-                    if let state = environment.installationState { detailRow("Installation", state) }
-                    if let result = environment.lastBootResult { detailRow("Last boot result", result) }
-                    detailRow("Created", environment.createdAt.formatted(date: .abbreviated, time: .shortened))
-                    if let last = environment.lastBootedAt { detailRow("Last started", last.formatted(date: .abbreviated, time: .shortened)) }
-                }
-                DisclosureGroup("Command Launchers") {
-                    ForEach(manager.environments.first(where: { $0.id == environment.id })?.applications ?? []) { app in
-                        Button { run(app) } label: { VStack(alignment: .leading) { Text(app.name); Text(([app.command] + app.arguments).joined(separator: " ")).font(.caption).foregroundColor(.secondary) } }
-                            .disabled(!active).accessibilityIdentifier("run-\(app.name)")
-                    }
-                    NavigationLink("Create Command Launcher", destination: LauncherEditor { manager.add(application: $0, to: environment) })
-                    if active && !manager.detected.isEmpty { ForEach(manager.detected) { app in Button(app.name) { run(app) } } }
-                }
-            }
-            Section {
-                Button(role: .destructive) { pendingEnvironmentDeletion = environment } label: { Label("Delete Environment…", systemImage: "trash") }
-                    .disabled(manager.busy || LRRuntimeBridge.environmentDeletionUnavailableReason(environment.rootfsName) != nil)
-            } footer: {
-                Text(LRRuntimeBridge.environmentDeletionUnavailableReason(environment.rootfsName) ?? "Deletes this environment's packages and files. Export important files first.")
-            }
-        }
-        .listStyle(.insetGrouped)
-        .navigationTitle(environment.name).navigationBarTitleDisplayMode(.inline)
     }
 
     private func detailRow(_ title: String, _ value: String) -> some View {
@@ -939,7 +1342,7 @@ struct PackageView: View {
             }
             if let error { Text(error).foregroundColor(.red) }
         }.navigationTitle("APT Package Manager")
-        .onAppear { resultsVisible = true; readResults(); manager.refresh() }.onReceive(timer) { _ in readResults() }
+        .onAppear { resultsVisible = true; readResults(); manager.refresh() }.onReceive(timer) { _ in if UIApplication.shared.applicationState == .active { readResults() } }
         .onDisappear { resultsVisible = false; resultReadID = nil }
         .onChange(of: environment.rootfsName) { _ in
             resultReadID = nil; packages = []; details = ""; log = ""; previousResult = ""
@@ -1045,6 +1448,31 @@ private struct FileSharingView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
+                let fpEnabled = LRRuntimeBridge.fileProviderEnabled()
+                LRCard(title: "Apple Files (Full Linux /)", symbol: "externaldrive.fill.badge.checkmark", colors: [.indigo, .blue], value: fpEnabled ? "Mounted" : "App Group Required") {
+                    if fpEnabled {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label { Text("Files › Browse › Locations › DebianRunner › Debian Minimal").font(.caption).textSelection(.enabled) } icon: { Image(systemName: "folder.badge.gearshape") }
+                            Text("Browse and edit the entire Debian Minimal root filesystem directly inside Apple's native Files app (enable DebianRunner under Locations › Edit in Files if hidden).")
+                                .font(.caption)
+                        }.foregroundStyle(.secondary)
+                        HStack(spacing: 10) {
+                            Button {
+                                if let url = URL(string: "shareddocuments://") { openURL(url) }
+                            } label: { Label("Open Files", systemImage: "arrow.up.forward.app").lineLimit(1) }
+                            .buttonStyle(.borderedProminent)
+                            Button {
+                                LRRuntimeBridge.refreshFileProviderDomains()
+                                message = "Refreshed Apple Files rootfs registration."
+                            } label: { Label("Refresh Mount", systemImage: "arrow.clockwise") }
+                            .buttonStyle(.bordered)
+                        }.font(.subheadline.weight(.semibold)).controlSize(.small)
+                    } else {
+                        Text("To mount the full Debian root filesystem under Apple Files › Locations › DebianRunner, sign DebianRunner and its File Provider extension with an App Group entitlement (for example via AltStore, SideStore, Sideloadly, or Xcode). Until then, use DebianRunner Shared below.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+
                 if let environment {
                     let iosURL = LRRuntimeBridge.sharedExchangeURL(environment.rootfsName)
                     LRCard(title: "DebianRunner Shared", symbol: "folder.fill", colors: [.cyan, .blue], value: LRRuntimeBridge.isRunning() ? "Mounted" : "When Linux runs") {
@@ -1382,7 +1810,7 @@ struct DeveloperDiagnosticsView: View {
                     if let failure { Text(failure).foregroundColor(.red) }
                 }
             }.navigationTitle("Developer Diagnostics").toolbar { Button("Done") { dismiss() } }
-        }.navigationViewStyle(.stack).onAppear(perform: refresh).onReceive(tick) { _ in refresh() }.sheet(item: $share) { ShareView(item: $0) }
+        }.navigationViewStyle(.stack).onAppear(perform: refresh).onReceive(tick) { _ in if UIApplication.shared.applicationState == .active { refresh() } }.sheet(item: $share) { ShareView(item: $0) }
     }
     private func refresh() { entries = LRRuntimeBridge.diagnosticEntries().compactMap { $0 as? [String: Any] }; health = LRRuntimeBridge.healthSummary() as? [String: Any] ?? [:] }
 }
@@ -1488,7 +1916,7 @@ struct ExecutionEngineView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             if requested { requested = false; activate() } else { refresh() }
         }
-        .onReceive(ticker) { _ in refresh() }
+        .onReceive(ticker) { _ in if UIApplication.shared.applicationState == .active { refresh() } }
     }
     private var jitStateIcon: String {
         switch report["state"] as? String {
@@ -1661,7 +2089,7 @@ private struct DevicesView: View {
         }
         .background(Color(.systemGroupedBackground).ignoresSafeArea())
         .navigationTitle("Devices").navigationBarTitleDisplayMode(.inline)
-        .onAppear(perform: refresh).onReceive(timer) { _ in refresh() }
+        .onAppear(perform: refresh).onReceive(timer) { _ in if UIApplication.shared.applicationState == .active { refresh() } }
         .alert(selected?.name ?? "", isPresented: Binding(get: { selected != nil }, set: { if !$0 { selected = nil } })) {
             Button("OK", role: .cancel) { selected = nil }
         } message: { Text(selected.map { "\($0.detected)\n\n\($0.linux)" } ?? "") }
@@ -2304,7 +2732,7 @@ struct TaskManagerView: View {
         .navigationViewStyle(.stack)
         .preferredColorScheme(.dark)
         .onAppear { sampler.sample() }
-        .onReceive(timer) { _ in sampler.sample() }
+        .onReceive(timer) { _ in if UIApplication.shared.applicationState == .active { sampler.sample() } }
         .sheet(item: $selected) { ProcessDetailView(process: $0, sampler: sampler) }
     }
 

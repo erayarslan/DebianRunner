@@ -33,6 +33,11 @@ NS_ASSUME_NONNULL_BEGIN
 #endif
 - (BOOL)exportRootNamed:(NSString *)name toArchive:(NSURL *)archive error:(NSError **)error progressReporter:(id<ProgressReporter> _Nullable)progress;
 - (BOOL)destroyRootNamed:(NSString *)name error:(NSError **)error;
+#ifdef LINUXRUNNER
+- (BOOL)forceDestroyAllRoots:(NSError **)error;
+- (void)syncFileProviderDomains;
+- (void)removeAllFileProviderDomains;
+#endif
 - (BOOL)renameRoot:(NSString *)name toName:(NSString *)newName error:(NSError **)error;
 
 @end
