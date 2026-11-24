@@ -77,10 +77,10 @@ struct exec_args {
 struct exec_ids { uid_t_ euid; uid_t_ egid; bool secure; };
 
 static inline addr_t align_stack(addr_t sp);
-static inline ssize_t user_strlen(addr_t p);
+static inline __attribute__((unused)) ssize_t user_strlen(addr_t p);
 static inline int user_memset(addr_t start, byte_t val, dword_t len);
 static inline addr_t copy_string(addr_t sp, const char *string);
-static inline addr_t args_copy(addr_t sp, struct exec_args args);
+static inline addr_t args_copy(addr_t sp, struct exec_args args, size_t size);
 static size_t args_size(struct exec_args args);
 
 static int read_header(struct fd *fd, exec_elf_header *header) {
@@ -351,8 +351,29 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 
     // STACK TIME!
 
-    // ARM64: stack near top of 48-bit address space
-    if ((err = pt_map_nothing(current->mem, STACK_INIT_PAGE, 1, stack_prot)) < 0)
+    // ARM64: stack near top of 48-bit address space. Pre-map enough pages to
+    // cover argv, envp, executable name, pointer/auxv tables, plus 8 KiB of
+    // initial headroom so args_copy and loader startup don't fault-grow page by page.
+    size_t argv_bytes = args_size(argv);
+    size_t envp_bytes = args_size(envp);
+    size_t file_bytes = strlen(file) + 1;
+    size_t ptrs_bytes = ((argv.count + 1) + (envp.count + 1) + 1) * ELF_PTR_SIZE;
+    pages_t stack_pages = PAGE_ROUND_UP(argv_bytes + envp_bytes + file_bytes + ptrs_bytes + 8192);
+    rlim_t_ stack_limit = rlimit(RLIMIT_STACK_);
+    if (stack_limit != RLIM_INFINITY_) {
+        pages_t max_stack_pages = stack_limit / PAGE_SIZE;
+        if (max_stack_pages < 1)
+            max_stack_pages = 1;
+        if (stack_pages > max_stack_pages)
+            stack_pages = max_stack_pages;
+    }
+    if (stack_pages > STACK_TOP_PAGE - MMAP_HOLE_START)
+        stack_pages = STACK_TOP_PAGE - MMAP_HOLE_START;
+    if (stack_pages < 1)
+        stack_pages = 1;
+    if (stack_pages > 1 && !pt_is_hole(current->mem, STACK_TOP_PAGE - stack_pages, stack_pages))
+        stack_pages = 1;
+    if ((err = pt_map_nothing(current->mem, STACK_TOP_PAGE - stack_pages, stack_pages, stack_prot)) < 0)
         goto beyond_hope;
     if ((err = pt_map_nothing(current->mem, STACK_TOP_PAGE, 1, P_READ)) < 0)
         goto beyond_hope;
@@ -369,12 +390,12 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     if (sp == 0)
         goto out_free_interp;
     current->mm->env_end = sp;
-    addr_t envp_addr = sp = args_copy(sp, envp);
+    addr_t envp_addr = sp = args_copy(sp, envp, envp_bytes);
     if (sp == 0)
         goto out_free_interp;
     current->mm->env_start = sp;
     current->mm->argv_end = sp;
-    addr_t argv_addr = sp = args_copy(sp, argv);
+    addr_t argv_addr = sp = args_copy(sp, argv, argv_bytes);
     if (sp == 0)
         goto out_free_interp;
     current->mm->argv_start = sp;
@@ -429,23 +450,30 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     addr_t p = sp;
 
     // argc
-    {uint64_t argc64 = argv.count; if (user_put(p, argc64)) return _EFAULT;}
+    {uint64_t argc64 = argv.count; if (user_put(p, argc64)) goto out_free_interp;}
     p += ELF_PTR_SIZE;
 
-    // argv
+    // argv — compute string lengths directly from host argv.args instead of
+    // re-scanning guest memory with user_strlen.
+    const char *argv_str = argv.args;
     size_t argc = argv.count;
     while (argc-- > 0) {
-        {uint64_t ptr64 = argv_addr; if (user_put(p, ptr64)) return _EFAULT;}
-        argv_addr += user_strlen(argv_addr) + 1;
+        {uint64_t ptr64 = argv_addr; if (user_put(p, ptr64)) goto out_free_interp;}
+        size_t len = strlen(argv_str) + 1;
+        argv_addr += len;
+        argv_str += len;
         p += ELF_PTR_SIZE;
     }
     p += ELF_PTR_SIZE; // null terminator
 
-    // envp
+    // envp — compute string lengths directly from host envp.args.
+    const char *envp_str = envp.args;
     size_t envc = envp.count;
     while (envc-- > 0) {
-        {uint64_t ptr64 = envp_addr; if (user_put(p, ptr64)) return _EFAULT;}
-        envp_addr += user_strlen(envp_addr) + 1;
+        {uint64_t ptr64 = envp_addr; if (user_put(p, ptr64)) goto out_free_interp;}
+        size_t len = strlen(envp_str) + 1;
+        envp_addr += len;
+        envp_str += len;
         p += ELF_PTR_SIZE;
     }
     p += ELF_PTR_SIZE; // null terminator
@@ -453,7 +481,7 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     // copy auxv
     current->mm->auxv_start = p;
     if (user_put(p, aux))
-        goto beyond_hope;
+        goto out_free_interp;
     p += sizeof(aux);
     current->mm->auxv_end = p;
 
@@ -510,29 +538,63 @@ static inline addr_t copy_string(addr_t sp, const char *string) {
     return sp;
 }
 
-static inline addr_t args_copy(addr_t sp, struct exec_args args) {
-    size_t size = args_size(args);
+static inline addr_t args_copy(addr_t sp, struct exec_args args, size_t size) {
     sp -= size;
     if (user_write(sp, args.args, size))
         return 0;
     return sp;
 }
 
-static inline ssize_t user_strlen(addr_t p) {
-    size_t i = 0;
-    char c;
-    do {
-        if (user_get(p + i, c))
+static inline __attribute__((unused)) ssize_t user_strlen(addr_t p) {
+    struct mem *mem = __atomic_load_n(&current->mem, __ATOMIC_ACQUIRE);
+    if (mem == NULL)
+        return -1;
+    read_wrlock(&mem->lock);
+    size_t len = 0;
+    for (;;) {
+        if (len > UINT64_MAX - p) {
+            read_wrunlock(&mem->lock);
             return -1;
-        i++;
-    } while (c != '\0');
-    return i - 1;
+        }
+        addr_t cur = p + len;
+        const char *src = mem_ptr(mem, cur, MEM_READ);
+        if (src == NULL) {
+            read_wrunlock(&mem->lock);
+            return -1;
+        }
+        size_t chunk = PAGE_SIZE - PGOFFSET(cur);
+        const char *nul = memchr(src, '\0', chunk);
+        if (nul != NULL) {
+            len += (size_t)(nul - src);
+            read_wrunlock(&mem->lock);
+            return (ssize_t)len;
+        }
+        len += chunk;
+    }
 }
 
 static inline int user_memset(addr_t start, byte_t val, dword_t len) {
-    while (len--)
-        if (user_put(start++, val))
+    if (len == 0)
+        return 0;
+    struct mem *mem = __atomic_load_n(&current->mem, __ATOMIC_ACQUIRE);
+    if (mem == NULL || len > UINT64_MAX - start)
+        return 1;
+    read_wrlock(&mem->lock);
+    addr_t p = start;
+    addr_t end = start + len;
+    while (p < end) {
+        size_t chunk = PAGE_SIZE - PGOFFSET(p);
+        if (chunk > (size_t)(end - p))
+            chunk = (size_t)(end - p);
+        char *ptr = mem_ptr(mem, p, MEM_WRITE);
+        if (ptr == NULL) {
+            read_wrunlock(&mem->lock);
             return 1;
+        }
+        memset(ptr, val, chunk);
+        p += chunk;
+    }
+    read_wrunlock(&mem->lock);
     return 0;
 }
 
@@ -807,28 +869,79 @@ int do_execve(const char *file, size_t argc, const char *argv_p, const char *env
 }
 
 static ssize_t user_read_string_array(addr_t addr, char *buf, size_t max) {
+    struct mem *mem = __atomic_load_n(&current->mem, __ATOMIC_ACQUIRE);
+    if (mem == NULL)
+        return _EFAULT;
+    read_wrlock(&mem->lock);
     size_t i = 0;
     size_t p = 0;
     for (;;) {
-        uint64_t str_addr64;
-        if (user_get(addr + i * ELF_PTR_SIZE, str_addr64))
+        if (i > (UINT64_MAX - addr) / ELF_PTR_SIZE) {
+            read_wrunlock(&mem->lock);
             return _EFAULT;
+        }
+        addr_t ptr_addr = addr + i * ELF_PTR_SIZE;
+        uint64_t str_addr64 = 0;
+        size_t ptr_rem = PAGE_SIZE - PGOFFSET(ptr_addr);
+        if (ptr_rem >= sizeof(str_addr64)) {
+            const void *pptr = mem_ptr(mem, ptr_addr, MEM_READ);
+            if (pptr == NULL) {
+                read_wrunlock(&mem->lock);
+                return _EFAULT;
+            }
+            memcpy(&str_addr64, pptr, sizeof(str_addr64));
+        } else {
+            const char *p1 = mem_ptr(mem, ptr_addr, MEM_READ);
+            if (p1 == NULL || ptr_addr > UINT64_MAX - ptr_rem) {
+                read_wrunlock(&mem->lock);
+                return _EFAULT;
+            }
+            const char *p2 = mem_ptr(mem, ptr_addr + ptr_rem, MEM_READ);
+            if (p2 == NULL) {
+                read_wrunlock(&mem->lock);
+                return _EFAULT;
+            }
+            char raw[sizeof(str_addr64)];
+            memcpy(raw, p1, ptr_rem);
+            memcpy(raw + ptr_rem, p2, sizeof(str_addr64) - ptr_rem);
+            memcpy(&str_addr64, raw, sizeof(str_addr64));
+        }
         addr_t str_addr = (addr_t) str_addr64;
         if (str_addr == 0)
             break;
-        size_t str_p = 0;
-        for (;;) {
-            if (p >= max)
+
+        size_t str_off = 0;
+        bool found_nul = false;
+        while (!found_nul) {
+            if (p >= max) {
+                read_wrunlock(&mem->lock);
                 return _E2BIG;
-            if (user_get(str_addr + str_p, buf[p]))
+            }
+            if (str_off > UINT64_MAX - str_addr) {
+                read_wrunlock(&mem->lock);
                 return _EFAULT;
-            str_p++;
-            p++;
-            if (buf[p - 1] == '\0')
-                break;
+            }
+            addr_t cur = str_addr + str_off;
+            const char *src = mem_ptr(mem, cur, MEM_READ);
+            if (src == NULL) {
+                read_wrunlock(&mem->lock);
+                return _EFAULT;
+            }
+            size_t chunk = PAGE_SIZE - PGOFFSET(cur);
+            if (chunk > max - p)
+                chunk = max - p;
+            const char *nul = memchr(src, '\0', chunk);
+            if (nul != NULL) {
+                chunk = (size_t)(nul - src) + 1;
+                found_nul = true;
+            }
+            memcpy(buf + p, src, chunk);
+            p += chunk;
+            str_off += chunk;
         }
         i++;
     }
+    read_wrunlock(&mem->lock);
     if (p >= max)
         return _E2BIG;
     buf[p] = '\0';

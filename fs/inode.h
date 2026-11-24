@@ -15,6 +15,7 @@ struct inode_data {
     struct list chain;
 
     struct list posix_locks;
+    _Atomic uint32_t posix_lock_count;
     cond_t posix_unlock;
 
     uint32_t socket_id;
@@ -36,7 +37,7 @@ void inode_release(struct inode_data *inode);
 extern lock_t inodes_lock;
 struct inode_data *inode_get_unlocked(struct mount *mount, ino_t inode);
 
-// calls mount->fs->inode_orphaned if this inode is orphaned, while holding indoes_lock
+// calls mount->fs->inode_orphaned if this inode is orphaned (after releasing inodes_lock)
 void inode_check_orphaned(struct mount *mount, ino_t ino);
 
 // file locking stuff (maybe should go in kernel/calls.h?)

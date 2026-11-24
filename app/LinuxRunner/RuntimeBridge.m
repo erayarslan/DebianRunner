@@ -82,6 +82,13 @@ __attribute__((constructor)) static void LRProcessStarted(void) {
     const char message[] = "[BOOT] process started (C constructor)\n";
     write(STDERR_FILENO, message, sizeof(message) - 1);
 }
+static void LRBootLogSync(void) {
+    int saved = errno;
+    pthread_mutex_lock(&bootLogLock);
+    if (bootLogFD >= 0) fsync(bootLogFD);
+    pthread_mutex_unlock(&bootLogLock);
+    errno = saved;
+}
 void LRBootEvent(const char *message) {
     if (!message) return;
     int saved = errno;
@@ -92,7 +99,13 @@ void LRBootEvent(const char *message) {
     if (n > 0) {
         size_t count = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
         write(STDERR_FILENO, line, count);
-        if (bootLogFD >= 0) { struct stat st; if (fstat(bootLogFD, &st) == 0 && st.st_size < 1024 * 1024) { write(bootLogFD, line, count); fsync(bootLogFD); } }
+        if (bootLogFD >= 0) {
+            struct stat st;
+            if (fstat(bootLogFD, &st) == 0 && st.st_size < 1024 * 1024) {
+                write(bootLogFD, line, count);
+                if (strstr(lastMilestone, "FATAL") != NULL) fsync(bootLogFD);
+            }
+        }
         os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "%{public}s", lastMilestone);
     }
     pthread_mutex_unlock(&bootLogLock);
@@ -151,6 +164,7 @@ extern void (*runtime_guest_fault)(int, int, const char *, uint64_t, uint64_t, i
 extern void (*runtime_fault_context)(const char *);
 static void LRGuestFault(int pid,int ppid,const char *comm,uint64_t pc,uint64_t sp,int signal,uint64_t address,uint32_t instruction) {
     char line[300];snprintf(line,sizeof line,"guest fault pid=%d ppid=%d comm=%.16s signal=%d pc=%#llx sp=%#llx address=%#llx instruction=%#x",pid,ppid,comm,signal,(unsigned long long)pc,(unsigned long long)sp,(unsigned long long)address,instruction);LRBootEvent(line);
+    LRBootLogSync();
     @autoreleasepool {
         char executable[MAX_PATH] = "";
         if(current && current->mm && current->mm->exefile) generic_getpath(current->mm->exefile,executable);
@@ -168,7 +182,10 @@ static void LRGuestOutput(int tid,int tgid,int fd,const char *text) {
     }
 }
 extern void (*runtime_guest_terminated)(int,int,int);
-static void LRGuestTerminated(int tid,int signal,int exitCode) { @autoreleasepool { [LRGuestCrashCenter finish:tid signal:signal exitCode:exitCode]; } }
+static void LRGuestTerminated(int tid,int signal,int exitCode) {
+    if (signal != 0) LRBootLogSync();
+    @autoreleasepool { [LRGuestCrashCenter finish:tid signal:signal exitCode:exitCode]; }
+}
 static void LRFaultContext(const char *line) {
     LRBootEvent(line);
     @autoreleasepool { [LRGuestCrashCenter append:[NSString stringWithUTF8String:line]?:@"" tid:current?current->pid:0]; }
@@ -190,6 +207,13 @@ static void LRObserveCompletedCall(int tid,int pid,unsigned number,const uint64_
         [LRDiagnosticCenter record:lifecycle?@"PROCESS":@"SYSCALL" severity:result<0?1:2 message:message pid:pid tid:tid];
     }
 }
+static void LRUpdateSyscallResultObserver(void) {
+    // Only attach the completed-syscall observer when verbose diagnostics
+    // (DEBUG/TRACE) or an explicit PID/syscall filter is active; default INFO
+    // leaves it NULL for zero per-syscall overhead.
+    bool active = atomic_load(&diagnosticLevel) >= 3 || atomic_load(&diagnosticPID) >= 0 || atomic_load(&diagnosticSyscall) >= 0;
+    __atomic_store_n(&runtime_syscall_result_observer, active ? LRObserveCompletedCall : NULL, __ATOMIC_RELEASE);
+}
 extern void (*runtime_memory_failure)(const char *, uint64_t, uint64_t, int, int, int);
 
 extern int fakefs_bind_mount(const char *, const char *, bool);
@@ -206,6 +230,7 @@ static void instructionFailure(int pid, uint64_t pc, uint32_t instruction) {
         [LRRuntimeBridge logCategory:@"LOADER" event:[NSString stringWithFormat:
             @"unsupported instruction pid=%d pc=0x%llx encoding=0x%08x", pid, (unsigned long long)pc, instruction]];
     }
+    LRBootLogSync();
 }
 
 static NSError *lrError(int code, NSString *message) {
@@ -383,9 +408,14 @@ static struct lr_transfer_control LRTransferCallbacks(LRTransferControl *control
     if (!Roots.instance.defaultRoot) return NO;
     bootAttempted = YES;
 #if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
-    // Leave room for guest data and UIKit within the iOS app limit.
-    setenv("ISH_CODE_CAP_MB", "32", 0);
-    setenv("ISH_CODE_IDLE_FLUSH_S", "5", 0);
+    // Scale the Asbestos translation cache cap with device RAM while leaving
+    // headroom for guest data and UIKit within the iOS app memory limit.
+    unsigned long long physMem = NSProcessInfo.processInfo.physicalMemory;
+    const char *codeCapMB = physMem >= (10ULL << 30) ? "96"
+                          : physMem >= (7ULL << 30)  ? "64"
+                          : "32";
+    setenv("ISH_CODE_CAP_MB", codeCapMB, 0);
+    setenv("ISH_CODE_IDLE_FLUSH_S", "60", 0);
 #endif
     extern void arm64_memory_pc_fusion_set_enabled_from_env(const char *);
     id fusionSetting = [NSUserDefaults.standardUserDefaults objectForKey:@"LinuxRunner.experimentalMemoryPCFusion"];
@@ -412,7 +442,7 @@ static struct lr_transfer_control LRTransferCallbacks(LRTransferControl *control
     id networkView=[NSUserDefaults.standardUserDefaults objectForKey:@"LinuxRunnerNetworkInterfaceView"];
     setenv("ISH_NETLINK_STUB",(!networkView||[networkView boolValue])?"1":"0",1);
     LRBootEvent("read-only host network interface compatibility configured; XNU retains network ownership");
-    runtime_syscall_observer = LRObserveSyscall;
+    __atomic_store_n(&runtime_syscall_observer, LRObserveSyscall, __ATOMIC_RELEASE);
     runtime_guest_fault = LRGuestFault;
     runtime_fault_context = LRFaultContext;
     runtime_guest_terminated = LRGuestTerminated;
@@ -422,8 +452,10 @@ static struct lr_transfer_control LRTransferCallbacks(LRTransferControl *control
     runtime_memory_failure = LRObserveMemory;
     runtimeStartedAt=NSProcessInfo.processInfo.systemUptime;
     atomic_store(&diagnosticLevel,[NSUserDefaults.standardUserDefaults objectForKey:@"DiagnosticLevel"]?[NSUserDefaults.standardUserDefaults integerForKey:@"DiagnosticLevel"]:2);
-    atomic_store(&runtime_syscall_timing_enabled,atomic_load(&diagnosticLevel)>=3);
-    runtime_syscall_result_observer=LRObserveCompletedCall;
+    int initialLevel = atomic_load(&diagnosticLevel);
+    atomic_store(&runtime_syscall_timing_enabled, initialLevel >= 3);
+    atomic_store(&runtime_futex_pi_trace_enabled, initialLevel >= 3 && (atomic_load(&diagnosticSyscall) < 0 || atomic_load(&diagnosticSyscall) == 98));
+    LRUpdateSyscallResultObserver();
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(thermalStateChanged:) name:NSProcessInfoThermalStateDidChangeNotification object:nil];
     LRBootEvent("manual/automatic boot requested; optional numeric observers installed");
     return YES;
@@ -459,6 +491,7 @@ static struct lr_transfer_control LRTransferCallbacks(LRTransferControl *control
     atomic_store(&diagnosticLevel,level);atomic_store(&diagnosticPID,pid);atomic_store(&diagnosticSyscall,number);atomic_store(&diagnosticErrorsOnly,errorsOnly);
     atomic_store(&runtime_syscall_timing_enabled,level>=3);
     atomic_store(&runtime_futex_pi_trace_enabled,level>=3 && (number<0||number==98));
+    LRUpdateSyscallResultObserver();
     [LRDiagnosticCenter setLevel:level];
 }
 static NSString *LRThermalState(void) {
@@ -564,7 +597,15 @@ static NSString *LRThermalState(void) {
 }
 + (void)recordBoot:(NSString *)root error:(int)error {
     bootedRoot = [root copy]; bootResult = error;
+    if (error == 0) {
+        // Boot succeeded: detach the per-syscall boot-snapshot observer to avoid
+        // snapshotWriter contention and MAP_SHARED writes on every guest syscall.
+        __atomic_store_n(&runtime_syscall_observer, NULL, __ATOMIC_RELEASE);
+    }
     [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"boot result=%d backend=asbestos jit=false", error]];
+    if (error != 0) {
+        LRBootLogSync();
+    }
     if (error == 0) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [self syncServiceManagerAndAutostart];
@@ -1172,6 +1213,7 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
 
 + (void)handleDidEnterBackground {
     [self logCategory:@"LIFECYCLE" event:@"entered background"];
+    LRBootLogSync();
     if (self.isRunning) {
         sockrestart_on_suspend();
     }
@@ -2040,6 +2082,7 @@ static NSCountedSet<NSString *> *LRAwakeSet;
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"],
         jit[@"state"], jit[@"detail"], jit[@"mode"], [jit[@"debugger"] boolValue] ? @"attached" : @"none", jit[@"blocks"] ?: @0,
         self.runtimeStatus];
+    LRBootLogSync();
     if (bootSnapshot) msync(bootSnapshot, sizeof(*bootSnapshot), MS_SYNC);
     NSMutableString *text = [header mutableCopy];
     [text appendFormat:@"Device diagnostics: %@\n", [self deviceDiagnostics]];
@@ -2055,6 +2098,7 @@ static NSCountedSet<NSString *> *LRAwakeSet;
     return [[self redactDiagnosticText:text application:NO] writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:error] ? url : nil;
 }
 + (NSURL *)exportFullDiagnosticBundle:(NSError **)error {
+    LRBootLogSync();
     [LRDiagnosticCenter flush];
     NSMutableDictionary<NSString *,NSData *> *entries=[NSMutableDictionary new];
     entries[@"health.json"]=[NSJSONSerialization dataWithJSONObject:self.healthSummary options:NSJSONWritingPrettyPrinted error:nil];

@@ -270,12 +270,6 @@ struct pt_entry *mem_pt(struct mem *mem, page_t page) {
     return entry;
 }
 
-static void mem_pt_del(struct mem *mem, page_t page) {
-    struct pt_entry *entry = mem_pt(mem, page);
-    if (entry != NULL)
-        entry->data = NULL;
-}
-
 // Skip over large unallocated regions efficiently by checking intermediate levels
 void mem_page_counts(struct mem *mem, unsigned long *mapped, unsigned long *shared, unsigned long *anonymous) {
     *mapped = *shared = *anonymous = 0;
@@ -543,20 +537,23 @@ static int pt_map_accounted(struct mem *mem, page_t start, pages_t pages,
         .dest = start << PAGE_BITS,
 #endif
     };
+    // Brand-new struct data is unpublished; initialize refcount once instead of
+    // performing an atomic RMW per page.
+    atomic_init(&data->refcount, (unsigned)pages);
 
     for (page_t page = start; page < start + pages; page++) {
-        if (mem_pt(mem, page) != NULL)
-            pt_unmap(mem, page, 1);
-        data->refcount++;
         struct pt_entry *pt = mem_pt_new(mem, page);
+        if (pt->data != NULL) {
+            pt_unmap(mem, page, 1);
+            pt = mem_pt_new(mem, page);
+        }
         pt->data = data;
         pt->offset = ((page - start) << PAGE_BITS) + offset;
         pt->flags = flags;
-
     }
 #if ANON_MMAP_LIMIT_PAGES > 0
     if (!precharged && anon_page_is_charged(flags))
-        atomic_fetch_add(&anon_page_count, (long)pages);
+        atomic_fetch_add_explicit(&anon_page_count, (long)pages, memory_order_relaxed);
 #endif
     mem_changed(mem);
     return 0;
@@ -587,6 +584,8 @@ void data_release(struct data *data) {
 }
 
 int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
+    if (pages == 0)
+        return 0;
     // Reset mmap_hint if freed region is above it, so pt_find_hole can
     // reuse the freed space on the next mmap(addr=0).
     if (start + pages - 1 > mem->mmap_hint)
@@ -596,6 +595,9 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
     bool bulk_invalidate = pages > FIBER_PAGE_HASH_SIZE && start + pages >= start;
     if (bulk_invalidate) asbestos_invalidate_range(mem->mmu.asbestos, start, start + pages);
 
+#if ANON_MMAP_LIMIT_PAGES > 0
+    long anon_unmapped = 0;
+#endif
     for (page_t page = start; page < start + pages; mem_next_page(mem, &page)) {
         struct pt_entry *pt = mem_pt(mem, page);
         if (pt == NULL)
@@ -604,15 +606,19 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
         if (!bulk_invalidate) asbestos_invalidate_page(mem->mmu.asbestos, page);
         struct data *data = pt->data;
 #if ANON_MMAP_LIMIT_PAGES > 0
-        // Decrement per-page for anonymous mappings. This correctly handles
+        // Count per-page for anonymous mappings. This correctly handles
         // partial unmaps (munmap of subset of original mmap region) where the
         // data object's refcount doesn't reach 0 but the guest page is gone.
         if (anon_page_is_charged(pt->flags))
-            atomic_fetch_sub(&anon_page_count, 1);
+            anon_unmapped++;
 #endif
-        mem_pt_del(mem, page);
+        pt->data = NULL;
         data_release(data);
     }
+#if ANON_MMAP_LIMIT_PAGES > 0
+    if (anon_unmapped > 0)
+        atomic_fetch_sub_explicit(&anon_page_count, anon_unmapped, memory_order_relaxed);
+#endif
     mem_changed(mem);
     return 0;
 }
@@ -706,7 +712,9 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
 #if ANON_MMAP_LIMIT_PAGES > 0
     long accounting_delta = 0;
 #endif
-    for (page_t page = start; page < start + pages; page++) {
+    page_t end = page_range_end(start, pages);
+    bool need_host_mprotect = false;
+    for (page_t page = start; page < end; page++) {
         struct pt_entry *entry = mem_pt(mem, page);
         if (entry && (flags & P_WRITE) && (entry->flags & P_NO_SHARED_WRITE))
             return _EACCES;
@@ -715,37 +723,76 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
                 continue;
             return _ENOMEM;
         }
+        if (!entry->data->page_pool && ((flags & ~entry->flags) & (P_READ | P_WRITE)))
+            need_host_mprotect = true;
     }
-    for (page_t page = start; page < start + pages; page++) {
+
+    // Coalesce contiguous host-page ranges within each backing object into a
+    // single host mprotect() call instead of calling it 4x per 16 KiB page.
+    // Run before mutating entry->flags so a host mprotect failure never leaves
+    // guest flags claiming permissions the host rejected.
+    if (need_host_mprotect) {
+        int prot = PROT_READ | ((flags & P_WRITE) ? PROT_WRITE : 0);
+        struct data *mprot_data = NULL;
+        uintptr_t mprot_start = 0;
+        uintptr_t mprot_end = 0;
+        for (page_t page = start; page < end; mem_next_page(mem, &page)) {
+            struct pt_entry *entry = mem_pt(mem, page);
+            if (entry == NULL)
+                continue;
+            if (entry->data->page_pool || !((flags & ~entry->flags) & (P_READ | P_WRITE)))
+                continue;
+            uintptr_t host_page = ((uintptr_t)((char *)entry->data->data + entry->offset)) & ~(real_page_size - 1);
+            uintptr_t host_page_end = host_page + real_page_size;
+            if (mprot_end == 0) {
+                mprot_data = entry->data;
+                mprot_start = host_page;
+                mprot_end = host_page_end;
+            } else if (entry->data == mprot_data && host_page >= mprot_start && host_page_end <= mprot_end) {
+                // Already covered by the current pending host-page range.
+            } else if (entry->data == mprot_data && host_page == mprot_end) {
+                mprot_end = host_page_end;
+            } else {
+                if (mprotect((void *)mprot_start, mprot_end - mprot_start, prot) < 0) {
+                    int saved = errno;
+                    if (runtime_memory_failure)
+                        runtime_memory_failure("mprotect", mprot_start, mprot_end - mprot_start, prot, 0, saved);
+                    errno = saved;
+                    return errno_map();
+                }
+                mprot_data = entry->data;
+                mprot_start = host_page;
+                mprot_end = host_page_end;
+            }
+        }
+        if (mprot_end != 0) {
+            if (mprotect((void *)mprot_start, mprot_end - mprot_start, prot) < 0) {
+                int saved = errno;
+                if (runtime_memory_failure)
+                    runtime_memory_failure("mprotect", mprot_start, mprot_end - mprot_start, prot, 0, saved);
+                errno = saved;
+                return errno_map();
+            }
+        }
+    }
+
+    for (page_t page = start; page < end; mem_next_page(mem, &page)) {
         struct pt_entry *entry = mem_pt(mem, page);
         if (entry == NULL)
             continue;
         int old_flags = entry->flags;
         unsigned new_flags = flags | (old_flags & P_META_FLAGS);
-
-        // Pool slots share host permissions. Guest flags enforce each slot.
-        // Change host permissions only for separate mappings.
-        if (!entry->data->page_pool && ((flags & ~old_flags) & (P_READ|P_WRITE))) {
-            void *data = (char *) entry->data->data + entry->offset;
-            // force to be page aligned
-            data = (void *) ((uintptr_t) data & ~(real_page_size - 1));
-            int prot = PROT_READ;
-            if (flags & P_WRITE) prot |= PROT_WRITE;
-            if (mprotect(data, real_page_size, prot) < 0) {
-                int saved = errno;
-                if (runtime_memory_failure) runtime_memory_failure("mprotect", (uintptr_t)data, real_page_size, prot, 0, saved);
-                errno = saved; return errno_map();
-            }
-        }
         entry->flags = new_flags;
         if ((old_flags ^ new_flags) & P_EXEC)
             asbestos_invalidate_page(mem->mmu.asbestos, page);
 #if ANON_MMAP_LIMIT_PAGES > 0
-        int delta = (int)anon_page_is_charged(new_flags) - (int)anon_page_is_charged(old_flags);
-        atomic_fetch_add(&anon_page_count, delta);
-        accounting_delta += delta;
+        accounting_delta += (long)anon_page_is_charged(new_flags) - (long)anon_page_is_charged(old_flags);
 #endif
     }
+#if ANON_MMAP_LIMIT_PAGES > 0
+    if (accounting_delta != 0)
+        atomic_fetch_add_explicit(&anon_page_count, accounting_delta, memory_order_relaxed);
+#endif
     int err = mem_set_reservation_flags(mem, start, pages, flags);
     if (err < 0)
         return err;
@@ -762,16 +809,38 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 #if ANON_MMAP_LIMIT_PAGES > 0
     long anon_copied = 0;
 #endif
-    for (page_t page = start; page < start + pages; mem_next_page(src, &page)) {
+    page_t end = page_range_end(start, pages);
+    if (dst->reservations != NULL)
+        mem_remove_reservations(dst, start, pages);
+
+    struct data *batch_data = NULL;
+    unsigned batch_count = 0;
+    for (page_t page = start; page < end; mem_next_page(src, &page)) {
         struct pt_entry *entry = mem_pt(src, page);
         if (entry == NULL)
             continue;
-        if (pt_unmap_always(dst, page, 1) < 0)
-            return -1;
+        struct pt_entry *dst_entry = mem_pt_new(dst, page);
+        if (dst_entry->data != NULL) {
+            // Flush pending refcount increments before unmapping an existing slot.
+            if (batch_count > 0) {
+                atomic_fetch_add_explicit(&batch_data->refcount, batch_count, memory_order_relaxed);
+                batch_data = NULL;
+                batch_count = 0;
+            }
+            if (pt_unmap_always(dst, page, 1) < 0)
+                return -1;
+            dst_entry = mem_pt_new(dst, page);
+        }
         if (!(entry->flags & P_SHARED))
             entry->flags |= P_COW;
-        entry->data->refcount++;
-        struct pt_entry *dst_entry = mem_pt_new(dst, page);
+        if (entry->data == batch_data) {
+            batch_count++;
+        } else {
+            if (batch_count > 0)
+                atomic_fetch_add_explicit(&batch_data->refcount, batch_count, memory_order_relaxed);
+            batch_data = entry->data;
+            batch_count = 1;
+        }
         dst_entry->data = entry->data;
         dst_entry->offset = entry->offset;
         dst_entry->flags = entry->flags;
@@ -780,10 +849,13 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
             anon_copied++;
 #endif
     }
+    if (batch_count > 0)
+        atomic_fetch_add_explicit(&batch_data->refcount, batch_count, memory_order_relaxed);
 #if ANON_MMAP_LIMIT_PAGES > 0
     // The child process now has its own set of anonymous pages.
     // These will be decremented per-page when the child's mm is freed.
-    atomic_fetch_add(&anon_page_count, anon_copied);
+    if (anon_copied > 0)
+        atomic_fetch_add_explicit(&anon_page_count, anon_copied, memory_order_relaxed);
     if (g_trace_syscalls)
         printk("MEMORY_ACCOUNT: operation=copy-on-write tid=%d copied-pages=%ld committed-after=%ld\n", current ? current->pid : 0,
             anon_copied, atomic_load(&anon_page_count));
@@ -831,13 +903,28 @@ static void *mem_ptr_nofault(struct mem *mem, addr_t addr, int type) {
 }
 
 void *mem_ptr(struct mem *mem, addr_t addr, int type) {
-#ifndef NDEBUG
-    void *old_ptr = mem_ptr_nofault(mem, addr, type); // just for an assert
-    bool remapped = false;
-#endif
-
     page_t page = PAGE(addr);
     struct pt_entry *entry = mem_pt(mem, page);
+
+    // Fast path: single 4-level page-table walk when already mapped and permitted.
+    if (entry != NULL) {
+        unsigned flags = entry->flags;
+        if (type == MEM_READ) {
+            return (flags & P_RWX) ? (char *)entry->data->data + entry->offset + PGOFFSET(addr) : NULL;
+        }
+        if (type == MEM_EXEC) {
+            return (flags & P_EXEC) ? (char *)entry->data->data + entry->offset + PGOFFSET(addr) : NULL;
+        }
+        if (type == MEM_WRITE) {
+            if (!(flags & P_WRITE))
+                return NULL;
+            if (!(flags & P_COW)) {
+                asbestos_invalidate_page(mem->mmu.asbestos, page);
+                return (char *)entry->data->data + entry->offset + PGOFFSET(addr);
+            }
+        }
+    }
+
     extern __thread volatile sig_atomic_t in_jit;
 
     if (entry == NULL) {
@@ -869,9 +956,6 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
         // READ from their task_run_current, so write_wrlock deadlocks.
         // Use trylock: if contended, return NULL for INT_GPF retry from
         // handle_interrupt where the lock upgrade is safe.
-#ifndef NDEBUG
-        remapped = true;
-#endif
         read_wrunlock(&mem->lock);
         if (in_jit) {
             if (!write_wrtrylock(&mem->lock)) {
@@ -922,9 +1006,6 @@ check_reservation: ;
             if (current) __atomic_store_n(&current->diagnostic_memory_stage, 0, __ATOMIC_RELAXED);
             return NULL;
         }
-#ifndef NDEBUG
-        remapped = true;
-#endif
         read_wrunlock(&mem->lock);
         if (in_jit) {
             if (!write_wrtrylock(&mem->lock)) {
@@ -956,9 +1037,6 @@ have_entry:
         if (type != MEM_WRITE_PTRACE && !(entry->flags & P_WRITE))
             return NULL;
         if ((entry->flags & P_COW) || type == MEM_WRITE_PTRACE) {
-#ifndef NDEBUG
-            remapped = true;
-#endif
             read_wrunlock(&mem->lock);
             // in_jit also covers gadgets: returning a synthetic fault here
             // can replay non-restartable pre-index/writeback state. Keep the
@@ -975,41 +1053,53 @@ have_entry:
                 // than temporarily exposing shared backing or crashing the host.
                 failed = !(entry->flags & P_RWX) ||
                     (type == MEM_WRITE && !(entry->flags & P_WRITE));
+                if (!failed && type == MEM_WRITE &&
+                        entry->data->data != vdso_data &&
+                        entry->data->fd == NULL &&
+                        entry->data->size == PAGE_SIZE &&
+                        atomic_load_explicit(&entry->data->refcount, memory_order_acquire) == 1) {
+                    // Sole owner of this private single-page backing: clear
+                    // P_COW in place without allocating or copying 4 KiB.
+                    entry->flags = flags;
+                    mem_changed(mem);
+                } else {
 #if ANON_MMAP_LIMIT_PAGES > 0
-                bool precharged = !anon_page_is_charged(entry->flags) &&
-                    anon_page_is_charged(flags);
-                bool reserved = !failed && precharged && anon_pages_reserve(1);
-                if (!failed && precharged && !reserved) failed = true;
+                    bool precharged = !anon_page_is_charged(entry->flags) &&
+                        anon_page_is_charged(flags);
+                    bool reserved = !failed && precharged && anon_pages_reserve(1);
+                    if (!failed && precharged && !reserved) failed = true;
 #else
-                bool precharged = false;
+                    bool precharged = false;
 #endif
-                void *copy = MAP_FAILED;
-                struct guest_page_slab *pool = NULL;
-                if (!failed) {
-                    copy = guest_page_allocate(real_page_size, PAGE_SIZE, &pool);
-                    failed = copy == MAP_FAILED;
-                    if (failed && runtime_memory_failure) runtime_memory_failure("mmap COW", 0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, errno);
-                }
-                if (!failed) {
-                    memcpy(copy, (char *)entry->data->data + entry->offset, PAGE_SIZE);
-                    // A private CoW page still belongs to its file VMA. Keep
-                    // file identity/offset alive across replacement, even if
-                    // this was the old backing's final page reference.
-                    struct fd *backing = entry->data->fd ? fd_retain(entry->data->fd) : NULL;
-                    size_t file_offset = entry->data->file_offset + entry->offset - entry->data->mapping_offset;
-                    const char *name = entry->data->name;
-                    failed = pt_map_accounted(mem, page, 1, copy, 0, flags, precharged, pool) < 0;
+                    void *copy = MAP_FAILED;
+                    struct guest_page_slab *pool = NULL;
                     if (!failed) {
-                        struct data *replacement = mem_pt(mem, page)->data;
-                        replacement->fd = backing;
-                        replacement->file_offset = backing ? file_offset : 0;
-                        replacement->name = name;
-                    } else if (backing) fd_close(backing);
-                }
-                if (failed && copy != MAP_FAILED) guest_page_release(pool, copy, PAGE_SIZE);
+                        // CoW overwrites all PAGE_SIZE bytes immediately via memcpy.
+                        copy = guest_page_allocate_opts(real_page_size, PAGE_SIZE, &pool, false);
+                        failed = copy == MAP_FAILED;
+                        if (failed && runtime_memory_failure) runtime_memory_failure("mmap COW", 0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, errno);
+                    }
+                    if (!failed) {
+                        memcpy(copy, (char *)entry->data->data + entry->offset, PAGE_SIZE);
+                        // A private CoW page still belongs to its file VMA. Keep
+                        // file identity/offset alive across replacement, even if
+                        // this was the old backing's final page reference.
+                        struct fd *backing = entry->data->fd ? fd_retain(entry->data->fd) : NULL;
+                        size_t file_offset = entry->data->file_offset + entry->offset - entry->data->mapping_offset;
+                        const char *name = entry->data->name;
+                        failed = pt_map_accounted(mem, page, 1, copy, 0, flags, precharged, pool) < 0;
+                        if (!failed) {
+                            struct data *replacement = mem_pt(mem, page)->data;
+                            replacement->fd = backing;
+                            replacement->file_offset = backing ? file_offset : 0;
+                            replacement->name = name;
+                        } else if (backing) fd_close(backing);
+                    }
+                    if (failed && copy != MAP_FAILED) guest_page_release(pool, copy, PAGE_SIZE);
 #if ANON_MMAP_LIMIT_PAGES > 0
-                if (failed && reserved) anon_pages_unreserve(1);
+                    if (failed && reserved) anon_pages_unreserve(1);
 #endif
+                }
             }
             write_wrunlock(&mem->lock);
             read_wrlock(&mem->lock);
@@ -1019,14 +1109,7 @@ have_entry:
         asbestos_invalidate_page(mem->mmu.asbestos, page);
     }
 
-    void *ptr = mem_ptr_nofault(mem, addr, type);
-#ifndef NDEBUG
-    // OpenMinis bea892fc/57c1f142: releasing mem->lock permits another
-    // mapper or CoW resolver to replace backing. Equality is only meaningful
-    // while the original read-lock interval remained uninterrupted.
-    assert(remapped || old_ptr == NULL || old_ptr == ptr || type == MEM_WRITE_PTRACE);
-#endif
-    return ptr;
+    return mem_ptr_nofault(mem, addr, type);
 }
 
 static void *mem_mmu_translate(struct mmu *mmu, addr_t addr, int type) {

@@ -64,8 +64,8 @@ __attribute__((weak)) void *mem_ptr(struct mem *mem, addr_t addr, int type) {
 #ifdef GUEST_ARM64
 bool arm64_block_stats_enabled;
 static bool arm64_block_stats_dumped;
-static bool arm64_eager_prechain_enabled;
-static bool arm64_eager_prechain_incoming_enabled;
+static bool arm64_eager_prechain_enabled = true;
+static bool arm64_eager_prechain_incoming_enabled = true;
 static _Atomic uint64_t arm64_block_stats_entries;
 static _Atomic uint64_t arm64_block_stats_cache_hits;
 static _Atomic uint64_t arm64_block_stats_cache_misses;
@@ -621,15 +621,19 @@ static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size);
 
 // Process-wide translation memory (diagnostics: /proc/ish/memory). Blocks in a
 // translation table count; disconnected (jetsam) blocks stop counting.
-_Atomic uint64_t asbestos_stat_instances, asbestos_stat_blocks, asbestos_stat_code_words;
-_Atomic uint64_t asbestos_stat_retired_bytes;
-_Atomic uint64_t asbestos_stat_idle_flushes, asbestos_stat_cap_flushes;
+// Cache-line align hot global atomics to eliminate false sharing across threads.
+_Alignas(64) _Atomic uint64_t asbestos_stat_instances;
+_Alignas(64) _Atomic uint64_t asbestos_stat_blocks;
+_Alignas(64) _Atomic uint64_t asbestos_stat_code_words;
+_Alignas(64) _Atomic uint64_t asbestos_stat_retired_bytes;
+_Alignas(64) _Atomic uint64_t asbestos_stat_idle_flushes;
+_Alignas(64) _Atomic uint64_t asbestos_stat_cap_flushes;
 // Translated code is per address space and otherwise kept until exit: a desktop
 // session held ~575 MB, mostly start-up code of idle daemons. A space that has
-// translated nothing new for ISH_CODE_IDLE_FLUSH_S seconds (default 30) and
-// holds more than 4 MiB drops its translations; any space past ISH_CODE_CAP_MB
-// (default 128) does too. Both go through the ordinary invalidation path
-// (blocks become jetsam, freed once no thread of the space executes) and hot
+// been dormant (no execution slices) for ISH_CODE_IDLE_FLUSH_S seconds (default 30)
+// and holds more than 4 MiB drops its translations on wake; any space past
+// ISH_CODE_CAP_MB (default 128) does too. Both go through the ordinary invalidation
+// path (blocks become jetsam, freed once no thread of the space executes) and hot
 // code is translated again on demand. 0 disables either rule.
 static uint64_t asbestos_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000; }
 static uint64_t code_policy(const char *name, uint64_t fallback) { const char *v = getenv(name); return v && *v ? strtoull(v, NULL, 10) : fallback; }
@@ -638,8 +642,8 @@ static uint64_t code_cap_bytes(void) { static uint64_t v = UINT64_MAX; if (v == 
 // System memory pressure (iOS memory warnings; macOS the same): every space
 // drops its translations at its next run-slice boundary, and freed heap pages
 // go back to the system.
-_Atomic unsigned asbestos_pressure_gen;
-_Atomic uint64_t asbestos_stat_pressure_flushes;
+_Alignas(64) _Atomic unsigned asbestos_pressure_gen;
+_Alignas(64) _Atomic uint64_t asbestos_stat_pressure_flushes;
 #ifdef __APPLE__
 static void asbestos_return_free_heap(void) { malloc_zone_pressure_relief(NULL, 0); }
 static void asbestos_watch_pressure(void) {
@@ -673,6 +677,8 @@ struct asbestos *asbestos_new(struct mmu *mmu) {
     wrlock_init(&asbestos->jetsam_lock);
     atomic_init(&asbestos->invalidate_gen, 0);
     atomic_init(&asbestos->jit_active_threads, 0);
+    atomic_init(&asbestos->retired_bytes, 0);
+    atomic_init(&asbestos->jetsam_nonempty, false);
     atomic_init(&asbestos->collecting, false);
     atomic_init(&asbestos->jetsam_gen, 0);
     for (size_t i = 0; i < FIBER_CODE_SEEN_WORDS; i++)
@@ -859,7 +865,18 @@ static struct fiber_block *fiber_lookup(struct asbestos *asbestos, addr_t addr);
 static void fiber_prechain_same_page(struct asbestos *asbestos, struct fiber_block *block);
 #endif
 
+static inline size_t fiber_hash_index(addr_t addr, size_t hash_size) {
+    // hash_size is always a power of two. ARM64 instructions are 4-byte aligned,
+    // so shifting right by 2 avoids leaving 75% of hash buckets permanently empty.
+#ifdef GUEST_ARM64
+    return (size_t)((addr >> 2) & (hash_size - 1));
+#else
+    return (size_t)(addr & (hash_size - 1));
+#endif
+}
+
 static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size) {
+    assert(new_size != 0 && (new_size & (new_size - 1)) == 0);
     TRACE_(verbose, "%d resizing hash to %lu, using %lu bytes for gadgets\n", current_pid(), new_size, asbestos->mem_used);
     struct list *new_hash = calloc(new_size, sizeof(struct list));
     for (size_t i = 0; i < asbestos->hash_size; i++) {
@@ -868,7 +885,7 @@ static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size) {
         struct fiber_block *block, *tmp;
         list_for_each_entry_safe(&asbestos->hash[i], block, tmp, chain) {
             list_remove(&block->chain);
-            list_init_add(&new_hash[block->addr % new_size], &block->chain);
+            list_init_add(&new_hash[fiber_hash_index(block->addr, new_size)], &block->chain);
         }
     }
     free(asbestos->hash);
@@ -883,7 +900,11 @@ static void fiber_insert(struct asbestos *asbestos, struct fiber_block *block) {
     absent_exact_forget(asbestos, PAGE(block->end_addr));
     asbestos->mem_used += block->used;
     asbestos->num_blocks++;
-    asbestos->last_insert_ms = asbestos_now_ms();
+    if ((asbestos->insert_tick++ & 255) == 0 || asbestos->last_insert_ms == 0) {
+        uint64_t now = asbestos_now_ms();
+        __atomic_store_n(&asbestos->last_insert_ms, now, __ATOMIC_RELAXED);
+        __atomic_store_n(&asbestos->last_active_ms, now, __ATOMIC_RELAXED);
+    }
     if (code_cap_bytes() && asbestos_code_bytes(asbestos) > code_cap_bytes()) asbestos->flush_requested = true;
     atomic_fetch_add_explicit(&asbestos_stat_blocks, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&asbestos_stat_code_words, block->used, memory_order_relaxed);
@@ -891,7 +912,7 @@ static void fiber_insert(struct asbestos *asbestos, struct fiber_block *block) {
     if (asbestos->num_blocks >= asbestos->hash_size * 2)
         fiber_resize_hash(asbestos, asbestos->hash_size * 2);
 
-    list_init_add(&asbestos->hash[block->addr % asbestos->hash_size], &block->chain);
+    list_init_add(&asbestos->hash[fiber_hash_index(block->addr, asbestos->hash_size)], &block->chain);
     asbestos->page_hash[PAGE(block->addr) % FIBER_PAGE_HASH_SIZE].absent_valid[0] = false;
     list_init_add(blocks_list(asbestos, PAGE(block->addr), 0), &block->page[0]);
     if (PAGE(block->addr) != PAGE(block->end_addr)) {
@@ -905,7 +926,7 @@ static void fiber_insert(struct asbestos *asbestos, struct fiber_block *block) {
 }
 
 static struct fiber_block *fiber_lookup(struct asbestos *asbestos, addr_t addr) {
-    struct list *bucket = &asbestos->hash[addr % asbestos->hash_size];
+    struct list *bucket = &asbestos->hash[fiber_hash_index(addr, asbestos->hash_size)];
     if (list_null(bucket))
         return NULL;
     struct fiber_block *block;
@@ -1135,7 +1156,9 @@ static void fiber_block_retire(struct asbestos *asbestos, struct fiber_block *bl
     list_add(&asbestos->jetsam, &block->jetsam);
     size_t bytes = sizeof(*block) + block->used * sizeof(unsigned long) +
         block->fault_pc_count * sizeof(struct fiber_fault_pc);
-    asbestos->retired_bytes += bytes;
+    size_t retired = atomic_load_explicit(&asbestos->retired_bytes, memory_order_relaxed) + bytes;
+    atomic_store_explicit(&asbestos->retired_bytes, retired, memory_order_release);
+    atomic_store_explicit(&asbestos->jetsam_nonempty, true, memory_order_release);
     atomic_fetch_add_explicit(&asbestos_stat_retired_bytes, bytes, memory_order_relaxed);
 }
 
@@ -1160,24 +1183,28 @@ static void fiber_free_jetsam(struct asbestos *asbestos) {
         free(block->fault_pcs);
         free(block);
     }
-    atomic_fetch_sub_explicit(&asbestos_stat_retired_bytes, asbestos->retired_bytes, memory_order_relaxed);
-    asbestos->retired_bytes = 0;
+    size_t retired = atomic_load_explicit(&asbestos->retired_bytes, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&asbestos_stat_retired_bytes, retired, memory_order_relaxed);
+    atomic_store_explicit(&asbestos->retired_bytes, 0, memory_order_release);
+    atomic_store_explicit(&asbestos->jetsam_nonempty, false, memory_order_release);
     // A flushed translation table frees many small blocks: return the pages.
     if (freed > 20000) asbestos_return_free_heap();
 }
 
 void asbestos_collect(struct asbestos *asbestos) {
-    lock(&asbestos->lock);
-    bool needed = asbestos->retired_bytes >= (4u << 20);
-    unlock(&asbestos->lock);
+    // Lock-free fast path: avoid acquiring asbestos->lock on every syscall/slice
+    // when retired jetsam is below the collection threshold (or empty).
+    if (atomic_load_explicit(&asbestos->retired_bytes, memory_order_acquire) < (4u << 20))
+        return;
     bool expected = false;
-    if (!needed || !atomic_compare_exchange_strong(&asbestos->collecting, &expected, true)) return;
+    if (!atomic_compare_exchange_strong(&asbestos->collecting, &expected, true)) return;
     // Stop new execution slices before waiting for existing readers. Readers
     // must not wait for this lock while they hold the address-space read lock:
     // an executing CoW fault can need that address-space lock for writing.
     write_wrlock(&asbestos->jetsam_lock);
     lock(&asbestos->lock);
-    fiber_free_jetsam(asbestos);
+    if (!list_empty(&asbestos->jetsam))
+        fiber_free_jetsam(asbestos);
     unlock(&asbestos->lock);
     write_wrunlock(&asbestos->jetsam_lock);
     atomic_store_explicit(&asbestos->collecting, false, memory_order_release);
@@ -1187,7 +1214,13 @@ int fiber_enter(struct fiber_block *block, struct fiber_frame *frame, struct tlb
 static int cpu_single_step(struct cpu_state *cpu, struct tlb *tlb);
 
 static inline size_t fiber_cache_hash(addr_t ip) {
+#if defined(GUEST_ARM64) && !defined(ISH_JIT)
+    // ARM64 PCs are 4-byte aligned; shifting right by 2 utilizes all 4096 slots
+    // (must stay in sync with indirect_cache_dispatch in control.S).
+    return ((ip >> 2) ^ (ip >> 14)) & (FIBER_CACHE_SIZE - 1);
+#else
     return (ip ^ (ip >> 12)) & (FIBER_CACHE_SIZE - 1);
+#endif
 }
 
 static inline unsigned asbestos_invalidate_gen_load(struct asbestos *asbestos) {
@@ -1467,13 +1500,18 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
 
         // (debug trace removed)
 
-        // Check if page table changed (mmap/munmap by another thread) EVERY BLOCK.
-        if (tlb->mem_changes != __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE)) {
+        // Check if page table changed (mmap/munmap/CoW by another thread) EVERY BLOCK.
+        // Only flush TLB (O(1) generation advance); clear block_cache/ret_cache only
+        // when translated code was actually invalidated (invalidate_gen changed).
+        if (tlb->mem_changes != (unsigned)__atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE)) {
             tlb_flush(tlb);
-            memset(cache, 0, sizeof(tlb->block_cache));
-            tlb->block_cache_gen = asbestos_invalidate_gen_load(asbestos);
-            memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
-            frame->last_block = NULL;
+            invalidate_gen = asbestos_invalidate_gen_load(asbestos);
+            if (tlb->block_cache_gen != invalidate_gen) {
+                memset(cache, 0, sizeof(tlb->block_cache));
+                tlb->block_cache_gen = invalidate_gen;
+                memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
+                frame->last_block = NULL;
+            }
         }
 
         // Most block boundaries have no pending poke. Avoid an exclusive
@@ -1563,33 +1601,46 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     if (asbestos->num_blocks) {
         unsigned pressure = atomic_load_explicit(&asbestos_pressure_gen, memory_order_relaxed);
         bool cap = asbestos->flush_requested || pressure != asbestos->pressure_seen, idle = false;
-        if (pressure != asbestos->pressure_seen) { asbestos->pressure_seen = pressure; atomic_fetch_add_explicit(&asbestos_stat_pressure_flushes, 1, memory_order_relaxed); }
-        if (!cap && code_idle_ms() && asbestos_code_bytes(asbestos) > (4u << 20))
-            idle = asbestos_now_ms() - asbestos->last_insert_ms > code_idle_ms();
+        if (pressure != asbestos->pressure_seen) {
+            asbestos->pressure_seen = pressure;
+            atomic_fetch_add_explicit(&asbestos_stat_pressure_flushes, 1, memory_order_relaxed);
+        }
+        uint64_t now = 0;
+        uint64_t idle_ms = code_idle_ms();
+        if (!cap && idle_ms && ((++asbestos->slice_tick & 63) == 0)) {
+            now = asbestos_now_ms();
+            uint64_t prev_active = __atomic_load_n(&asbestos->last_active_ms, __ATOMIC_RELAXED);
+            __atomic_store_n(&asbestos->last_active_ms, now, __ATOMIC_RELAXED);
+            // Only flush on wake after genuine dormancy (> idle_ms between active slices),
+            // never while actively executing already-translated blocks (e.g. cc1/cc1plus).
+            if (prev_active != 0 && now > prev_active && (now - prev_active) > idle_ms &&
+                    asbestos_code_bytes(asbestos) > (4u << 20))
+                idle = true;
+        }
         if (cap || idle) {
+            if (now == 0)
+                now = asbestos_now_ms();
             asbestos->flush_requested = false;
-            asbestos->last_insert_ms = asbestos_now_ms();
+            __atomic_store_n(&asbestos->last_insert_ms, now, __ATOMIC_RELAXED);
+            __atomic_store_n(&asbestos->last_active_ms, now, __ATOMIC_RELAXED);
             asbestos_invalidate_range(asbestos, 0, MEM_PAGES);
             atomic_fetch_add_explicit(cap ? &asbestos_stat_cap_flushes : &asbestos_stat_idle_flushes, 1, memory_order_relaxed);
         }
     }
 
-    lock(&asbestos->lock);
-    if (!list_empty(&asbestos->jetsam)) {
-        unlock(&asbestos->lock);
-
+    // Lock-free fast path: skip asbestos->lock completely when jetsam is empty.
+    if (atomic_load_explicit(&asbestos->jetsam_nonempty, memory_order_acquire)) {
         // This runs while task_run_current still holds mem->lock for reading.
         // Do not block here: a concurrent page-fault handler may be queued for
         // mem->lock write, which makes new/read re-entry block on glibc's
         // writer-preferred rwlock and can deadlock with JIT fault retry.
         if (write_wrtrylock(&asbestos->jetsam_lock)) {
             lock(&asbestos->lock);
-            fiber_free_jetsam(asbestos);
+            if (!list_empty(&asbestos->jetsam))
+                fiber_free_jetsam(asbestos);
             unlock(&asbestos->lock);
             write_wrunlock(&asbestos->jetsam_lock);
         }
-    } else {
-        unlock(&asbestos->lock);
     }
 
     return interrupt;

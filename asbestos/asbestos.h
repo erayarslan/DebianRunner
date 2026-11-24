@@ -27,7 +27,7 @@ struct asbestos {
     // list of fiber_blocks that should be freed soon (at the next RCU grace
     // period, if we had such a thing)
     struct list jetsam;
-    size_t retired_bytes;
+    _Atomic size_t retired_bytes;
     _Atomic bool collecting;
 
     // A way to look up blocks in a page
@@ -73,6 +73,14 @@ struct asbestos {
 
     lock_t lock;
     wrlock_t jetsam_lock;
+
+    // Coarse activity timestamp and tick counters for translation memory policy.
+    // Placed after jetsam_lock so offsets of code_seen and invalidate_gen stay unchanged.
+    uint64_t last_active_ms;
+    uint32_t insert_tick;
+    uint32_t slice_tick;
+    // Lock-free fast-path flag maintained under lock: true iff jetsam is non-empty.
+    _Atomic bool jetsam_nonempty;
 #ifdef ISH_JIT
     void *jit_ctxs;
 #endif

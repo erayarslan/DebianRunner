@@ -189,11 +189,14 @@ int path_normalize_target(struct fd *at, const char *path, char *out, int flags,
         return _ENOENT;
 
     // start with root or cwd, depending on whether it starts with a slash
+    bool is_global_root = false;
     lock(&current->fs->lock);
     if (path[0] == '/')
         at = current->fs->root;
     else if (at == AT_PWD)
         at = current->fs->pwd;
+    if (at != NULL && !IS_ERR(at))
+        is_global_root = at->is_global_root;
     unlock(&current->fs->lock);
     if (at == NULL && path[0] != '/')
         return _EBADF;
@@ -201,14 +204,16 @@ int path_normalize_target(struct fd *at, const char *path, char *out, int flags,
         return PTR_ERR(at);
 
     char at_path[MAX_PATH];
-    if (at != NULL) {
+    const char *at_path_ptr = NULL;
+    if (at != NULL && !is_global_root) {
         int err = directory_getpath(at, at_path);
         if (err < 0)
             return err;
         assert(path_is_normalized(at_path));
+        at_path_ptr = at_path;
     }
 
-    return __path_normalize(at != NULL ? at_path : NULL, path, out, flags, 0, NULL, target);
+    return __path_normalize(at_path_ptr, path, out, flags, 0, NULL, target);
 }
 
 int path_normalize(struct fd *at, const char *path, char *out, int flags) {
@@ -224,11 +229,20 @@ int path_normalize_in_fs(struct fs_info *fs, struct fd *at,
     else if (at == AT_PWD) at = fs->pwd;
     if (!root || !at || IS_ERR(root) || IS_ERR(at)) return _EBADF;
     char root_path[MAX_PATH], at_path[MAX_PATH];
-    int err = directory_getpath(root, root_path);
-    if (err < 0) return err;
-    err = directory_getpath(at, at_path);
-    if (err < 0) return err;
-    if (!strcmp(root_path, "/")) root_path[0] = '\0';
+    if (root->is_global_root) {
+        root_path[0] = '\0';
+    } else {
+        int err = directory_getpath(root, root_path);
+        if (err < 0) return err;
+        if (!strcmp(root_path, "/")) root_path[0] = '\0';
+    }
+    if (at->is_global_root) {
+        at_path[0] = '/';
+        at_path[1] = '\0';
+    } else {
+        int err = directory_getpath(at, at_path);
+        if (err < 0) return err;
+    }
     size_t n = strlen(root_path);
     if (strncmp(at_path, root_path, n) || (at_path[n] && at_path[n] != '/'))
         return _EXDEV;

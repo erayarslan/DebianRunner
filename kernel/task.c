@@ -391,14 +391,14 @@ void task_run_current() {
             // Exit the host thread silently; cleanup handler frees tlb.
             pthread_exit(NULL);
         }
-        if (self->group->doing_group_exit) {
+        if (__atomic_load_n(&self->group->doing_group_exit, __ATOMIC_ACQUIRE)) {
             do_exit(self->group->group_exit_code);
         }
         if (self->mem == NULL) {
             pthread_exit(NULL);
         }
         read_wrlock_yield_to_writers(&self->mem->lock);
-        tlb_refresh(tlb, &self->mem->mmu);
+        // cpu_run_to_interrupt() unconditionally calls tlb_refresh(tlb, cpu->mmu).
         guest_profile_state(1);
         int interrupt = cpu_run_to_interrupt(cpu, tlb);
         guest_profile_state(2);

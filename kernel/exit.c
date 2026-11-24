@@ -89,8 +89,12 @@ noreturn void do_exit(int status) {
     runtime_process_event("thread_exit_status",current->tgid,status);
 
 #ifdef GUEST_ARM64
-    // Nonzero leader exit is an unexpected exit record, not proof of a crash.
-    if (current->pid == current->tgid && !(status & 0x7f) && (status >> 8)) {
+    // Normal nonzero exits (grep/test/cmake returning 1, etc.) must never
+    // trigger crash dumps or full FD census scans. Only dump fault diagnostics
+    // for nonzero exits when verbose tracing is explicitly enabled; actual
+    // fatal signals are reported in kernel/signal.c.
+    extern volatile bool g_trace_syscalls;
+    if (g_trace_syscalls && current->pid == current->tgid && !(status & 0x7f) && (status >> 8)) {
         extern void runtime_report_guest_fault(int,uint64_t,uint32_t);
         extern void (*runtime_guest_terminated)(int,int,int);
         if (runtime_guest_terminated) {
@@ -273,8 +277,8 @@ noreturn void do_exit_group(int status) {
     lock(&group->lock);
     bool is_group_leader = false;
     if (!group->doing_group_exit) {
-        group->doing_group_exit = true;
         group->group_exit_code = status;
+        __atomic_store_n(&group->doing_group_exit, true, __ATOMIC_RELEASE);
         is_group_leader = true;  // First thread to call exit_group
     } else {
         status = group->group_exit_code;
@@ -286,7 +290,7 @@ noreturn void do_exit_group(int status) {
     list_for_each_entry(&group->threads, task, group_links) {
         thread_count++;
         deliver_signal(task, SIGKILL_, SIGINFO_NIL);
-        task->group->stopped = false;
+        __atomic_store_n(&task->group->stopped, false, __ATOMIC_RELEASE);
         notify(&task->group->stopped_cond);
     }
     (void)is_group_leader;

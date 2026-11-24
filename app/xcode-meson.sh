@@ -57,11 +57,15 @@ if [[ $? -ne 0 ]]; then
     for arch in $ARCHS; do
         arch_args="'-arch', '$arch', $arch_args"
     done
-    arch_args="${arch_args%%, }"
     meson_arch=${ARCHS%% *}
     case "$meson_arch" in
         arm64) meson_arch=aarch64 ;;
     esac
+    if [[ $meson_arch == aarch64 && "$ARCHS" != *x86_64* ]]; then
+        # Dynamically use ARMv8.1+ LSE atomics on A13+ while staying iOS 15 compatible.
+        arch_args="${arch_args}'-moutline-atomics', "
+    fi
+    arch_args="${arch_args%%, }"
     cat | tee $crossfile <<-EOF
     [binaries]
     c = 'clang'
@@ -89,9 +93,16 @@ EOF
 fi
 
 buildtype=debug
+optimization=0
+debug=true
 b_ndebug=false
 if [[ $CONFIGURATION == Release ]]; then
-    buildtype=debugoptimized
+    # Compile at -O3 with assertions disabled (-DNDEBUG) while keeping DWARF
+    # debug info (-g) so dSYM UUIDs match scripts/verify-ipa.py.
+    buildtype=custom
+    optimization=3
+    debug=true
+    b_ndebug=true
 fi
 b_sanitize=none
 if [[ -n "$ENABLE_ADDRESS_SANITIZER" ]]; then
@@ -110,10 +121,20 @@ guest_arch=${GUEST_ARCH:-arm64}
 # installs the native fault adapter; static images are linked separately only
 # when the checked Apple image build is explicitly requested.
 (set -x; meson configure -Djit=$jit -Djit_emit=$jit_emit -Dcli_aot= -Dvdso_required=true) || exit $?
-for var in buildtype log b_ndebug b_sanitize log_handler kernel kconfig guest_arch; do
-    old_value=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == '$var'); print(str(v).lower() if isinstance(v, bool) else ','.join(v) if isinstance(v, list) else v)" <<< $config)
+# Configure optimization + debug together so Meson derives buildtype cleanly
+# (debug for -O0/-g, custom for -O3/-g) without passing -Dbuildtype=custom
+# directly (which hits KeyError in Meson 1.8.0 and warns when combined with
+# -Doptimization/-Ddebug).
+old_buildtype=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == 'buildtype'); print(v)" <<< "$config")
+old_optimization=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == 'optimization'); print(v)" <<< "$config")
+old_debug=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == 'debug'); print(str(v).lower() if isinstance(v, bool) else v)" <<< "$config")
+if [[ $old_buildtype != $buildtype || $old_optimization != $optimization || $old_debug != $debug ]]; then
+    (set -x; meson configure "-Doptimization=$optimization" "-Ddebug=$debug") || exit $?
+fi
+for var in log b_ndebug b_sanitize log_handler kernel kconfig guest_arch; do
+    old_value=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == '$var'); print(str(v).lower() if isinstance(v, bool) else ','.join(v) if isinstance(v, list) else v)" <<< "$config")
     new_value=${!var}
     if [[ $old_value != $new_value ]]; then
-        set -x; meson configure "-D$var=$new_value" || exit $?
+        (set -x; meson configure "-D$var=$new_value") || exit $?
     fi
 done

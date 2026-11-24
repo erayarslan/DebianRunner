@@ -104,10 +104,10 @@ static int deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ i
 
     struct sigqueue *sigqueue = malloc(sizeof(struct sigqueue));
     if(!sigqueue)return _EAGAIN;
-    sigset_add(&task->pending, sig);
     sigqueue->info = info;
     sigqueue->info.sig = sig;
     list_add_tail(&task->queue, &sigqueue->queue);
+    __atomic_store_n(&task->pending, task->pending | sig_mask(sig), __ATOMIC_RELEASE);
 
     if (sigset_has(task->blocked & ~task->waiting, sig) && signal_is_blockable(sig)) {
         notify(&task->pause);
@@ -139,8 +139,8 @@ static int deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ i
 // The pending bit represents the remaining queue, including RT duplicates.
 static void refresh_pending_signal_locked(struct task *task,int sig) {
     struct sigqueue *entry;
-    list_for_each_entry(&task->queue,entry,queue)if(entry->info.sig==sig){sigset_add(&task->pending,sig);return;}
-    sigset_del(&task->pending,sig);
+    list_for_each_entry(&task->queue,entry,queue)if(entry->info.sig==sig){__atomic_store_n(&task->pending,task->pending|sig_mask(sig),__ATOMIC_RELEASE);return;}
+    __atomic_store_n(&task->pending,task->pending&~sig_mask(sig),__ATOMIC_RELEASE);
 }
 void deliver_signal(struct task *task, int sig, struct siginfo_ info) {
     if (task->sighand == NULL)
@@ -194,7 +194,7 @@ void send_signal(struct task *task, int sig, struct siginfo_ info) {
 
     if (sig == SIGCONT_ || sig == SIGKILL_) {
         lock(&task->group->lock);
-        task->group->stopped = false;
+        __atomic_store_n(&task->group->stopped, false, __ATOMIC_RELEASE);
         notify(&task->group->stopped_cond);
         unlock(&task->group->lock);
     }
@@ -454,8 +454,8 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
 
         case SIGNAL_STOP:
             lock(&current->group->lock);
-            current->group->stopped = true;
             current->group->group_exit_code = sig << 8 | 0x7f;
+            __atomic_store_n(&current->group->stopped, true, __ATOMIC_RELEASE);
             unlock(&current->group->lock);
             return;
 
@@ -691,13 +691,28 @@ void ptrace_syscall_stop(void) {
 }
 
 void receive_signals() {
-    lock(&current->group->lock);
-    bool was_stopped = current->group->stopped;
-    unlock(&current->group->lock);
-
     struct sighand *sighand = current->sighand;
     if (sighand == NULL)
         return;
+
+    struct tgroup *group = current->group;
+    // Lock-free fast path: when no unblocked signal is pending, no temporary
+    // sigmask needs restoring, no unconditional restart is armed, and the group
+    // is neither stopped nor exiting, skip all group->lock and sighand->lock
+    // pairs. Writers publish pending/stopped/doing_group_exit with release
+    // semantics and then call cpu_poke() (SEQ_CST), preventing lost wakeups.
+    if ((__atomic_load_n(&current->pending, __ATOMIC_ACQUIRE) & ~current->blocked) == 0 &&
+        !current->has_saved_mask &&
+        !current->syscall_restart_always &&
+        !__atomic_load_n(&group->stopped, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&group->doing_group_exit, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+
+    lock(&group->lock);
+    bool was_stopped = group->stopped;
+    unlock(&group->lock);
+
     lock(&sighand->lock);
 
     // A saved mask means that the last system call was a call like sigsuspend
@@ -942,7 +957,7 @@ static int do_sigaction(int sig, const struct sigaction_ *action, struct sigacti
                         free(entry);
                     }
                 }
-                sigset_del(&task->pending, sig);
+                __atomic_store_n(&task->pending, task->pending & ~sig_mask(sig), __ATOMIC_RELEASE);
             }
         }
     }

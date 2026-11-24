@@ -119,15 +119,9 @@ int user_write_string(addr_t addr, const char *buf) {
     if (addr == 0)
         return 1;
     struct mem *mem = USER_MEM_OR_FAULT(current);
+    size_t len = strlen(buf) + 1;
     read_wrlock(&mem->lock);
-    size_t i = 0;
-    do {
-        if (__user_write_mem(mem, addr + i, &buf[i], sizeof(buf[i]), false)) {
-            read_wrunlock(&mem->lock);
-            return 1;
-        }
-        i++;
-    } while (buf[i - 1] != '\0');
+    int res = __user_write_mem(mem, addr, buf, len, false);
     read_wrunlock(&mem->lock);
-    return 0;
+    return res;
 }

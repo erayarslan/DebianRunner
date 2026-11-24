@@ -55,6 +55,8 @@ struct task {
     addr_t altstack;
     dword_t altstack_size;
     sigset_t_ blocked;
+    // Written under sighand->lock with __ATOMIC_RELEASE; lock-free fast-path
+    // readers observe with __ATOMIC_ACQUIRE before taking sighand->lock.
     sigset_t_ pending;
     sigset_t_ waiting; // if nonzero, an ongoing call to sigtimedwait is waiting on these
     struct list queue;
@@ -269,6 +271,8 @@ struct tgroup {
     struct list session;
     struct list pgroup;
 
+    // Written under group->lock with __ATOMIC_RELEASE; lock-free fast-path
+    // readers observe with __ATOMIC_ACQUIRE before taking group->lock.
     bool stopped;
     cond_t stopped_cond;
 
@@ -288,7 +292,8 @@ struct tgroup {
     // > - any thread calls exit_group
     // > the SIGNAL_GROUP_EXIT flag will be set and wait will return the status passed to exit_group
     //
-    // TODO locking
+    // Written under pids_lock + group->lock with __ATOMIC_RELEASE; lock-free
+    // readers observe with __ATOMIC_ACQUIRE.
     bool doing_group_exit;
     dword_t group_exit_code;
 

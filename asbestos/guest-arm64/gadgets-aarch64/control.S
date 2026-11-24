@@ -40,9 +40,9 @@
     // Chained fast path — poke check + periodic timer
     load_block_addr x11, \reg
     str x11, [_cpu, #CPU_pc]
-    // Increment cycle counter; exit to main loop every 1024 cycles for timer check
+    // Increment cycle counter; exit to main loop every 16384 cycles for timer check
     add _cycle_w, _cycle_w, #1
-    tst _cycle_w, #0x3ff
+    tst _cycle_w, #0x3fff
     b.eq 7778f
     // Check poke flag
     ldr x8, [_cpu, #CPU_poked_ptr]
@@ -111,7 +111,11 @@
     str x8, [_cpu, #(CPU_x0 + 30*8)]
 #ifndef DISABLE_RET_CACHE
     // Store _pc in ret_cache keyed by return address
+#ifdef ISH_JIT
     ubfx w12, w8, #4, #12
+#else
+    ubfx w12, w8, #2, #12
+#endif
     add x13, _cpu, #LOCAL_ret_cache
     str _pc, [x13, x12, lsl #3]
 #endif
@@ -208,7 +212,11 @@
     str x10, [_cpu, #CPU_pc]
 #ifndef DISABLE_RET_CACHE
     // Look up return address in ret_cache
+#ifdef ISH_JIT
     ubfx w12, w10, #4, #12
+#else
+    ubfx w12, w10, #2, #12
+#endif
     add x13, _cpu, #LOCAL_ret_cache
     ldr x14, [x13, x12, lsl #3]  // x14 = saved _pc from BL
     // Cache miss?
@@ -306,9 +314,10 @@ indirect_cache_dispatch:
     ldr w9, [x12]
     cmp w8, w9
     b.ne 8f
-    // x9 = block_cache[(ip ^ (ip >> 12)) & 4095]
+    // x9 = block_cache[((ip >> 2) ^ (ip >> 14)) & 4095]
+    // Equivalent to ((ip ^ (ip >> 12)) >> 2) & 0xfff in 2 instructions.
     eor x11, x10, x10, lsr #12
-    and x11, x11, #0xfff
+    ubfx x11, x11, #2, #12
     add x12, _tlb, #((TLB_block_cache-TLB_entries) & 0xfff)
     add x12, x12, #((TLB_block_cache-TLB_entries) >> 12), lsl #12
     ldr x9, [x12, x11, lsl #3]
@@ -318,7 +327,7 @@ indirect_cache_dispatch:
     b.ne 8f
     // Timer: same cycle accounting as a chained branch
     add _cycle_w, _cycle_w, #1
-    tst _cycle_w, #0x3ff
+    tst _cycle_w, #0x3fff
     b.eq 8f
     add _pc, x9, #FIBER_BLOCK_code
     b fiber_ret_chain
@@ -339,7 +348,7 @@ indirect_cache_dispatch:
     ldr x10, [x9, x8, lsl #3]   // x10 = return address (guest PC)
     str x10, [_cpu, #CPU_pc]
 #ifndef DISABLE_RET_CACHE
-    ubfx w12, w10, #4, #12
+    ubfx w12, w10, #2, #12
     add x13, _cpu, #LOCAL_ret_cache
     ldr x14, [x13, x12, lsl #3]
     cbz x14, 1f
@@ -386,7 +395,7 @@ indirect_cache_dispatch:
     ldr x10, [x9, x8, lsl #3]   // read the target before x30 is overwritten (blr x30)
     str x11, [_cpu, #(CPU_x0 + 30*8)]
 #ifndef DISABLE_RET_CACHE
-    ubfx w12, w11, #4, #12
+    ubfx w12, w11, #2, #12
     add x13, _cpu, #LOCAL_ret_cache
     str _pc, [x13, x12, lsl #3]
 #endif

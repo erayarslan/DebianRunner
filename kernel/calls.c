@@ -1,6 +1,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@ void (*runtime_guest_fault)(int pid, int ppid, const char *comm, uint64_t pc, ui
 atomic_bool runtime_syscall_timing_enabled;
 void (*runtime_syscall_result_observer)(int, int, unsigned, const uint64_t *, int64_t, uint64_t);
 extern volatile bool g_trace_faults;
+extern volatile bool g_trace_syscalls;
 void (*runtime_fault_context)(const char *line);
 // Called only after Linux signal disposition is fatal, never for a handled trap.
 void (*runtime_guest_terminated)(int tid, int signal, int exit_code);
@@ -52,7 +54,7 @@ static struct output_record *output_record(void) {
     *old=(struct output_record){.tgid=current->tgid,.start=start};return old;
 }
 void runtime_capture_output(int fd,const void *buffer,size_t size) {
-    if((fd!=1&&fd!=2)||!size||!current)return;
+    if((fd!=1&&fd!=2)||!size||!current||!runtime_guest_output)return;
     const unsigned char *bytes=buffer;unsigned channel=fd-1;
     // A single huge write cannot monopolize the ring or the lock.
     if(size>4096){bytes+=size-4096;size=4096;}
@@ -89,9 +91,12 @@ static void remember_guest_call(unsigned number, uint64_t pc, const uint64_t arg
     *record = (struct recent_guest_call){.number=number, .pc=pc, .result=result};
     memcpy(record->args, args, sizeof(record->args));
 #ifdef GUEST_ARM64
-    // Preserve the path before later calls reuse the guest stack. Only failed
-    // openat/faccessat paths are retained; no read/write payloads are captured.
-    if (result < 0 && (number == 56 || number == 48 || number == 78)) {
+    // Preserve the path before later calls reuse the guest stack. Only
+    // unexpected openat/faccessat/readlinkat failures are retained (skipping
+    // common expected misses like ENOENT/EEXIST/EACCES); no read/write payloads
+    // are captured.
+    if (result < 0 && result != _ENOENT && result != _EEXIST && result != _EACCES &&
+            (number == 56 || number == 48 || number == 78)) {
         if (user_read_string(args[1], record->failed_path, sizeof(record->failed_path)))
             record->failed_path[0] = '\0';
     }
@@ -163,7 +168,10 @@ void runtime_process_event(const char *kind,int subject,int status) {
         snprintf(event.line + used, sizeof event.line - used, " ppid=%d type=%s utility_subtype=%s", event.parent, type, subtype);
     }
     lock(&process_event_lock);process_events[process_sequence++%64]=event;unlock(&process_event_lock);
-    if (leader_event) fault_context("%s", event.line);
+    // Keep normal exec_committed/thread_exit_status in the ring buffer (dumped
+    // by report_process_events() on actual fatal faults) without invoking
+    // fault_context() on every normal process exec/exit.
+    if (leader_event && g_trace_syscalls) fault_context("%s", event.line);
 }
 void runtime_output_exec_reset(void) {
     lock(&output_lock);struct output_record *r=output_record();int tgid=r->tgid;uint64_t start=r->start;*r=(struct output_record){.tgid=tgid,.start=start,.sequence=++output_sequence};unlock(&output_lock);
@@ -515,11 +523,15 @@ void handle_interrupt(int interrupt) {
             ptrace_skip = (int32_t) syscall_num == -1;
         }
         uint64_t observe_args[6] = {0}; struct timespec observe_start = {0};
-        bool observe = runtime_syscall_result_observer != NULL;
+        void (*res_obs)(int, int, unsigned, const uint64_t *, int64_t, uint64_t) =
+            __atomic_load_n(&runtime_syscall_result_observer, __ATOMIC_ACQUIRE);
+        bool observe = res_obs != NULL;
         bool timed = observe && atomic_load(&runtime_syscall_timing_enabled);
         if (observe) memcpy(observe_args, cpu->regs, sizeof observe_args);
         if (timed) clock_gettime(CLOCK_MONOTONIC, &observe_start);
-        if (runtime_syscall_observer) runtime_syscall_observer(current->pid, cpu->pc, cpu->sp, syscall_num);
+        void (*obs)(int, uint64_t, uint64_t, unsigned) =
+            __atomic_load_n(&runtime_syscall_observer, __ATOMIC_ACQUIRE);
+        if (obs) obs(current->pid, cpu->pc, cpu->sp, syscall_num);
         // Snapshot for SA_RESTART: x0 (first arg) is about to be clobbered by
         // the return value; save it and the number so an interrupted syscall
         // can be re-executed if a SA_RESTART signal is delivered.
@@ -738,31 +750,16 @@ void handle_interrupt(int interrupt) {
             ptrace_syscall_stop();
             current->ptrace.in_syscall = false;
         }
-        if (observe && runtime_syscall_result_observer && syscall_num != 139) {
+        if (res_obs && syscall_num != 139) {
             uint64_t ns = 0;
             if (timed) { struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end); ns = (end.tv_sec-observe_start.tv_sec)*1000000000ULL + end.tv_nsec-observe_start.tv_nsec; }
-            runtime_syscall_result_observer(current->pid, current->tgid, syscall_num, observe_args, (int64_t)cpu->regs[0], ns);
-        }
-        // Update deadlock detection state.
-        atomic_fetch_add(&current->group->syscall_count, 1);
-        // Update last_unblocked_ns for non-blocking syscalls only.
-        // Blocking calls (futex, epoll, ppoll, waitid, nanosleep) that
-        // return and retry should NOT refresh the timestamp, as they
-        // don't represent real forward progress.
-        if (syscall_num != 22 && syscall_num != 73 && syscall_num != 95 &&
-            syscall_num != 98 && syscall_num != 101) {
-            struct timespec _ts;
-            clock_gettime(CLOCK_MONOTONIC, &_ts);
-            uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
-            current->last_unblocked_ns = now;
-            atomic_store_explicit(&current->group->last_progress_ns, now,
-                                  memory_order_relaxed);
+            res_obs(current->pid, current->tgid, syscall_num, observe_args, (int64_t)cpu->regs[0], ns);
         }
         // Check for pending group exit. When do_exit_group sends SIGKILL to
         // all threads, a thread stuck in a retrying syscall (e.g., musl's
         // futex_wait loops on EINTR) would never return to the JIT dispatch
         // loop where receive_signals() handles SIGKILL. Catch it here.
-        if (current->group->doing_group_exit)
+        if (__atomic_load_n(&current->group->doing_group_exit, __ATOMIC_ACQUIRE))
             do_exit(current->group->group_exit_code);
     } else if (interrupt == INT_OOM) {
         // Do not disguise host allocation failure as a guest page fault: a
@@ -770,8 +767,10 @@ void handle_interrupt(int interrupt) {
         // affected guest process group, as for a host OOM victim.
         do_exit_group(SIGKILL_);
     } else if (interrupt == INT_GPF) {
-        struct timespec fault_begin, fault_end;
-        clock_gettime(CLOCK_MONOTONIC, &fault_begin);
+        struct timespec fault_begin;
+        bool time_fault = g_trace_syscalls;
+        if (time_fault)
+            clock_gettime(CLOCK_MONOTONIC, &fault_begin);
         __atomic_add_fetch(&current->diagnostic_faults, 1, __ATOMIC_RELAXED);
         __atomic_store_n(&current->diagnostic_fault_address, cpu->segfault_addr, __ATOMIC_RELAXED);
         read_wrlock(&current->mem->lock);
@@ -781,10 +780,13 @@ void handle_interrupt(int interrupt) {
 #endif
         void *ptr = mem_ptr(current->mem, cpu->segfault_addr, fault_access);
         read_wrunlock(&current->mem->lock);
-        clock_gettime(CLOCK_MONOTONIC, &fault_end);
-        uint64_t fault_ns = (fault_end.tv_sec - fault_begin.tv_sec) * 1000000000ULL +
-            fault_end.tv_nsec - fault_begin.tv_nsec;
-        __atomic_add_fetch(&current->diagnostic_fault_ns, fault_ns, __ATOMIC_RELAXED);
+        if (time_fault) {
+            struct timespec fault_end;
+            clock_gettime(CLOCK_MONOTONIC, &fault_end);
+            uint64_t fault_ns = (fault_end.tv_sec - fault_begin.tv_sec) * 1000000000ULL +
+                fault_end.tv_nsec - fault_begin.tv_nsec;
+            __atomic_add_fetch(&current->diagnostic_fault_ns, fault_ns, __ATOMIC_RELAXED);
+        }
         if (ptr) __atomic_add_fetch(&current->diagnostic_resolved_faults, 1, __ATOMIC_RELAXED);
         // Retry only a real mapping fault resolved by mem_ptr (CoW, a
         // demand-zero reservation, or legitimate stack growth). An unmapped
@@ -859,10 +861,12 @@ void handle_interrupt(int interrupt) {
 
     receive_signals();
     struct tgroup *group = current->group;
-    lock(&group->lock);
-    while (group->stopped)
-        wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
-    unlock(&group->lock);
+    if (__atomic_load_n(&group->stopped, __ATOMIC_ACQUIRE)) {
+        lock(&group->lock);
+        while (group->stopped)
+            wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
+        unlock(&group->lock);
+    }
 }
 
 void dump_maps(void) {
@@ -978,15 +982,11 @@ static inline int fast_fstat64(struct cpu_state *cpu) {
 }
 
 static inline bool syscall_should_surface_eintr(void) {
-    if (current->group->doing_group_exit)
+    if (__atomic_load_n(&current->group->doing_group_exit, __ATOMIC_ACQUIRE))
         return true;
-    if (current->sighand != NULL) {
-        lock(&current->sighand->lock);
-        bool pending = !!(current->pending & ~current->blocked);
-        unlock(&current->sighand->lock);
-        if (pending)
-            return true;
-    }
+    if (current->sighand != NULL &&
+        (__atomic_load_n(&current->pending, __ATOMIC_ACQUIRE) & ~current->blocked) != 0)
+        return true;
     return false;
 }
 
@@ -994,16 +994,19 @@ static inline bool syscall_should_surface_eintr(void) {
 static inline int fast_read(struct cpu_state *cpu) {
     fd_t fd_no = (fd_t)cpu->regs[0];
     addr_t buf_addr = (addr_t)cpu->regs[1];
-    dword_t size = (dword_t)cpu->regs[2];
-
-    // Fast path condition: small buffer (≤ 4KB) and realfs fd
-    if (size > 4096)
+    if (cpu->regs[2] > 4096)
         return -1;
+    dword_t size = (dword_t)cpu->regs[2];
 
     struct fd *fd = f_get_retain(fd_no);
     if (fd == NULL) return -1;
-    // Memfd offsets/writes must serialize with size-seal enforcement.
-    if (fd->ops != &realfs_fdops || fd->memfd) { fd_close(fd); return -1; }
+    // Accept realfs and fakefs regular/stream fds; memfd requires seal locking
+    // and directories must return EISDIR via sys_read.
+    if ((fd->ops != &realfs_fdops && fd->ops != &fakefs_fdops) ||
+            fd->memfd || S_ISDIR(fd->type)) {
+        fd_close(fd);
+        return -1;
+    }
 
     // Direct host read. Retry spurious host EINTR, but surface guest signals
     // (especially exit_group SIGKILL) so helper threads blocked in pipes can
@@ -1011,7 +1014,10 @@ static inline int fast_read(struct cpu_state *cpu) {
     char buf[4096];
     ssize_t res;
     do {
-        if (current->group->doing_group_exit) { fd_close(fd); return _EINTR; }
+        if (__atomic_load_n(&current->group->doing_group_exit, __ATOMIC_ACQUIRE)) {
+            fd_close(fd);
+            return _EINTR;
+        }
         res = read(fd->real_fd, buf, size);
     } while (res < 0 && errno == EINTR && !syscall_should_surface_eintr());
 
@@ -1030,16 +1036,23 @@ static inline int fast_read(struct cpu_state *cpu) {
 static inline int fast_write(struct cpu_state *cpu) {
     fd_t fd_no = (fd_t)cpu->regs[0];
     addr_t buf_addr = (addr_t)cpu->regs[1];
-    dword_t size = (dword_t)cpu->regs[2];
-
-    // Fast path condition: small buffer (≤ 4KB) and realfs fd
-    if (size > 4096)
+    if (cpu->regs[2] > 4096)
         return -1;
+    dword_t size = (dword_t)cpu->regs[2];
 
     struct fd *fd = f_get_retain(fd_no);
     if (fd == NULL) return -1;
-    // Memfd offsets/writes must serialize with size-seal enforcement.
-    if (fd->ops != &realfs_fdops || fd->memfd) { fd_close(fd); return -1; }
+    // Accept realfs and fakefs fds when writable and already stripped of file
+    // capabilities for the current global generation; otherwise fall back to
+    // sys_write (which handles EBADF, memfd seals, and first-write cap strip).
+    if ((fd->ops != &realfs_fdops && fd->ops != &fakefs_fdops) ||
+            fd->memfd ||
+            (__atomic_load_n(&fd->flags, __ATOMIC_RELAXED) & O_ACCMODE_) == O_RDONLY_ ||
+            __atomic_load_n(&fd->caps_stripped_gen, __ATOMIC_RELAXED) !=
+                atomic_load_explicit(&g_file_caps_gen, memory_order_acquire)) {
+        fd_close(fd);
+        return -1;
+    }
 
     // Copy from guest memory
     char buf[4096];
@@ -1049,7 +1062,7 @@ static inline int fast_write(struct cpu_state *cpu) {
     ssize_t res;
     do {
         res = write(fd->real_fd, buf, size);
-    } while (res < 0 && errno == EINTR);
+    } while (res < 0 && errno == EINTR && !syscall_should_surface_eintr());
 
     int error = res < 0 ? errno_map() : 0;
     fd_close(fd);

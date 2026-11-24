@@ -1,3 +1,4 @@
+#include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -24,76 +25,123 @@ void fs_register(const struct fs_ops *fs) {
     assert(!"reached filesystem limit");
 }
 
-// === MOUNT CACHE: Thread-local cache for mount lookups ===
-// Most file operations use the same mount point (e.g., realfs at "/")
-// Caching the last lookup can save repeated list traversals
-static __thread struct mount *last_mount_cache = NULL;
-static __thread uint64_t mount_cache_version = 0;
-static uint64_t global_mount_version = 0;  // Incremented on mount/umount
+// === MOUNT CACHE: Lock-free TLS snapshot + sharded reader grace period ===
+// Mounts rarely change after boot (typically "/", "/proc", "/dev/pts").
+// Each thread caches a complete snapshot of the mount table (root + non-root
+// mounts in descending length order) validated against mounts_generation.
+// Even generation = quiescent; odd = mount_remove() in progress.
+// Sharded per-slot reader counters let mount_remove() drain any in-flight
+// fast-path readers before checking mount->refcount and freeing struct mount,
+// eliminating global mounts_lock contention on both mount_find and mount_release.
+#define MOUNT_CACHE_MAX 16
+#define MOUNT_READER_SLOTS 16
 
-// Check if cached mount is valid for given path
-static inline bool mount_cache_check(struct mount *cached, const char *path) {
-    if (cached == NULL)
-        return false;
+struct mount_reader_slot {
+    _Atomic uint32_t count;
+    char pad[64 - sizeof(_Atomic uint32_t)];
+};
+static struct mount_reader_slot mount_readers[MOUNT_READER_SLOTS];
+static _Atomic uint32_t next_reader_slot = 0;
+static __thread int tls_reader_slot = -1;
 
-    // Check if mount table changed (mount/umount invalidates cache)
-    if (mount_cache_version != global_mount_version)
-        return false;
+// Always even when quiescent, odd while mount_remove() is draining/freeing.
+static _Atomic uint64_t mounts_generation = 2;
 
-    // Check if path is under cached mount point
-    size_t n = strlen(cached->point);
-    if (n == 0) {
-        // Root mount: only cache if path doesn't start with any other mount point
-        // For now, don't cache root mount lookups since they're ambiguous
-        return false;
+struct mount_cache_entry {
+    struct mount *mount;
+    size_t point_len;
+    char point[64];
+};
+struct mount_tls_cache {
+    uint64_t generation;
+    struct mount *root_mount;
+    unsigned non_root_count;
+    bool complete;
+    struct mount_cache_entry non_root[MOUNT_CACHE_MAX];
+};
+static __thread struct mount_tls_cache tls_mount_cache;
+
+static inline int mount_reader_slot_index(void) {
+    int slot = tls_reader_slot;
+    if (unlikely(slot < 0)) {
+        slot = (int) (atomic_fetch_add_explicit(&next_reader_slot, 1, memory_order_relaxed) % MOUNT_READER_SLOTS);
+        tls_reader_slot = slot;
     }
-    return (strncmp(path, cached->point, n) == 0 &&
-            (path[n] == '/' || path[n] == '\0'));
+    return slot;
 }
 
 struct mount *mount_find(char *path) {
     assert(path_is_normalized(path));
 
-    // === FAST PATH: Check thread-local cache ===
-    struct mount *cached = last_mount_cache;
-    if (mount_cache_check(cached, path)) {
-        // Cache hit - just increment refcount
-        lock(&mounts_lock);
-        cached->refcount++;
-        unlock(&mounts_lock);
-        return cached;
+    // === FAST PATH: Lock-free TLS mount table snapshot (including root "/") ===
+    int slot = mount_reader_slot_index();
+    atomic_fetch_add_explicit(&mount_readers[slot].count, 1, memory_order_seq_cst);
+    uint64_t gen = atomic_load_explicit(&mounts_generation, memory_order_seq_cst);
+    if (__builtin_expect((gen & 1) == 0 && tls_mount_cache.generation == gen && tls_mount_cache.complete, 1)) {
+        struct mount *found = tls_mount_cache.root_mount;
+        if (path[0] == '/') {
+            for (unsigned i = 0; i < tls_mount_cache.non_root_count; i++) {
+                const struct mount_cache_entry *e = &tls_mount_cache.non_root[i];
+                size_t n = e->point_len;
+                if (path[1] == e->point[1] &&
+                        strncmp(path, e->point, n) == 0 &&
+                        (path[n] == '/' || path[n] == '\0')) {
+                    found = e->mount;
+                    break;
+                }
+            }
+        }
+        if (__builtin_expect(found != NULL, 1)) {
+            __atomic_fetch_add(&found->refcount, 1, __ATOMIC_RELAXED);
+            atomic_fetch_sub_explicit(&mount_readers[slot].count, 1, memory_order_release);
+            return found;
+        }
     }
+    atomic_fetch_sub_explicit(&mount_readers[slot].count, 1, memory_order_release);
 
-    // === SLOW PATH: Full mount table search ===
+    // === SLOW PATH: Full mount table search + refresh TLS snapshot ===
     lock(&mounts_lock);
     struct mount *mount = NULL;
     assert(!list_empty(&mounts)); // this would mean there's no root FS mounted
-    list_for_each_entry(&mounts, mount, mounts) {
-        size_t n = strlen(mount->point);
-        if (strncmp(path, mount->point, n) == 0 && (path[n] == '/' || path[n] == '\0')) {
-            break;
+    struct mount_tls_cache next_cache = {0};
+    next_cache.complete = true;
+    struct mount *iter;
+    list_for_each_entry(&mounts, iter, mounts) {
+        size_t n = strlen(iter->point);
+        if (mount == NULL && strncmp(path, iter->point, n) == 0 && (path[n] == '/' || path[n] == '\0')) {
+            mount = iter;
+        }
+        if (n == 0) {
+            if (next_cache.root_mount == NULL)
+                next_cache.root_mount = iter;
+        } else if (next_cache.non_root_count < MOUNT_CACHE_MAX && n < sizeof(next_cache.non_root[0].point)) {
+            struct mount_cache_entry *e = &next_cache.non_root[next_cache.non_root_count++];
+            e->mount = iter;
+            e->point_len = n;
+            memcpy(e->point, iter->point, n + 1);
+        } else {
+            next_cache.complete = false;
         }
     }
-    mount->refcount++;
+    assert(mount != NULL);
+    __atomic_fetch_add(&mount->refcount, 1, __ATOMIC_RELAXED);
 
-    // Update cache
-    last_mount_cache = mount;
-    mount_cache_version = global_mount_version;
+    next_cache.generation = atomic_load_explicit(&mounts_generation, memory_order_relaxed);
+    if (next_cache.complete && next_cache.root_mount != NULL)
+        tls_mount_cache = next_cache;
+    else
+        tls_mount_cache.generation = 0;
 
     unlock(&mounts_lock);
     return mount;
 }
 
 void mount_retain(struct mount *mount) {
-    lock(&mounts_lock);
-    mount->refcount++;
-    unlock(&mounts_lock);
+    __atomic_fetch_add(&mount->refcount, 1, __ATOMIC_RELAXED);
 }
 
 void mount_release(struct mount *mount) {
-    lock(&mounts_lock);
-    mount->refcount--;
-    unlock(&mounts_lock);
+    __atomic_fetch_sub(&mount->refcount, 1, __ATOMIC_RELEASE);
 }
 
 int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags) {
@@ -112,6 +160,7 @@ int do_mount(const struct fs_ops *fs, const char *source, const char *point, con
     if (fs->mount) {
         int err = fs->mount(new_mount);
         if (err < 0) {
+            free((void *) new_mount->info);
             free((void *) new_mount->point);
             free((void *) new_mount->source);
             free(new_mount);
@@ -127,15 +176,27 @@ int do_mount(const struct fs_ops *fs, const char *source, const char *point, con
     }
     list_add_before(&mount->mounts, &new_mount->mounts);
 
-    // Invalidate all mount caches
-    global_mount_version++;
+    // Advance by 2 to keep mounts_generation even and invalidate all TLS caches.
+    atomic_fetch_add_explicit(&mounts_generation, 2, memory_order_release);
 
     return 0;
 }
 
 int mount_remove(struct mount *mount) {
-    if (mount->refcount != 0)
+    // Flip mounts_generation odd so new fast-path readers fall back to mounts_lock.
+    uint64_t gen = atomic_load_explicit(&mounts_generation, memory_order_relaxed);
+    atomic_store_explicit(&mounts_generation, gen + 1, memory_order_seq_cst);
+
+    // Drain any in-flight fast-path readers that observed the previous generation.
+    for (unsigned i = 0; i < MOUNT_READER_SLOTS; i++) {
+        while (atomic_load_explicit(&mount_readers[i].count, memory_order_seq_cst) != 0)
+            sched_yield();
+    }
+
+    if (__atomic_load_n(&mount->refcount, __ATOMIC_ACQUIRE) != 0) {
+        atomic_store_explicit(&mounts_generation, gen + 2, memory_order_release);
         return _EBUSY;
+    }
 
     if (mount->fs->umount)
         mount->fs->umount(mount);
@@ -145,8 +206,8 @@ int mount_remove(struct mount *mount) {
     free((void *) mount->point);
     free(mount);
 
-    // Invalidate all mount caches
-    global_mount_version++;
+    // Publish next quiescent even generation, invalidating all TLS caches.
+    atomic_store_explicit(&mounts_generation, gen + 2, memory_order_release);
 
     return 0;
 }

@@ -550,6 +550,26 @@
     gret
     read_bullshit 64, load64_imm_fast_1
 
+// LDR Xd, [Xn, #imm] - fast path without inline PC save (rn!=31, rd!=31)
+// Stream: [gadget addr][rd | rn<<8 | offset<<16].
+// Used when lazy fault-PC recovery (block->fault_pcs) resolves retry PC from _pc.
+.gadget load64_imm_fast_nopc
+    ldr x22, [_pc], #8
+    ubfx x9, x22, #8, #5       // rn (guaranteed != 31)
+    lsr x10, x22, #16           // offset (unsigned)
+    add x11, _cpu, #CPU_x0
+    ldr x12, [x11, x9, lsl #3]  // load base (no SP check)
+    add _addr, x12, x10
+    and _addr, _addr, #0xffffffffffff
+    mov x24, _addr               // save for crosspage slow path
+    read_prep 64, load64_imm_fast_nopc_1
+    ldr _tmp, [_addr]
+    and x8, x22, #0x1f          // rd (guaranteed != 31)
+    add x11, _cpu, #CPU_x0      // read miss calls C and may clobber x11
+    str _tmp, [x11, x8, lsl #3]
+    gret
+    read_bullshit 64, load64_imm_fast_nopc_1
+
 // LDR Wd, [Xn, #imm] - fast path (rn!=31, rd!=31)
 .gadget load32_imm_fast
     ldr x22, [_pc]

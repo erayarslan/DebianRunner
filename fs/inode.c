@@ -34,6 +34,7 @@ struct inode_data *inode_get_unlocked(struct mount *mount, ino_t ino) {
         mount_retain(mount);
         inode->mount = mount;
         inode->socket_id = 0;
+        atomic_init(&inode->posix_lock_count, 0);
         cond_init(&inode->posix_unlock);
         list_init(&inode->posix_locks);
         list_init(&inode->chain);
@@ -53,13 +54,22 @@ struct inode_data *inode_get(struct mount *mount, ino_t ino) {
 }
 
 void inode_check_orphaned(struct mount *mount, ino_t ino) {
+    if (ino == 0 || !mount->fs->inode_orphaned)
+        return;
+    bool call_orphaned = false;
     lock(&inodes_lock);
     struct inode_data *inode = inode_get_data(mount, ino);
-    if (inode == NULL)
-        mount->fs->inode_orphaned(mount, ino);
-    else
+    if (inode == NULL) {
+        mount_retain(mount);
+        call_orphaned = true;
+    } else {
         inode->orphan_pending = true;
+    }
     unlock(&inodes_lock);
+    if (call_orphaned) {
+        mount->fs->inode_orphaned(mount, ino);
+        mount_release(mount);
+    }
 }
 
 void inode_retain(struct inode_data *inode) {
@@ -74,10 +84,15 @@ void inode_release(struct inode_data *inode) {
     if (--inode->refcount == 0) {
         unlock(&inode->lock);
         list_remove(&inode->chain);
-        if (inode->orphan_pending && inode->mount->fs->inode_orphaned)
-            inode->mount->fs->inode_orphaned(inode->mount, inode->number);
+        bool call_orphaned = inode->orphan_pending && inode->mount->fs->inode_orphaned != NULL;
+        struct mount *mount = inode->mount;
+        ino_t number = inode->number;
         unlock(&inodes_lock);
-        mount_release(inode->mount);
+        if (call_orphaned)
+            mount->fs->inode_orphaned(mount, number);
+        mount_release(mount);
+        cond_destroy(&inode->posix_unlock);
+        pthread_mutex_destroy(&inode->lock.m);
         free(inode);
     } else {
         unlock(&inode->lock);

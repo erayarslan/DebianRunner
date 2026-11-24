@@ -2,8 +2,8 @@
 #include "GuestARM64.xcconfig"
 #include "XtermRenderer.xcconfig"
 
-// ARM64 app release version, independent of inherited non-ARM64 targets.
-MARKETING_VERSION = 1.1.2
+// ARM64 app version; CI/build-ipa.sh stamps 0.0.0-dev+<sha> or a release tag version.
+MARKETING_VERSION = 0.0.0-dev
 CURRENT_PROJECT_VERSION = 910
 LINUXRUNNER_DIAGNOSTIC = NO
 

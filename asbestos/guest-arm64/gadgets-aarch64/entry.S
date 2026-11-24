@@ -125,11 +125,10 @@ fiber_ret_chain:
     sub x11, _pc, #FIBER_BLOCK_code          // x11 = target fiber_block*
     ldr x12, [x11, #FIBER_BLOCK_addr]        // x12 = target->addr
     // Adjacent: target->addr == from->end_addr + 4
-    sub x12, x12, x10
-    cmp x12, #4
+    sub x13, x12, x10
+    cmp x13, #4
     b.ne fiber_ret_chain_memcheck
     // Same page: PAGE(from->end_addr) == PAGE(target->addr)
-    ldr x12, [x11, #FIBER_BLOCK_addr]        // reload target->addr
     eor x10, x10, x12                        // XOR end_addr ^ target->addr
     lsr x10, x10, #12                        // non-zero iff different pages
     cbnz x10, fiber_ret_chain_memcheck

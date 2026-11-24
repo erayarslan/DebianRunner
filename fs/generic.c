@@ -38,6 +38,22 @@ bool contains_mount_point(const char *path) {
     return false;
 }
 
+static int check_parent_dir_write(const char *normalized_path) {
+    char parent[MAX_PATH];
+    strcpy(parent, normalized_path);
+    char *slash = strrchr(parent, '/');
+    if (slash) *slash = '\0';
+    struct mount *mount = find_mount_and_trim_path(parent);
+    struct statbuf stat;
+    int err = mount->fs->stat(mount, parent, &stat);
+    if (!err) {
+        if (!S_ISDIR(stat.mode)) err = _ENOTDIR;
+        else err = mount_access_check(mount, parent, &stat, AC_W | AC_X);
+    }
+    mount_release(mount);
+    return err;
+}
+
 static struct fd *generic_openat_impl(struct fs_info *fs, struct fd *at,
         const char *path_raw, int flags, int mode, bool execute) {
     if (flags & O_RDWR_ && flags & O_WRONLY_)
@@ -82,8 +98,7 @@ static struct fd *generic_openat_impl(struct fs_info *fs, struct fd *at,
         int exists = existing_mount->fs->stat(existing_mount, existing_path, &existing);
         mount_release(existing_mount);
         if (exists == _ENOENT) {
-            err = fs ? path_normalize_in_fs(fs, at, path_raw, path, normalize_flags | N_PARENT_DIR_WRITE) :
-                path_normalize(at, path_raw, path, normalize_flags | N_PARENT_DIR_WRITE);
+            err = check_parent_dir_write(path);
             if (err < 0) return ERR_PTR(err);
             creating = true;
         } else if (exists < 0) return ERR_PTR(exists);
@@ -125,6 +140,7 @@ static struct fd *generic_openat_impl(struct fs_info *fs, struct fd *at,
     }
     fd->type = stat.mode & S_IFMT;
     fd->flags = flags;
+    fd->is_global_root = (mount->point[0] == '\0' && path[0] == '\0' && S_ISDIR(fd->type));
 
     if (!S_ISDIR(fd->type) && flags & O_DIRECTORY_) { err = _ENOTDIR; goto error; }
 
@@ -429,21 +445,27 @@ int generic_mkdirat(struct fd *at, const char *path_raw, mode_t_ mode) {
     int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW);
     if (err < 0)
         return err;
-    struct mount *existing = find_mount_and_trim_path(path);
+    char trimmed[MAX_PATH];
+    strcpy(trimmed, path);
+    struct mount *mount = find_mount_and_trim_path(trimmed);
     struct statbuf st;
-    err = existing->fs->stat(existing, path, &st);
-    mount_release(existing);
-    if (err == 0)
+    err = mount->fs->stat(mount, trimmed, &st);
+    if (err == 0) {
+        mount_release(mount);
         return _EEXIST;
-    if (err != _ENOENT)
+    }
+    if (err != _ENOENT) {
+        mount_release(mount);
         return err;
-    err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
-    if (err < 0)
+    }
+    err = check_parent_dir_write(path);
+    if (err < 0) {
+        mount_release(mount);
         return err;
-    struct mount *mount = find_mount_and_trim_path(path);
+    }
     err = _EPERM;
     if (mount->fs->mkdir)
-        err = mount->fs->mkdir(mount, path, mode);
+        err = mount->fs->mkdir(mount, trimmed, mode);
     mount_release(mount);
     return err;
 }

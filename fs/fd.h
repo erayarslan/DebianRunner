@@ -167,6 +167,11 @@ struct fd {
     // these are used for a variety of things related to the fd
     lock_t lock;
     cond_t cond;
+
+    // Appended at end to preserve existing field offsets.
+    uint64_t caps_stripped_gen;
+    bool is_global_root;
+    bool origin_tracked;
 };
 
 typedef sdword_t fd_t;
@@ -264,6 +269,9 @@ struct fd_ops {
     // handle F_SETFL, i.e. set O_NONBLOCK
     int (*setflags)(struct fd *fd, dword_t arg);
 };
+
+extern const struct fd_ops fakefs_fdops;
+extern _Atomic uint64_t g_file_caps_gen;
 
 struct fdtable {
     atomic_uint refcount;

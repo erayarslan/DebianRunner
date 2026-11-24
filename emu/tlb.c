@@ -1,47 +1,83 @@
+#include <stdatomic.h>
 #include "emu/cpu.h"
 #include "emu/tlb.h"
 #include "kernel/task.h"
 #include "kernel/memory.h"
 #include "kernel/fs.h"
 #include "util/sync.h"
+#include "asbestos/asbestos.h"
 #include "asbestos/frame.h"
 
+static void tlb_reset_entries(struct tlb *tlb) {
+    for (unsigned i = 0; i < TLB_SIZE; i++)
+        tlb->entries[i] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
+}
+
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
-    if (tlb->mmu == mmu && tlb->mem_changes == mmu->changes)
+    uint64_t changes = __atomic_load_n(&mmu->changes, __ATOMIC_ACQUIRE);
+    struct asbestos *asbestos = mmu->asbestos;
+    unsigned inv_gen = asbestos ? atomic_load_explicit(&asbestos->invalidate_gen, memory_order_acquire) : 0;
+
+    if (tlb->mmu == mmu && tlb->mem_changes == (unsigned)changes &&
+            tlb->block_cache_gen == inv_gen)
         return;
 
     bool mmu_changed = (tlb->mmu != mmu);
-    bool mappings_changed = (tlb->mmu == mmu && tlb->mem_changes != mmu->changes);
+    bool code_invalidated = (tlb->block_cache_gen != inv_gen);
 
-    if (mmu_changed || mappings_changed) {
-        // The persistent threaded-code caches contain host pointers into guest-code
-        // fiber blocks. They must be dropped whenever mappings change, not just
-        // when the mmu pointer itself changes, because execve/remap paths can keep
-        // the same mmu object while replacing the underlying mappings.
+    if (mmu_changed || code_invalidated) {
+        // Persistent threaded-code caches hold host pointers into fiber blocks.
+        // Drop them only when the address space changes or translated code is
+        // invalidated — never on data-only brk/mmap/CoW mmu->changes bumps.
         memset(tlb->block_cache, 0, sizeof(tlb->block_cache));
-        tlb->block_cache_gen = 0;
+        tlb->block_cache_gen = inv_gen;
 
         if (tlb->frame != NULL) {
+            memset(tlb->frame->ret_cache, 0, sizeof(tlb->frame->ret_cache));
+            tlb->frame->last_block = NULL;
             if (mmu_changed) {
-                free(tlb->frame);
-                tlb->frame = NULL;
-            } else {
-                memset(tlb->frame->ret_cache, 0, sizeof(tlb->frame->ret_cache));
-                tlb->frame->last_block = NULL;
+                // Reuse the existing frame allocation across execve/mmu switch.
+                tlb->frame->bp = NULL;
+                tlb->frame->value_addr = 0;
+                tlb->frame->jit_saved_pc = 0;
+                tlb->frame->fault_code = NULL;
+                tlb->frame->xzr_read = 0;
+                tlb->frame->xzr_sink = 0;
+#ifdef ISH_JIT
+                tlb->frame->native_fault_host_pc = 0;
+                tlb->frame->native_fault_guest_pc = 0;
+                tlb->frame->native_fault_addr = 0;
+                tlb->frame->native_fault_write = 0;
+#endif
             }
         }
     }
 
-    tlb->mmu = mmu;
     tlb->dirty_page = TLB_PAGE_EMPTY;
-    tlb->mem_changes = mmu->changes;
-    tlb_flush(tlb);
+    if (mmu_changed) {
+        tlb->mmu = mmu;
+        tlb->mem_changes = (unsigned)changes;
+        tlb_reset_entries(tlb);
+    } else if (tlb->mem_changes != (unsigned)changes) {
+        tlb_flush(tlb);
+    }
 }
 
 void tlb_flush(struct tlb *tlb) {
-    tlb->mem_changes = tlb->mmu->changes;
-    for (unsigned i = 0; i < TLB_SIZE; i++)
-        tlb->entries[i] = (struct tlb_entry) {.page = 1, .page_if_writable = 1};
+    uint64_t changes = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
+#ifdef GUEST_ARM64
+    // All ARM64 TLB lookup paths (tlb.h, gadgets.h, jit.c) verify
+    // entry.gen == mmu->changes. When mmu->changes has advanced on the same
+    // mmu without wrapping to 0, older entries already miss in O(1).
+    // Forced flushes at the same generation (e.g. INT_JIT_CRASH) or wrap to 0
+    // perform a full entry reset.
+    if ((unsigned)changes != tlb->mem_changes && (uintptr_t)changes != 0 && (unsigned)changes != 0) {
+        tlb->mem_changes = (unsigned)changes;
+        return;
+    }
+#endif
+    tlb->mem_changes = (unsigned)changes;
+    tlb_reset_entries(tlb);
 }
 
 void tlb_free(struct tlb *tlb) {
@@ -115,9 +151,15 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
     // change).
     for (int attempt = 0; ; attempt++) {
         gen = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
-        if (gen != tlb->mem_changes)
+        if ((unsigned)gen != tlb->mem_changes) {
+#ifdef GUEST_ARM64
+            if ((uintptr_t)gen == 0 || (unsigned)gen == 0)
+                tlb_reset_entries(tlb);
+            tlb->mem_changes = (unsigned)gen;
+#else
             tlb_flush(tlb);
-        tlb->mem_changes = gen;
+#endif
+        }
         ptr = mmu_translate(tlb->mmu, TLB_PAGE(addr), type);
         // Re-read after translate; if unchanged, ptr is consistent with `gen`.
         if (__atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE) == gen)
@@ -126,7 +168,7 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
             // Refresh gen to the post-translate value so the entry we stamp is
             // at least self-consistent with this last translation.
             gen = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
-            tlb->mem_changes = gen;
+            tlb->mem_changes = (unsigned)gen;
             break;
         }
         // Raced with a concurrent remap — retry with the fresh generation.

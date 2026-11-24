@@ -12,22 +12,84 @@ struct DiagnosticEvent: Codable {
     var tid: Int?
 }
 enum DiagnosticPrivacy {
+    private static let compiledPatterns: [(NSRegularExpression, String)] = [
+        (#"(?i)(password|passwd|token|secret|api[_-]?key|cookie|authorization)"?\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"#, "$1=[REDACTED]"),
+        (#"(?i)Bearer\s+\S+"#, "Bearer [REDACTED]"),
+        (#"(https?://)[^/\s]*@"#, "$1[REDACTED]@"),
+        (#"(https?://[^/\s?#]+)[/][^\s]*"#, "$1/[path omitted]"),
+        (#"(https?://[^\s?#]+)[?#][^\s]*"#, "$1?[REDACTED]"),
+        (#"title=.*$"#, "title=[omitted]")
+    ].compactMap { pattern, replacement in
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        return (regex, replacement)
+    }
+
+    // Fast single-pass UTF-8 prefilter: returns false only when none of the
+    // fail-closed rules or compiled regexes can possibly match.
+    private static func mayNeedRedaction(_ buf: UnsafeBufferPointer<UInt8>) -> Bool {
+        let n = buf.count
+        @inline(__always) func lower(_ b: UInt8) -> UInt8 {
+            (b >= 65 && b <= 90) ? (b &+ 32) : b
+        }
+        @inline(__always) func matches(_ at: Int, _ target: StaticString) -> Bool {
+            let len = target.utf8CodeUnitCount
+            if len > n - at { return false }
+            let ptr = target.utf8Start
+            for j in 0..<len {
+                if lower(buf[at + j]) != ptr[j] { return false }
+            }
+            return true
+        }
+        var i = 0
+        while i < n {
+            switch lower(buf[i]) {
+            case UInt8(ascii: "-"):
+                if matches(i, "-----begin") { return true }
+            case UInt8(ascii: "a"):
+                if matches(i, "api") || matches(i, "auth") { return true }
+            case UInt8(ascii: "b"):
+                if matches(i, "bearer") || matches(i, "bytes_hex=") { return true }
+            case UInt8(ascii: "c"):
+                if matches(i, "cookie") { return true }
+            case UInt8(ascii: "h"):
+                if matches(i, "http") { return true }
+            case UInt8(ascii: "k"):
+                if matches(i, "key_text=") { return true }
+            case UInt8(ascii: "p"):
+                if matches(i, "pass") { return true }
+            case UInt8(ascii: "s"):
+                if matches(i, "secret") { return true }
+            case UInt8(ascii: "t"):
+                if matches(i, "token") || matches(i, "title=") { return true }
+            case 0xC3: // U+00DF 'ß' (folds to "ss")
+                if i + 1 < n && buf[i + 1] == 0x9F { return true }
+            case 0xC4: // U+0130 'İ' / U+0131 'ı' (Turkish 'i' fold)
+                if i + 1 < n && (buf[i + 1] == 0xB0 || buf[i + 1] == 0xB1) { return true }
+            case 0xC5: // U+017F 'ſ' (folds to 's')
+                if i + 1 < n && buf[i + 1] == 0xBF { return true }
+            case 0xE2: // U+212A 'K' (folds to 'k')
+                if i + 2 < n && buf[i + 1] == 0x84 && buf[i + 2] == 0xAA { return true }
+            default:
+                break
+            }
+            i &+= 1
+        }
+        return false
+    }
+
     static func redact(_ input: String) -> String {
+        if input.isEmpty { return input }
+        var contiguous = input
+        let needsScan = contiguous.withUTF8 { mayNeedRedaction($0) }
+        if !needsScan {
+            return contiguous.utf8.count <= 4096 ? input : String(input.prefix(4096))
+        }
         // Fail closed for payloads whose meaning cannot be safely inferred.
         if ["bytes_hex=", "key_text=", "Authorization:", "Set-Cookie:", "Cookie:"].contains(where: input.localizedCaseInsensitiveContains) { return "[private payload omitted]" }
         if input.contains("-----BEGIN") { return "[key material omitted]" }
         var result = input
-        let patterns = [
-            (#"(?i)(password|passwd|token|secret|api[_-]?key|cookie|authorization)"?\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"#, "$1=[REDACTED]"),
-            (#"(?i)Bearer\s+\S+"#, "Bearer [REDACTED]"),
-            (#"(https?://)[^/\s]*@"#, "$1[REDACTED]@"),
-            (#"(https?://[^/\s?#]+)[/][^\s]*"#, "$1/[path omitted]"),
-            (#"(https?://[^\s?#]+)[?#][^\s]*"#, "$1?[REDACTED]"),
-            (#"title=.*$"#, "title=[omitted]")]
-        for (pattern, replacement) in patterns {
-            if let regex = try? NSRegularExpression(pattern: pattern) {
-                result = regex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: replacement)
-            }
+        for (regex, replacement) in compiledPatterns {
+            result = regex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: replacement)
         }
         return String(result.prefix(4096))
     }
@@ -161,9 +223,12 @@ final class StructuredLogStore {
         retainedFiles = max(1, min(16, count))
         if retainedFiles < 16 { for n in (retainedFiles + 1)...16 { try? FileManager.default.removeItem(at: directory.appendingPathComponent("events.\(n).jsonl")) } }
     }
-    func append(_ event: DiagnosticEvent) throws {
+    func append(_ event: DiagnosticEvent, alreadyRedacted: Bool = false) throws {
         lock.lock(); defer { lock.unlock() }
-        var safe = event; safe.message = DiagnosticPrivacy.redact(event.message)
+        var safe = event
+        if !alreadyRedacted {
+            safe.message = DiagnosticPrivacy.redact(event.message)
+        }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         var data = try encoder.encode(safe); data.append(10)
         if size + data.count > maximumBytes {
@@ -346,20 +411,22 @@ import SwiftUI
     @objc static func setRetention(_ count: Int) { queue.sync { store?.setRetention(count) }; UserDefaults.standard.set(count.clamped(to: 1...16), forKey: "DiagnosticRetention") }
     @objc static func record(_ category: String, severity: Int, message: String, pid: Int, tid: Int) {
         guard slots.wait(timeout: .now()) == .success else { overflowLock.lock(); dropped += 1; overflowLock.unlock(); return }
-        let event = DiagnosticEvent(level: DiagnosticLevel(rawValue: severity) ?? .info, category: category, message: DiagnosticPrivacy.redact(message), pid: pid > 0 ? pid : nil, tid: tid > 0 ? tid : nil)
+        let event = DiagnosticEvent(level: DiagnosticLevel(rawValue: severity) ?? .info, category: category, message: message, pid: pid > 0 ? pid : nil, tid: tid > 0 ? tid : nil)
         queue.async {
             defer { slots.signal() }
             overflowLock.lock(); let lost = dropped; dropped = 0; overflowLock.unlock()
-            if lost > 0 { try? store?.append(DiagnosticEvent(level: .warning, category: "DIAGNOSTICS", message: "pending_queue_overflow dropped_records=\(lost)")) }
+            if lost > 0 { try? store?.append(DiagnosticEvent(level: .warning, category: "DIAGNOSTICS", message: "pending_queue_overflow dropped_records=\(lost)"), alreadyRedacted: true) }
             guard event.level.rawValue <= threshold.rawValue else { return }
-            let stableMessage = event.message.components(separatedBy: " duration_ns=").first ?? event.message
-            let key = "\(event.category):\(event.pid ?? 0):\(stableMessage)"
+            var redacted = event
+            redacted.message = DiagnosticPrivacy.redact(event.message)
+            let stableMessage = redacted.message.components(separatedBy: " duration_ns=").first ?? redacted.message
+            let key = "\(redacted.category):\(redacted.pid ?? 0):\(stableMessage)"
             if threshold != .trace {
                 if let previous = repeated[key], Date().timeIntervalSince(previous.0) < 5 { repeated[key] = (previous.0, previous.1 + 1); return }
-                if let previous = repeated[key], previous.1 > 0 { try? store?.append(DiagnosticEvent(level: event.level, category: event.category, message: "repeated_records=\(previous.1) original=\(stableMessage)", pid: event.pid, tid: event.tid)) }
+                if let previous = repeated[key], previous.1 > 0 { try? store?.append(DiagnosticEvent(level: redacted.level, category: redacted.category, message: String("repeated_records=\(previous.1) original=\(stableMessage)".prefix(4096)), pid: redacted.pid, tid: redacted.tid), alreadyRedacted: true) }
                 if repeated.count > 256 { repeated.removeAll() }; repeated[key] = (Date(), 0)
             }
-            try? store?.append(event)
+            try? store?.append(redacted, alreadyRedacted: true)
         }
     }
     @objc static func entries() -> [[String: Any]] {

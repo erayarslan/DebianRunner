@@ -82,6 +82,11 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
 
     dword_t orig_count = count;
 
+    // Batch serialized dirents into a 4 KiB chunk buffer to avoid one
+    // user_write (and mem->lock / TLB lookup) per directory entry.
+    char chunk[4096];
+    size_t chunk_len = 0;
+
     long ptr;
     int err;
     int printed = 0;
@@ -94,8 +99,7 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
         if (err == 0)
             break;
 
-        size_t max_reclen = sizeof(struct linux_dirent64_) + strlen(entry.name) + 4;
-        char dirent_data[max_reclen];
+        char dirent_data[sizeof(struct linux_dirent64_) + NAME_MAX + 4];
         ino_t inode = entry.inode;
         off_t_ offset = fd_telldir(fd);
         const char *name = entry.name;
@@ -109,14 +113,24 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
 
         if (reclen > count)
             break;
+        if (chunk_len + reclen > sizeof(chunk)) {
+            if (user_write(dirents, chunk, chunk_len))
+                return _EFAULT;
+            dirents += chunk_len;
+            chunk_len = 0;
+        }
 #if DENTS_DEBUG
         fprintf(stderr, "getdents: returning entry: name='%s' inode=%lu off=%lu reclen=%zu at addr=%#llx\n",
-                name, (unsigned long)inode, (unsigned long)offset, reclen, (unsigned long long)dirents);
+                name, (unsigned long)inode, (unsigned long)offset, reclen, (unsigned long long)(dirents + chunk_len));
 #endif
-        if (user_write(dirents, dirent_data, reclen))
-            return _EFAULT;
-        dirents += reclen;
+        memcpy(chunk + chunk_len, dirent_data, reclen);
+        chunk_len += reclen;
         count -= reclen;
+    }
+
+    if (chunk_len > 0) {
+        if (user_write(dirents, chunk, chunk_len))
+            return _EFAULT;
     }
 
     fd_seekdir(fd, ptr);

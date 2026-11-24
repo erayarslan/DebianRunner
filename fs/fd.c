@@ -19,32 +19,37 @@
 #include <sys/ioctl.h>
 #undef fd_create
 extern const struct fd_ops socket_fdops;
+extern volatile bool g_trace_syscalls;
 
 static atomic_uint live_descriptions;
 
-// Fixed-size origin registry: no per-descriptor allocation and no fd layout
-// change (the GPU tools mirror that private layout). Dropped origins are counted.
+// Fixed-size origin registry: no per-descriptor allocation. Dropped origins are counted.
+// Only populated when syscall tracing is enabled or descriptor pressure is elevated
+// (> 512 live descriptions) so routine fd_create/fd_close avoid global lock contention.
 struct fd_origin { struct fd *fd; const char *site; uint64_t serial; int tid, tgid; };
 static struct fd_origin origins[4096];
 static lock_t origins_lock = LOCK_INITIALIZER;
 static uint64_t origin_serial;
 static atomic_uint created_descriptions, destroyed_descriptions, dropped_origins;
 static unsigned origin_slot(struct fd *fd) { return ((uintptr_t)fd >> 4) % 4096; }
-static void origin_create(struct fd *fd, const char *site) {
+static bool origin_create(struct fd *fd, const char *site) {
     lock(&origins_lock);
     unsigned start=origin_slot(fd), slot=start;
     do {
         if (!origins[slot].fd) {
             origins[slot]=(struct fd_origin){fd,site,++origin_serial,current?current->pid:0,current?current->tgid:0};
-            unlock(&origins_lock); return;
+            unlock(&origins_lock); return true;
         }
         slot=(slot+1)%4096;
     } while(slot!=start);
     atomic_fetch_add_explicit(&dropped_origins,1,memory_order_relaxed);
     unlock(&origins_lock);
+    return false;
 }
 static struct fd_origin origin_get(struct fd *fd, bool remove) {
     struct fd_origin result={0};
+    if (!fd->origin_tracked)
+        return result;
     lock(&origins_lock);
     // A removed slot cannot terminate a lookup: slots are reused independently.
     unsigned start=origin_slot(fd), slot=start;
@@ -52,6 +57,7 @@ static struct fd_origin origin_get(struct fd *fd, bool remove) {
         if (origins[slot].fd==fd) { result=origins[slot]; if(remove)origins[slot].fd=NULL; break; }
         slot=(slot+1)%4096;
     } while(slot!=start);
+    if (remove) fd->origin_tracked = false;
     unlock(&origins_lock); return result;
 }
 // Failure-only observation of a pinned description. No new descriptor, mapping
@@ -176,11 +182,26 @@ struct fd *fd_mapping_identity(struct fd *source) {
     if (source->memfd || source->ops == &mapping_identity_fdops || source->real_fd < 0 || source->mount == NULL)
         return fd_retain(source);
     struct mapping_identity *identity = calloc(1, sizeof(*identity));
-    char *path = malloc(MAX_PATH);
-    if (identity == NULL || path == NULL) { free(identity); free(path); return fd_retain(source); }
-    if (source->mount->fs->getpath(source, path) == 0) identity->relpath = strdup(path);
-    if (generic_getpath(source, path) == 0) identity->path = strdup(path);
-    free(path);
+    if (identity == NULL) return fd_retain(source);
+    char path[MAX_PATH + 1];
+    if (source->mount->fs->getpath(source, path) == 0) {
+        size_t rel_len = strlen(path);
+        size_t point_len = strlen(source->mount->point);
+        identity->relpath = malloc(rel_len + 1);
+        if (identity->relpath)
+            memcpy(identity->relpath, path, rel_len + 1);
+        if (rel_len + point_len < MAX_PATH) {
+            if (point_len == 0 && rel_len == 0) {
+                identity->path = strdup("/");
+            } else {
+                identity->path = malloc(point_len + rel_len + 1);
+                if (identity->path) {
+                    memcpy(identity->path, source->mount->point, point_len);
+                    memcpy(identity->path + point_len, path, rel_len + 1);
+                }
+            }
+        }
+    }
     struct stat st;
     if (fstat(source->real_fd, &st) == 0) { identity->dev = st.st_dev; identity->ino = st.st_ino; identity->have_stat = true; }
     struct fd *fd = fd_create_at(&mapping_identity_fdops, "mapping_identity");
@@ -216,7 +237,7 @@ struct fd *fd_create_at(const struct fd_ops *ops, const char *site) {
     *fd = (struct fd) {};
     fd->ops = ops;
     fd->refcount = 1;
-    atomic_fetch_add_explicit(&live_descriptions, 1, memory_order_relaxed);
+    unsigned live = atomic_fetch_add_explicit(&live_descriptions, 1, memory_order_relaxed) + 1;
     fd->flags = 0;
     fd->mount = NULL;
     fd->offset = 0;
@@ -225,7 +246,8 @@ struct fd *fd_create_at(const struct fd_ops *ops, const char *site) {
     lock_init(&fd->poll_lock);
     lock_init(&fd->lock);
     cond_init(&fd->cond);
-    origin_create(fd,site);
+    if (unlikely(g_trace_syscalls || live > 512))
+        fd->origin_tracked = origin_create(fd, site);
     atomic_fetch_add_explicit(&created_descriptions,1,memory_order_relaxed);
     return fd;
 }
@@ -237,7 +259,8 @@ void fd_discard_unopened(struct fd *fd) {
     cond_destroy(&fd->cond);
     pthread_mutex_destroy(&fd->lock.m);
     pthread_mutex_destroy(&fd->poll_lock.m);
-    origin_get(fd,true);
+    if (unlikely(fd->origin_tracked))
+        origin_get(fd, true);
     atomic_fetch_add_explicit(&destroyed_descriptions,1,memory_order_relaxed);
     atomic_fetch_sub_explicit(&live_descriptions, 1, memory_order_relaxed);
     free(fd);
@@ -271,7 +294,8 @@ int fd_close(struct fd *fd) {
             pthread_mutex_destroy(&fd->memfd->lock.m);
             free(fd->memfd);
         }
-        origin_get(fd,true);
+        if (unlikely(fd->origin_tracked))
+            origin_get(fd, true);
         atomic_fetch_add_explicit(&destroyed_descriptions,1,memory_order_relaxed);
         atomic_fetch_sub_explicit(&live_descriptions, 1, memory_order_relaxed);
         free(fd);

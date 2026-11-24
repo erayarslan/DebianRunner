@@ -21,10 +21,13 @@ if [[ $diagnostic == YES && -z ${RELEASE_DIR:-} ]]; then release="$PWD/build/dev
 mkdir -p "$release"
 release=$(cd "$release" && pwd)
 archive="$release/$artifact.xcarchive"
+short_sha=$(git rev-parse --short=7 HEAD)
+marketing_version="${MARKETING_VERSION:-0.0.0-dev+${short_sha}}"
 args=(-project iSH.xcodeproj -scheme LinuxRunner -configuration Release
       -destination 'generic/platform=iOS' -archivePath "$archive"
       -derivedDataPath "$PWD/build/release-derived"
       "LINUXRUNNER_SOURCE_COMMIT=$(git rev-parse HEAD)"
+      "MARKETING_VERSION=${marketing_version}"
       IPHONEOS_DEPLOYMENT_TARGET=15.0 "LINUXRUNNER_DIAGNOSTIC=$diagnostic"
       "ROOT_BUNDLE_IDENTIFIER=${BUNDLE_ID:-dev.debianrunner.app}")
 if [[ $diagnostic == YES ]]; then args+=(CODE_SIGN_ENTITLEMENTS=app/LinuxRunner/PrivateContainer.entitlements); fi

@@ -105,13 +105,30 @@ struct fakefs_bind_mount {
 };
 
 static struct fakefs_bind_mount g_bind_mounts[FAKEFS_MAX_BIND_MOUNTS];
+static _Atomic int g_bind_mount_count = 0;
+static _Atomic int g_readonly_bind_mount_count = 0;
 struct mount *g_fakefs_mount = NULL;
+
+static void bind_mount_recount(void) {
+    int total = 0, ro = 0;
+    for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
+        if (g_bind_mounts[i].active) {
+            total++;
+            if (g_bind_mounts[i].read_only)
+                ro++;
+        }
+    }
+    atomic_store_explicit(&g_bind_mount_count, total, memory_order_release);
+    atomic_store_explicit(&g_readonly_bind_mount_count, ro, memory_order_release);
+}
 
 /* Translate a resolved host path back to a Linux path for bind mounts.
  * e.g. "/Users/.../MinisChat/minis/<sid>/attachments/file.mp4"
  *   -> "/var/minis/attachments/file.mp4"
  * Returns true and writes to out_path if a match was found. */
 bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t out_size) {
+    if (atomic_load_explicit(&g_bind_mount_count, memory_order_acquire) == 0)
+        return false;
     for (int i = 0; i < FAKEFS_MAX_BIND_MOUNTS; i++) {
         if (!g_bind_mounts[i].active)
             continue;
@@ -147,7 +164,7 @@ bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t
 /* Public wrapper for native offload handlers. See fake.h. */
 bool fakefs_bind_mount_translate_path(const char *path, char *out_path, size_t out_size);
 
-static bool bind_mount_translate_path(const char *path, char *out_path, size_t out_size) {
+static __attribute__((noinline)) bool bind_mount_translate_path_slow(const char *path, char *out_path, size_t out_size) {
     /* Normalize: if path lacks leading /, prepend it for comparison.
      * Bind mount table always stores paths with leading /. */
     char normalized[MAX_PATH];
@@ -169,10 +186,15 @@ static bool bind_mount_translate_path(const char *path, char *out_path, size_t o
     }
     return false;
 }
+static inline bool bind_mount_translate_path(const char *path, char *out_path, size_t out_size) {
+    if (atomic_load_explicit(&g_bind_mount_count, memory_order_acquire) == 0)
+        return false;
+    return bind_mount_translate_path_slow(path, out_path, out_size);
+}
 
 /* Check if a path is at or under a bind mount prefix.
  * Handles both "/var/minis/..." and "var/minis/..." (without leading /). */
-static struct fakefs_bind_mount *bind_mount_for_path(const char *path) {
+static __attribute__((noinline)) struct fakefs_bind_mount *bind_mount_for_path_slow(const char *path) {
     char normalized[MAX_PATH];
     const char *cmp_path = path;
     if (path[0] != '/') {
@@ -191,7 +213,12 @@ static struct fakefs_bind_mount *bind_mount_for_path(const char *path) {
     }
     return best;
 }
-static bool is_under_bind_mount(const char *path) {
+static inline struct fakefs_bind_mount *bind_mount_for_path(const char *path) {
+    if (atomic_load_explicit(&g_bind_mount_count, memory_order_acquire) == 0)
+        return NULL;
+    return bind_mount_for_path_slow(path);
+}
+static __attribute__((noinline)) bool is_under_bind_mount_slow(const char *path) {
     char normalized[MAX_PATH];
     const char *cmp_path = path;
     if (path[0] != '/') {
@@ -208,13 +235,18 @@ static bool is_under_bind_mount(const char *path) {
     }
     return false;
 }
+static inline bool is_under_bind_mount(const char *path) {
+    if (atomic_load_explicit(&g_bind_mount_count, memory_order_acquire) == 0)
+        return false;
+    return is_under_bind_mount_slow(path);
+}
 
 /* Return true if `path` is at or under a bind mount that was registered
  * with read_only=true. Used by the fakefs write entry points to reject
  * modifications with EROFS. Root bypasses the DAC access_check path, so
  * relying on the meta.db 0555 mode bits alone is insufficient — we enforce
  * it here instead. */
-static bool is_under_readonly_bind_mount(const char *path) {
+static __attribute__((noinline)) bool is_under_readonly_bind_mount_slow(const char *path) {
     char normalized[MAX_PATH];
     const char *cmp_path = path;
     if (path[0] != '/') {
@@ -230,6 +262,11 @@ static bool is_under_readonly_bind_mount(const char *path) {
             return true;
     }
     return false;
+}
+static inline bool is_under_readonly_bind_mount(const char *path) {
+    if (atomic_load_explicit(&g_readonly_bind_mount_count, memory_order_acquire) == 0)
+        return false;
+    return is_under_readonly_bind_mount_slow(path);
 }
 
 /* Auto-create a meta.db entry for a path under a bind mount.
@@ -276,8 +313,11 @@ static inode_t bind_mount_ensure_inode(struct fakefs_db *fs, struct mount *mount
     return ino;
 }
 
-// this exists only to override readdir to fix the returned inode numbers
-static struct fd_ops fakefs_fdops;
+// Declared extern const in fs/fd.h; defined below after fakefs_readdir.
+extern ssize_t realfs_pread(struct fd *fd, void *buf, size_t bufsize, off_t off);
+extern ssize_t realfs_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_t off);
+extern struct fd *realfs_reopen(struct fd *source, int flags);
+extern void inode_try_cleanup(struct fakefs_db *fs, inode_t inode);
 
 static bool fakefs_caps_allowed(struct fd *fd) {
     // Host-shared imports can change outside the guest write hooks. Never
@@ -302,6 +342,36 @@ static int fakefs_strip_caps_path(struct mount *mount, const char *path) {
     return err == _ENODATA || err == _EOPNOTSUPP ? 0 : err;
 }
 
+static __attribute__((noinline)) struct fd *fakefs_open_bind_mount(const char *path, int flags) {
+    char host_abs[PATH_MAX];
+    if (!bind_mount_translate_path_slow(path, host_abs, sizeof(host_abs)))
+        return NULL;
+    int real_flags = 0;
+    if (flags & O_RDONLY_) real_flags |= O_RDONLY;
+    if (flags & O_WRONLY_) real_flags |= O_WRONLY;
+    if (flags & O_RDWR_) real_flags |= O_RDWR;
+    if (flags & O_CREAT_) real_flags |= O_CREAT;
+    if (flags & O_EXCL_) real_flags |= O_EXCL;
+    // Truncate in generic_openat after guest DAC and file-cap invalidation.
+    if (flags & O_APPEND_) real_flags |= O_APPEND;
+    if (flags & O_NONBLOCK_) real_flags |= O_NONBLOCK;
+    if (flags & O_NOFOLLOW_) real_flags |= O_NOFOLLOW;
+    // Reserve the descriptor before a create/truncate can have effects.
+    struct fd *fd = fd_create(&realfs_fdops);
+    if (fd == NULL)
+        return ERR_PTR(_ENOMEM);
+    int fd_no = open(host_abs, real_flags, 0666);
+    if (fd_no < 0) {
+        int err = errno_map();
+        fd_discard_unopened(fd);
+        return ERR_PTR(err);
+    }
+    fd->real_fd = fd_no;
+    fd->dir = NULL;
+    fd->flags = flags & ~O_TRUNC_;
+    return fd;
+}
+
 static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, int mode) {
     struct fakefs_db *fs = &mount->fakefs;
 
@@ -315,54 +385,51 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
 
     /* For bind-mounted paths, open directly via host absolute path
      * instead of relying on symlink traversal (which iOS sandbox may block). */
-    char host_abs[PATH_MAX];
-    struct fd *fd;
-    if (bind_mount_translate_path(path, host_abs, sizeof(host_abs))) {
-        int real_flags = 0;
-        if (flags & O_RDONLY_) real_flags |= O_RDONLY;
-        if (flags & O_WRONLY_) real_flags |= O_WRONLY;
-        if (flags & O_RDWR_) real_flags |= O_RDWR;
-        if (flags & O_CREAT_) real_flags |= O_CREAT;
-        if (flags & O_EXCL_) real_flags |= O_EXCL;
-        // Truncate in generic_openat after guest DAC and file-cap invalidation.
-        if (flags & O_APPEND_) real_flags |= O_APPEND;
-        if (flags & O_NONBLOCK_) real_flags |= O_NONBLOCK;
-        if (flags & O_NOFOLLOW_) real_flags |= O_NOFOLLOW;
-        // Reserve the descriptor before a create/truncate can have effects.
-        fd = fd_create(&realfs_fdops);
-        if (fd == NULL)
-            return ERR_PTR(_ENOMEM);
-        int fd_no = open(host_abs, real_flags, 0666);
-        if (fd_no < 0) {
-            int err = errno_map();
-            fd_discard_unopened(fd);
-            return ERR_PTR(err);
-        }
-        fd->real_fd = fd_no;
-        fd->dir = NULL;
-    } else {
+    struct fd *fd = NULL;
+    if (atomic_load_explicit(&g_bind_mount_count, memory_order_acquire) > 0) {
+        fd = fakefs_open_bind_mount(path, flags);
+        if (IS_ERR(fd))
+            return fd;
+    }
+    if (fd == NULL) {
         fd = realfs.open(mount, path, flags, 0666);
         if (IS_ERR(fd))
             return fd;
     }
-    // Plain opens only read metadata; avoid acquiring SQLite's writer lock.
-    if (flags & O_CREAT_)
+    if ((flags & (O_CREAT_ | O_EXCL_)) == (O_CREAT_ | O_EXCL_)) {
         db_begin_write(fs);
-    else
-        db_begin_read(fs);
-    fd->fake_inode = path_get_inode(fs, path);
-    if (flags & O_CREAT_) {
-        struct ish_stat ishstat;
-        ishstat.mode = mode | S_IFREG;
-        ishstat.uid = current->euid;
-        ishstat.gid = current->egid;
-        ishstat.rdev = 0;
+        fd->fake_inode = path_get_inode(fs, path);
         if (fd->fake_inode == 0) {
-            path_create(fs, path, &ishstat);
+            struct ish_stat ishstat = {
+                .mode = mode | S_IFREG,
+                .uid = current->euid,
+                .gid = current->egid,
+                .rdev = 0,
+            };
+            fd->fake_inode = path_create(fs, path, &ishstat);
+        }
+        db_commit(fs);
+    } else {
+        // Plain opens and O_CREAT on an already-existing file only read metadata;
+        // avoid acquiring SQLite's writer lock unless we actually need to create.
+        db_begin_read(fs);
+        fd->fake_inode = path_get_inode(fs, path);
+        db_commit(fs);
+        if (fd->fake_inode == 0 && (flags & O_CREAT_)) {
+            db_begin_write(fs);
             fd->fake_inode = path_get_inode(fs, path);
+            if (fd->fake_inode == 0) {
+                struct ish_stat ishstat = {
+                    .mode = mode | S_IFREG,
+                    .uid = current->euid,
+                    .gid = current->egid,
+                    .rdev = 0,
+                };
+                fd->fake_inode = path_create(fs, path, &ishstat);
+            }
+            db_commit(fs);
         }
     }
-    db_commit(fs);
     if (fd->fake_inode == 0) {
         /* Auto-create for bind-mounted paths */
         if (is_under_bind_mount(path)) {
@@ -546,45 +613,16 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
     return 0;
 }
 
-static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
-    struct fakefs_db *fs = &mount->fakefs;
-    db_begin_read(fs);
-    struct ish_stat ishstat;
-    ino_t inode;
-    if (!path_read_stat(fs, path, &ishstat, &inode)) {
-        db_rollback(fs);
-        /* Auto-create for bind-mounted paths */
-        if (is_under_bind_mount(path)) {
-            inode = bind_mount_ensure_inode(fs, mount, path);
-            if (inode != 0) {
-                db_begin_read(fs);
-                path_read_stat(fs, path, &ishstat, &inode);
-                db_commit(fs);
-                int err = realfs.stat(mount, path, fake_stat);
-                if (err < 0)
-                    return err;
-                fake_stat->inode = inode;
-                fake_stat->mode = ishstat.mode;
-                fake_stat->uid = ishstat.uid;
-                fake_stat->gid = ishstat.gid;
-                fake_stat->rdev = ishstat.rdev;
-                return 0;
-            }
-        }
-        return _ENOENT;
-    }
-    int err;
+static __attribute__((noinline)) int fakefs_stat_bind_or_real(struct mount *mount, const char *path, struct statbuf *fake_stat) {
     char host_stat_path[PATH_MAX];
-    if (bind_mount_translate_path(path, host_stat_path, sizeof(host_stat_path))) {
+    if (bind_mount_translate_path_slow(path, host_stat_path, sizeof(host_stat_path))) {
         /* For bind-mounted paths, stat the host path directly to avoid
          * AT_SYMLINK_NOFOLLOW returning symlink stats instead of dir stats. */
         struct stat real_stat;
-        if (stat(host_stat_path, &real_stat) < 0) {
-            db_commit(fs);
+        if (stat(host_stat_path, &real_stat) < 0)
             return errno_map();
-        }
         /* Match fstat's host identity and block metadata (OpenMinis 359a268d).
-         * Guest ownership/mode/inode are overlaid from fakefs below. */
+         * Guest ownership/mode/inode are overlaid from fakefs by caller. */
         memset(fake_stat, 0, sizeof(*fake_stat));
         fake_stat->dev = dev_fake_from_real(real_stat.st_dev);
         fake_stat->blksize = real_stat.st_blksize;
@@ -594,11 +632,39 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         fake_stat->atime = platform_stat_atime_sec(&real_stat);
         fake_stat->mtime = platform_stat_mtime_sec(&real_stat);
         fake_stat->ctime = platform_stat_ctime_sec(&real_stat);
-        err = 0;
-    } else {
-        err = realfs.stat(mount, path, fake_stat);
+        fake_stat->atime_nsec = platform_stat_atime_nsec(&real_stat);
+        fake_stat->mtime_nsec = platform_stat_mtime_nsec(&real_stat);
+        fake_stat->ctime_nsec = platform_stat_ctime_nsec(&real_stat);
+        return 0;
     }
+    return realfs.stat(mount, path, fake_stat);
+}
+
+static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
+    struct fakefs_db *fs = &mount->fakefs;
+    db_begin_read(fs);
+    struct ish_stat ishstat;
+    ino_t inode;
+    bool found = path_read_stat(fs, path, &ishstat, &inode);
     db_commit(fs);
+    if (!found) {
+        /* Auto-create for bind-mounted paths */
+        if (is_under_bind_mount(path)) {
+            inode = bind_mount_ensure_inode(fs, mount, path);
+            if (inode != 0) {
+                db_begin_read(fs);
+                found = path_read_stat(fs, path, &ishstat, &inode);
+                db_commit(fs);
+            }
+        }
+        if (!found)
+            return _ENOENT;
+    }
+    int err;
+    if (atomic_load_explicit(&g_bind_mount_count, memory_order_acquire) > 0)
+        err = fakefs_stat_bind_or_real(mount, path, fake_stat);
+    else
+        err = realfs.stat(mount, path, fake_stat);
     if (err < 0)
         return err;
     fake_stat->inode = inode;
@@ -610,22 +676,32 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
 }
 
 static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
+    struct stat real_stat;
+    if (fstat(fd->real_fd, &real_stat) < 0)
+        return errno_map();
     struct fakefs_db *fs = &fd->mount->fakefs;
-    int err = realfs.fstat(fd, fake_stat);
-    if (err < 0)
-        return err;
     db_begin_read(fs);
     struct ish_stat ishstat;
-    if (!inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat)) {
-        db_rollback(fs);
-        return _ENOENT;
-    }
+    bool found = inode_read_stat_if_exist(fs, fd->fake_inode, &ishstat);
     db_commit(fs);
+    if (!found)
+        return _ENOENT;
+    fake_stat->dev = dev_fake_from_real(real_stat.st_dev);
     fake_stat->inode = fd->fake_inode;
     fake_stat->mode = ishstat.mode;
+    fake_stat->nlink = real_stat.st_nlink;
     fake_stat->uid = ishstat.uid;
     fake_stat->gid = ishstat.gid;
     fake_stat->rdev = ishstat.rdev;
+    fake_stat->size = real_stat.st_size;
+    fake_stat->blksize = real_stat.st_blksize;
+    fake_stat->blocks = real_stat.st_blocks;
+    fake_stat->atime = platform_stat_atime_sec(&real_stat);
+    fake_stat->mtime = platform_stat_mtime_sec(&real_stat);
+    fake_stat->ctime = platform_stat_ctime_sec(&real_stat);
+    fake_stat->atime_nsec = platform_stat_atime_nsec(&real_stat);
+    fake_stat->mtime_nsec = platform_stat_mtime_nsec(&real_stat);
+    fake_stat->ctime_nsec = platform_stat_ctime_nsec(&real_stat);
     return 0;
 }
 
@@ -654,21 +730,24 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
     if (attr.type == attr_uid || attr.type == attr_gid) {
         int err = fakefs_strip_caps_path(mount, path); if (err) return err;
     }
-    db_begin_read(fs);
+    db_begin_write(fs);
     struct ish_stat ishstat;
     ino_t inode;
     if (!path_read_stat(fs, path, &ishstat, &inode)) {
-        db_rollback(fs);
+        // Nothing was written; commit cleanly to avoid invalidating the cache.
+        db_commit(fs);
         /* Auto-create for bind-mounted paths */
         if (is_under_bind_mount(path)) {
             inode = bind_mount_ensure_inode(fs, mount, path);
             if (inode != 0) {
-                db_begin_read(fs);
-                path_read_stat(fs, path, &ishstat, &inode);
-                fake_stat_setattr(&ishstat, attr);
-                inode_write_stat(fs, inode, &ishstat);
+                db_begin_write(fs);
+                if (path_read_stat(fs, path, &ishstat, &inode)) {
+                    fake_stat_setattr(&ishstat, attr);
+                    inode_write_stat(fs, inode, &ishstat);
+                    db_commit(fs);
+                    return 0;
+                }
                 db_commit(fs);
-                return 0;
             }
         }
         return _ENOENT;
@@ -731,18 +810,15 @@ static ssize_t fakefs_readlink(struct mount *mount, const char *path, char *buf,
     struct fakefs_db *fs = &mount->fakefs;
     db_begin_read(fs);
     struct ish_stat ishstat;
-    if (!path_read_stat(fs, path, &ishstat, NULL)) {
-        db_rollback(fs);
+    bool found = path_read_stat(fs, path, &ishstat, NULL);
+    db_commit(fs);
+    if (!found)
         return _ENOENT;
-    }
-    if (!S_ISLNK(ishstat.mode)) {
-        db_rollback(fs);
+    if (!S_ISLNK(ishstat.mode))
         return _EINVAL;
-    }
     ssize_t err = realfs.readlink(mount, path, buf, bufsize);
     if (err == _EINVAL)
         err = file_readlink(mount, path, buf, bufsize);
-    db_commit(fs);
     return err;
 }
 
@@ -759,7 +835,9 @@ retry:
     realfs_getpath(fd, entry_path);
 
     /* Debug: log readdir for bind-mounted paths */
-    if (strstr(entry_path, "minis") != NULL || strstr(entry_path, "Library/MinisChat") != NULL)
+    extern volatile bool g_trace_syscalls;
+    if (unlikely(g_trace_syscalls) &&
+        (strstr(entry_path, "minis") != NULL || strstr(entry_path, "Library/MinisChat") != NULL))
         fprintf(stderr, "fakefs_readdir: getpath=\"%s\" entry=\"%s\"\n", entry_path, entry->name);
 
     if (strcmp(entry->name, "..") == 0) {
@@ -794,11 +872,25 @@ retry:
     return res;
 }
 
-static struct fd_ops fakefs_fdops;
-static void __attribute__((constructor)) init_fake_fdops() {
-    fakefs_fdops = realfs_fdops;
-    fakefs_fdops.readdir = fakefs_readdir;
-}
+const struct fd_ops fakefs_fdops = {
+    .read = realfs_read,
+    .write = realfs_write,
+    .pread = realfs_pread,
+    .pwrite = realfs_pwrite,
+    .readdir = fakefs_readdir,
+    .telldir = realfs_telldir,
+    .seekdir = realfs_seekdir,
+    .lseek = realfs_lseek,
+    .mmap = realfs_mmap,
+    .poll = realfs_poll,
+    .ioctl_size = realfs_ioctl_size,
+    .ioctl = realfs_ioctl,
+    .fsync = realfs_fsync,
+    .close = realfs_close,
+    .getflags = realfs_getflags,
+    .setflags = realfs_setflags,
+    .reopen = realfs_reopen,
+};
 
 /* ===== Public Bind Mount API ===== */
 
@@ -927,6 +1019,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             /* Always refresh the read-only flag — the user may have flipped
              * writability in Settings without changing anything else. */
             g_bind_mounts[i].read_only = read_only;
+            bind_mount_recount();
 
             /* Always refresh the meta.db mode — the read-only flag may have
              * flipped even if host_path is unchanged (e.g. user toggled
@@ -975,6 +1068,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             fprintf(stderr, "fakefs_bind_mount: slot[%d] symlinkat returned %d (errno=%d)\n", i, err, err < 0 ? errno : 0);
             if (err < 0) {
                 g_bind_mounts[i].active = false;
+                bind_mount_recount();
                 return _EINVAL;
             }
             return 0;
@@ -994,6 +1088,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             g_bind_mounts[i].active = true;
             g_bind_mounts[i].read_only = read_only;
             g_bind_mounts[i].has_owner = false;
+            bind_mount_recount();
 
             /* Create symlink on host: data/<linux_path> -> <host_path>
              * First remove any existing file/dir at the path (may be non-empty) */
@@ -1011,6 +1106,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             fprintf(stderr, "fakefs_bind_mount: slot[%d] symlinkat returned %d (errno=%d)\n", i, err, err < 0 ? errno : 0);
             if (err < 0) {
                 g_bind_mounts[i].active = false;
+                bind_mount_recount();
                 return _EINVAL;
             }
 
@@ -1092,6 +1188,7 @@ int fakefs_bind_unmount(const char *linux_path) {
         if (g_bind_mounts[i].active &&
             strcmp(g_bind_mounts[i].path, linux_path) == 0) {
             g_bind_mounts[i].active = false;
+            bind_mount_recount();
 
             /* Remove the symlink */
             char host_link[PATH_MAX];
@@ -1124,6 +1221,7 @@ static int fakefs_mount(struct mount *mount) {
     /* Store global reference for bind mount API */
     g_fakefs_mount = mount;
     memset(g_bind_mounts, 0, sizeof(g_bind_mounts));
+    bind_mount_recount();
 
     return 0;
 }
@@ -1140,8 +1238,7 @@ static int fakefs_umount(struct mount *mount) {
 static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
     struct fakefs_db *fs = &mount->fakefs;
     db_begin_write(fs);
-    sqlite3_bind_int64(fs->stmt.try_cleanup_inode, 1, inode);
-    db_exec_reset(fs, fs->stmt.try_cleanup_inode);
+    inode_try_cleanup(fs, inode);
     db_commit(fs);
 }
 

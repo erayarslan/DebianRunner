@@ -141,8 +141,10 @@ static inline void wrlock_destroy(wrlock_t *lock) {
 }
 static inline void read_wrlock(wrlock_t *lock) {
     if (pthread_rwlock_rdlock(&lock->l) != 0) __builtin_trap();
+#ifndef NDEBUG
     assert(lock->val >= 0);
     lock->val++;
+#endif
 }
 // Interpreter quantum boundary. A writer (mmap, mprotect, munmap, CoW) retries
 // trywrlock with sleeps; a guest thread that spins (busy-wait loop) releases
@@ -162,13 +164,17 @@ static inline bool read_wrtrylock(wrlock_t *lock) {
     int err = pthread_rwlock_tryrdlock(&lock->l);
     if (err == EBUSY || err == EAGAIN) return false;
     if (err != 0) __builtin_trap();
+#ifndef NDEBUG
     assert(lock->val >= 0);
     lock->val++;
+#endif
     return true;
 }
 static inline void read_wrunlock(wrlock_t *lock) {
+#ifndef NDEBUG
     assert(lock->val > 0);
     lock->val--;
+#endif
     if (pthread_rwlock_unlock(&lock->l) != 0) __builtin_trap();
 }
 // Called on each retry while a writer waits in __write_wrlock. The kernel
@@ -176,7 +182,7 @@ static inline void read_wrunlock(wrlock_t *lock) {
 // looping in chained code otherwise never reaches its quantum boundary, never
 // drops its read lock, and the writer (mmap, mprotect, munmap) waits forever.
 extern void (*wrlock_writer_waiting_hook)(wrlock_t *lock);
-static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
+static inline void __write_wrlock(wrlock_t *lock, __attribute__((unused)) const char *file, __attribute__((unused)) int line) {
     // Acquire the write lock without letting a *waiting* writer freeze out
     // readers (which macOS's writer-preferring pthread_rwlock does). We spin
     // on trywrlock instead of a blocking wrlock: while we're merely retrying
@@ -215,25 +221,31 @@ static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
         }
         atomic_fetch_sub(&lock->writers_waiting, 1);
     }
+#ifndef NDEBUG
     assert(lock->val == 0);
     lock->val = -1;
     lock->file = file;
     lock->line = line;
     lock->pid = current_pid();
+#endif
 }
 #define write_wrlock(lock) __write_wrlock(lock, __FILE__, __LINE__)
 static inline bool write_wrtrylock(wrlock_t *lock) {
     int err = pthread_rwlock_trywrlock(&lock->l);
     if (err == EBUSY) return false;
     if (err != 0) __builtin_trap();
+#ifndef NDEBUG
     assert(lock->val == 0);
     lock->val = -1;
+#endif
     return true;
 }
 static inline void write_wrunlock(wrlock_t *lock) {
+#ifndef NDEBUG
     assert(lock->val == -1);
     lock->val = lock->line = lock->pid = 0;
     lock->file = NULL;
+#endif
     if (pthread_rwlock_unlock(&lock->l) != 0) __builtin_trap();
 }
 

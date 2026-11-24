@@ -67,6 +67,7 @@ static int file_lock_acquire(struct inode_data *inode, struct file_lock *request
     // - do any or all of the above at the same time
 
     bool found_our_locks = false;
+    int count_delta = 0;
     struct file_lock *tmp;
     list_for_each_entry_safe(&inode->posix_locks, lock, tmp, locks) {
         // To speed up looping over all of our locks, the locks are grouped by owner.
@@ -90,6 +91,7 @@ static int file_lock_acquire(struct inode_data *inode, struct file_lock *request
             if (lock->end > request->end)
                 request->end = lock->end;
             file_lock_delete(lock);
+            count_delta--;
         } else {
             if (!file_locks_overlap(lock, request))
                 continue;
@@ -111,9 +113,11 @@ static int file_lock_acquire(struct inode_data *inode, struct file_lock *request
                 lock->end = request->start - 1;
                 lock2->start = request->end + 1;
                 list_add_after(&lock->locks, &lock2->locks);
+                count_delta++;
             } else if (request->start <= lock->start && request->end >= lock->end) {
                 // lock doesn't stick out at all, so just remove it
                 file_lock_delete(lock);
+                count_delta--;
             } else if (lock->start < request->start) {
                 // lock sticks out on the start, so move the end down
                 assert(lock->end >= request->start);
@@ -131,7 +135,14 @@ static int file_lock_acquire(struct inode_data *inode, struct file_lock *request
     if (request->type != F_UNLCK_) {
         struct file_lock *new_lock = file_lock_copy(request);
         list_add_before(&lock->locks, &new_lock->locks);
+        count_delta++;
     }
+    // Apply the net change once so posix_lock_count never transiently hits 0
+    // during merge/upgrade operations while locks still exist on the inode.
+    if (count_delta > 0)
+        atomic_fetch_add_explicit(&inode->posix_lock_count, (uint32_t) count_delta, memory_order_release);
+    else if (count_delta < 0)
+        atomic_fetch_sub_explicit(&inode->posix_lock_count, (uint32_t) (-count_delta), memory_order_release);
     return 0;
 }
 
@@ -263,12 +274,17 @@ int fcntl_setlk(struct fd *fd, struct flock_ *flock, bool blocking) { return fcn
 
 void file_lock_remove_owned_by(struct fd *fd, void *owner) {
     struct inode_data *inode = fd->inode;
+    if (atomic_load_explicit(&inode->posix_lock_count, memory_order_acquire) == 0)
+        return;
     lock(&inode->lock);
-    bool removed = false;
+    uint32_t removed = 0;
     struct file_lock *lock, *tmp;
     list_for_each_entry_safe(&inode->posix_locks, lock, tmp, locks) {
-        if (lock->owner == owner) { file_lock_delete(lock); removed = true; }
+        if (lock->owner == owner) { file_lock_delete(lock); removed++; }
     }
-    if (removed) notify(&inode->posix_unlock);
+    if (removed) {
+        atomic_fetch_sub_explicit(&inode->posix_lock_count, removed, memory_order_release);
+        notify(&inode->posix_unlock);
+    }
     unlock(&inode->lock);
 }

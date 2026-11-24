@@ -119,14 +119,16 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
 9:
     .endif
 #endif
+.if (\size) > 8
     // Cross-page check: if page offset > (0x1000 - access_size), need special handling
     and w8, w7, #0xfff
-    cmp x8, #(0x1000-(\size/8))
+    cmp x8, #(0x1000-((\size)/8))
     .ifc \type,read
         b.hi crosspage_load_\id
     .else
         b.hi crosspage_write_prep_\id
     .endif
+.endif
 
     // Extract page-aligned address (48-bit address space, clear low 12 bits)
     and x8, x7, #0xfffffffffffff000
@@ -134,12 +136,11 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
         str x8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
     .endif
 
-    // TLB index calculation: (addr >> 12) ^ (addr >> 26) masked to TLB_SIZE-1
+    // TLB index calculation: (addr >> 12) ^ (addr >> 25) masked to TLB_SIZE-1
     ubfx x9, x7, #12, #13       // (addr >> 12) & 0x1fff (TLB_BITS=13)
     eor x9, x9, x7, lsr #25    // XOR with (addr >> 25) = (addr >> (12+13))
     and w9, w9, #0x1fff          // mask to TLB_SIZE-1
-    lsl x9, x9, #5
-    add x9, x9, _tlb
+    add x9, _tlb, x9, lsl #5
 
     .ifc \type,read
         ldr x10, [x9, #TLB_ENTRY_page]
@@ -193,8 +194,9 @@ segfault_\type\()_\id :
     str _pc, [_cpu, #LOCAL_value]
     mov w0, #INT_GPF
     b fiber_exit
+.if (\size) > 8
 crosspage_load_\id :
-    mov x19, #(\size/8)
+    mov x19, #((\size)/8)
     bl NAME(crosspage_load)
     b back_\id
 .ifc \type,write
@@ -203,9 +205,10 @@ crosspage_write_prep_\id :
     add _addr, _cpu, #LOCAL_value
     b back_\id
 crosspage_store_\id :
-    mov x19, #(\size/8)
+    mov x19, #((\size)/8)
     bl NAME(crosspage_store)
     b back_write_done_\id
+.endif
 .endif
 #ifdef ENABLE_WRITE_WATCHPOINT
 .ifc \type,write
@@ -233,18 +236,24 @@ watch_hit_\id :
     ldp x21, x22, [sp, #0x10]
     ldp x19, x20, [sp], #0x60
     // Fall through to the normal write_prep path (re-do the cross-page check)
+.if (\size) > 8
     and w8, w7, #0xfff
-    cmp x8, #(0x1000-(\size/8))
+    cmp x8, #(0x1000-((\size)/8))
     b.hi crosspage_write_prep_\id
+.endif
     and x8, x7, #0xfffffffffffff000
     str x8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
     ubfx x9, x7, #12, #13
     eor x9, x9, x7, lsr #25
     and w9, w9, #0x1fff
-    lsl x9, x9, #5
-    add x9, x9, _tlb
+    add x9, _tlb, x9, lsl #5
     ldr x10, [x9, #TLB_ENTRY_page_if_writable]
     cmp x8, x10
+    b.ne handle_miss_\id
+    ldr x10, [x9, #TLB_ENTRY_gen]
+    ldr x8, [_tlb, #(-TLB_entries+TLB_mmu)]
+    ldr x8, [x8, #MMU_changes]
+    cmp x10, x8
     b.ne handle_miss_\id
     ldr x10, [x9, #TLB_ENTRY_data_minus_addr]
     add x7, x10, x7
@@ -256,10 +265,12 @@ watch_hit_\id :
 .endr
 
 .macro write_done size, id
+.if (\size) > 8
     add x8, _cpu, #LOCAL_value
     cmp x8, x7
     b.eq crosspage_store_\id
 back_write_done_\id :
+.endif
 .endm
 
 /*

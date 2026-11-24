@@ -940,6 +940,7 @@ extern void gadget_load16_imm(void);
 extern void gadget_load8_imm(void);
 extern void gadget_load32_sx_imm(void);
 extern void gadget_load64_imm_fast(void);
+extern void gadget_load64_imm_fast_nopc(void);
 extern void gadget_load32_imm_fast(void);
 extern void gadget_load16_imm_fast(void);
 extern void gadget_load8_imm_fast(void);
@@ -1201,7 +1202,50 @@ static void gen_interrupt(struct gen_state *state, int interrupt_type) {
     gen(state, interrupt_type);
 }
 
+// Per-thread single-page executable translation cache for block compilation.
+// Reset on gen_start() and validated against (mmu, mmu->changes, page) so
+// executable permissions and faults remain exact while avoiding repeated
+// page-table walks across instructions and peephole peeks within the same page.
+static _Thread_local struct {
+    struct mmu *mmu;
+    uint64_t changes;
+    page_t page;
+    const uint8_t *base;
+} gen_exec_cache;
+
+static inline bool gen_read_exec_u32(struct tlb *tlb, addr_t addr, uint32_t *out) {
+    unsigned off = PGOFFSET(addr);
+    if (off > PAGE_SIZE - sizeof(*out))
+        return tlb_read_exec(tlb, addr, out, sizeof(*out));
+    page_t page = PAGE(addr);
+    struct mmu *mmu = tlb->mmu;
+    uint64_t changes = __atomic_load_n(&mmu->changes, __ATOMIC_ACQUIRE);
+    if (gen_exec_cache.base == NULL || gen_exec_cache.page != page ||
+            gen_exec_cache.mmu != mmu || gen_exec_cache.changes != changes) {
+        const void *ptr = mmu_translate(mmu, addr, MEM_EXEC);
+        if (ptr == NULL) {
+            tlb->segfault_addr = addr;
+            return false;
+        }
+        gen_exec_cache.mmu = mmu;
+        gen_exec_cache.changes = __atomic_load_n(&mmu->changes, __ATOMIC_ACQUIRE);
+        gen_exec_cache.page = page;
+        gen_exec_cache.base = (const uint8_t *)ptr - off;
+    }
+    memcpy(out, gen_exec_cache.base + off, sizeof(*out));
+    return true;
+}
+
+static inline bool gen_read_insn(addr_t *ip, struct tlb *tlb, uint32_t *insn) {
+    if (!gen_read_exec_u32(tlb, *ip, insn))
+        return false;
+    *ip += 4;
+    return true;
+}
+
 void gen_start(addr_t addr, struct gen_state *state) {
+    gen_exec_cache.base = NULL;
+    gen_exec_cache.page = ~(page_t)0;
     state->capacity = FIBER_BLOCK_INITIAL_CAPACITY;
     state->size = 0;
     state->ip = addr;
@@ -1326,7 +1370,7 @@ static int gen_step_insn(struct gen_state *state, struct tlb *tlb) {
     state->tlb = tlb;
 
     uint32_t insn;
-    if (!arm64_read_insn(&state->ip, tlb, &insn)) {
+    if (!gen_read_insn(&state->ip, tlb, &insn)) {
         gen(state, (unsigned long) gadget_set_pc);
         gen(state, state->orig_ip);
         gen(state, (unsigned long) gadget_instruction_fault);
@@ -1485,7 +1529,7 @@ static bool simd_modimm_pattern(uint32_t cmode, uint8_t imm8, uint64_t *pattern)
  * Returns true if successful, false if read fails.
  */
 static bool gen_peek_next_insn(struct gen_state *state, uint32_t *next_insn) {
-    return tlb_read_exec(state->tlb, state->ip, next_insn, sizeof(*next_insn));
+    return gen_read_exec_u32(state->tlb, state->ip, next_insn);
 }
 
 /*
@@ -1712,10 +1756,8 @@ static int try_fuse_subs_reg_bcond(struct gen_state *state, uint32_t sf, uint32_
  * tests that same architectural register, and ends the block at the branch.
  */
 static int try_fuse_addsub_cbz(struct gen_state *state, uint32_t sf, uint32_t op,
-                               uint32_t rd, uint32_t rn, uint32_t imm12) {
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return -1;
+                               uint32_t rd, uint32_t rn, uint32_t imm12,
+                               uint32_t next_insn) {
     if ((next_insn & 0x7e000000) != 0x34000000)
         return -1;
 
@@ -1763,11 +1805,7 @@ static bool arm64_decode_int_unsigned_imm_ldst(uint32_t insn, bool *is_load,
     return true;
 }
 
-static void count_addsub_ldst_candidates(struct gen_state *state, uint32_t rd) {
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return;
-
+static void count_addsub_ldst_candidates(uint32_t rd, uint32_t next_insn) {
     bool is_load, sign_extend;
     uint32_t mem_rn, mem_rt, mem_size;
     if (!arm64_decode_int_unsigned_imm_ldst(next_insn, &is_load, &sign_extend, &mem_rn, &mem_rt, &mem_size))
@@ -1782,12 +1820,8 @@ static void count_addsub_ldst_candidates(struct gen_state *state, uint32_t rd) {
 }
 
 static int try_fuse_addsub_ldr64(struct gen_state *state, uint32_t op, uint32_t rd,
-                                 uint32_t rn, uint32_t imm12) {
+                                 uint32_t rn, uint32_t imm12, uint32_t next_insn) {
     if (PAGE(state->orig_ip) != PAGE(state->ip))
-        return -1;
-
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
         return -1;
 
     bool is_load, sign_extend;
@@ -1812,12 +1846,8 @@ static int try_fuse_addsub_ldr64(struct gen_state *state, uint32_t op, uint32_t 
 }
 
 static int try_fuse_addsub_ldr32(struct gen_state *state, uint32_t op, uint32_t rd,
-                                 uint32_t rn, uint32_t imm12) {
+                                 uint32_t rn, uint32_t imm12, uint32_t next_insn) {
     if (PAGE(state->orig_ip) != PAGE(state->ip))
-        return -1;
-
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
         return -1;
 
     bool is_load, sign_extend;
@@ -1841,12 +1871,8 @@ static int try_fuse_addsub_ldr32(struct gen_state *state, uint32_t op, uint32_t 
 }
 
 static int try_fuse_addsub_ldr16(struct gen_state *state, uint32_t op, uint32_t rd,
-                                 uint32_t rn, uint32_t imm12) {
+                                 uint32_t rn, uint32_t imm12, uint32_t next_insn) {
     if (PAGE(state->orig_ip) != PAGE(state->ip))
-        return -1;
-
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
         return -1;
 
     bool is_load, sign_extend;
@@ -1870,12 +1896,8 @@ static int try_fuse_addsub_ldr16(struct gen_state *state, uint32_t op, uint32_t 
 }
 
 static int try_fuse_addsub_ldr8(struct gen_state *state, uint32_t op, uint32_t rd,
-                                uint32_t rn, uint32_t imm12) {
+                                uint32_t rn, uint32_t imm12, uint32_t next_insn) {
     if (PAGE(state->orig_ip) != PAGE(state->ip))
-        return -1;
-
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
         return -1;
 
     bool is_load, sign_extend;
@@ -1899,12 +1921,8 @@ static int try_fuse_addsub_ldr8(struct gen_state *state, uint32_t op, uint32_t r
 }
 
 static int try_fuse_addsub_str64(struct gen_state *state, uint32_t op, uint32_t rd,
-                                 uint32_t rn, uint32_t imm12) {
+                                 uint32_t rn, uint32_t imm12, uint32_t next_insn) {
     if (PAGE(state->orig_ip) != PAGE(state->ip))
-        return -1;
-
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
         return -1;
 
     bool is_load, sign_extend;
@@ -1928,12 +1946,8 @@ static int try_fuse_addsub_str64(struct gen_state *state, uint32_t op, uint32_t 
 }
 
 static int try_fuse_addsub_str32(struct gen_state *state, uint32_t op, uint32_t rd,
-                                 uint32_t rn, uint32_t imm12) {
+                                 uint32_t rn, uint32_t imm12, uint32_t next_insn) {
     if (PAGE(state->orig_ip) != PAGE(state->ip))
-        return -1;
-
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
         return -1;
 
     bool is_load, sign_extend;
@@ -1957,12 +1971,8 @@ static int try_fuse_addsub_str32(struct gen_state *state, uint32_t op, uint32_t 
 }
 
 static int try_fuse_addsub_str16(struct gen_state *state, uint32_t op, uint32_t rd,
-                                 uint32_t rn, uint32_t imm12) {
+                                 uint32_t rn, uint32_t imm12, uint32_t next_insn) {
     if (PAGE(state->orig_ip) != PAGE(state->ip))
-        return -1;
-
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
         return -1;
 
     bool is_load, sign_extend;
@@ -1986,12 +1996,8 @@ static int try_fuse_addsub_str16(struct gen_state *state, uint32_t op, uint32_t 
 }
 
 static int try_fuse_addsub_str8(struct gen_state *state, uint32_t op, uint32_t rd,
-                                uint32_t rn, uint32_t imm12) {
+                                uint32_t rn, uint32_t imm12, uint32_t next_insn) {
     if (PAGE(state->orig_ip) != PAGE(state->ip))
-        return -1;
-
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
         return -1;
 
     bool is_load, sign_extend;
@@ -2014,11 +2020,9 @@ static int try_fuse_addsub_str8(struct gen_state *state, uint32_t op, uint32_t r
     return 1;
 }
 
-static void count_ldr_cbz_candidate(struct gen_state *state, uint32_t rn, uint32_t rt,
-                                     uint32_t size, bool sign_extend) {
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return;
+static void count_ldr_cbz_candidate(uint32_t rn, uint32_t rt,
+                                     uint32_t size, bool sign_extend,
+                                     uint32_t next_insn) {
     if ((next_insn & 0x7e000000) != 0x34000000)
         return;
     if ((next_insn & 0x1f) != rt || rt == 31)
@@ -2037,13 +2041,11 @@ static void count_ldr_cbz_candidate(struct gen_state *state, uint32_t rn, uint32
         ARM64_FUSION_STAT_INC(arm64_fusion_ldr8_sx_cbz_candidate_count);
 }
 
-static int try_fuse_ldr64_cbz64(struct gen_state *state, uint32_t rn, uint32_t rt, uint32_t imm12) {
+static int try_fuse_ldr64_cbz64(struct gen_state *state, uint32_t rn, uint32_t rt,
+                                uint32_t imm12, uint32_t next_insn) {
     if (rn == 31 || rt == 31 || PAGE(state->orig_ip) != PAGE(state->ip))
         return -1;
 
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return -1;
     if ((next_insn & 0x7e000000) != 0x34000000)
         return -1;
     if ((next_insn & 0x1f) != rt || ((next_insn >> 31) & 1) == 0)
@@ -2069,13 +2071,11 @@ static int try_fuse_ldr64_cbz64(struct gen_state *state, uint32_t rn, uint32_t r
     return 0;
 }
 
-static int try_fuse_ldr64_sp_cbz64(struct gen_state *state, uint32_t rn, uint32_t rt, uint32_t imm12) {
+static int try_fuse_ldr64_sp_cbz64(struct gen_state *state, uint32_t rn, uint32_t rt,
+                                   uint32_t imm12, uint32_t next_insn) {
     if (rn != 31 || rt == 31 || PAGE(state->orig_ip) != PAGE(state->ip))
         return -1;
 
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return -1;
     if ((next_insn & 0x7e000000) != 0x34000000)
         return -1;
     if ((next_insn & 0x1f) != rt || ((next_insn >> 31) & 1) == 0)
@@ -2101,13 +2101,11 @@ static int try_fuse_ldr64_sp_cbz64(struct gen_state *state, uint32_t rn, uint32_
     return 0;
 }
 
-static int try_fuse_ldr32_sx_cbz64(struct gen_state *state, uint32_t rn, uint32_t rt, uint32_t imm12) {
+static int try_fuse_ldr32_sx_cbz64(struct gen_state *state, uint32_t rn, uint32_t rt,
+                                   uint32_t imm12, uint32_t next_insn) {
     if (rt == 31 || PAGE(state->orig_ip) != PAGE(state->ip))
         return -1;
 
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return -1;
     if ((next_insn & 0x7e000000) != 0x34000000)
         return -1;
     if ((next_insn & 0x1f) != rt)
@@ -2133,13 +2131,11 @@ static int try_fuse_ldr32_sx_cbz64(struct gen_state *state, uint32_t rn, uint32_
     return 0;
 }
 
-static int try_fuse_ldr32_cbz32(struct gen_state *state, uint32_t rn, uint32_t rt, uint32_t imm12) {
+static int try_fuse_ldr32_cbz32(struct gen_state *state, uint32_t rn, uint32_t rt,
+                                uint32_t imm12, uint32_t next_insn) {
     if (rt == 31 || PAGE(state->orig_ip) != PAGE(state->ip))
         return -1;
 
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return -1;
     if ((next_insn & 0x7e000000) != 0x34000000)
         return -1;
     if ((next_insn & 0x1f) != rt || ((next_insn >> 31) & 1) != 0)
@@ -2166,15 +2162,13 @@ static int try_fuse_ldr32_cbz32(struct gen_state *state, uint32_t rn, uint32_t r
 }
 
 static int try_fuse_ldr_sx_cbz(struct gen_state *state, uint32_t rn, uint32_t rt,
-                                uint32_t imm12, uint32_t size, bool extend64) {
+                                uint32_t imm12, uint32_t size, bool extend64,
+                                uint32_t next_insn) {
     if (rt == 31 || PAGE(state->orig_ip) != PAGE(state->ip))
         return -1;
     if (size > 1)
         return -1;
 
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return -1;
     if ((next_insn & 0x7e000000) != 0x34000000)
         return -1;
     if ((next_insn & 0x1f) != rt)
@@ -2203,13 +2197,11 @@ static int try_fuse_ldr_sx_cbz(struct gen_state *state, uint32_t rn, uint32_t rt
     return 0;
 }
 
-static int try_fuse_ldr16_cbz32(struct gen_state *state, uint32_t rn, uint32_t rt, uint32_t imm12) {
+static int try_fuse_ldr16_cbz32(struct gen_state *state, uint32_t rn, uint32_t rt,
+                                uint32_t imm12, uint32_t next_insn) {
     if (rt == 31 || PAGE(state->orig_ip) != PAGE(state->ip))
         return -1;
 
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return -1;
     if ((next_insn & 0x7e000000) != 0x34000000)
         return -1;
     if ((next_insn & 0x1f) != rt || ((next_insn >> 31) & 1) != 0)
@@ -2235,13 +2227,11 @@ static int try_fuse_ldr16_cbz32(struct gen_state *state, uint32_t rn, uint32_t r
     return 0;
 }
 
-static int try_fuse_ldr8_cbz32(struct gen_state *state, uint32_t rn, uint32_t rt, uint32_t imm12) {
+static int try_fuse_ldr8_cbz32(struct gen_state *state, uint32_t rn, uint32_t rt,
+                               uint32_t imm12, uint32_t next_insn) {
     if (rt == 31 || PAGE(state->orig_ip) != PAGE(state->ip))
         return -1;
 
-    uint32_t next_insn;
-    if (!gen_peek_next_insn(state, &next_insn))
-        return -1;
     if ((next_insn & 0x7e000000) != 0x34000000)
         return -1;
     if ((next_insn & 0x1f) != rt || ((next_insn >> 31) & 1) != 0)
@@ -2355,27 +2345,43 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
             if (fused == 0) return 0;  // fused and block ended
         }
 
-        // Try ADD/SUB imm + CBZ/CBNZ of the result before the single-insn fast path.
+        // Try ADD/SUB imm + CBZ/CBNZ or LDR/STR of the result before the single-insn fast path.
+        // Peek next_insn once and decode once to avoid repeated exec-page peeks.
         if (!sh && !S && rd != 31 && rn != 31) {
-            int fused = try_fuse_addsub_cbz(state, sf, op, rd, rn, imm12);
-            if (fused == 0) return 0;  // fused and block ended
-            count_addsub_ldst_candidates(state, rd);
-            if (sf && try_fuse_addsub_ldr64(state, op, rd, rn, imm12) == 1)
-                return 1;
-            if (sf && try_fuse_addsub_ldr32(state, op, rd, rn, imm12) == 1)
-                return 1;
-            if (sf && try_fuse_addsub_ldr16(state, op, rd, rn, imm12) == 1)
-                return 1;
-            if (sf && try_fuse_addsub_ldr8(state, op, rd, rn, imm12) == 1)
-                return 1;
-            if (sf && try_fuse_addsub_str64(state, op, rd, rn, imm12) == 1)
-                return 1;
-            if (sf && try_fuse_addsub_str32(state, op, rd, rn, imm12) == 1)
-                return 1;
-            if (sf && try_fuse_addsub_str16(state, op, rd, rn, imm12) == 1)
-                return 1;
-            if (sf && try_fuse_addsub_str8(state, op, rd, rn, imm12) == 1)
-                return 1;
+            uint32_t next_insn;
+            if (gen_peek_next_insn(state, &next_insn)) {
+                int fused = try_fuse_addsub_cbz(state, sf, op, rd, rn, imm12, next_insn);
+                if (fused == 0) return 0;  // fused and block ended
+                if (arm64_fusion_stats_enabled)
+                    count_addsub_ldst_candidates(rd, next_insn);
+                if (sf && PAGE(state->orig_ip) == PAGE(state->ip)) {
+                    bool is_load, sign_extend;
+                    uint32_t mem_rn, mem_rt, mem_size;
+                    if (arm64_decode_int_unsigned_imm_ldst(next_insn, &is_load, &sign_extend,
+                                                           &mem_rn, &mem_rt, &mem_size) &&
+                            !sign_extend && mem_rn == rd && mem_rt != 31) {
+                        if (is_load) {
+                            if (mem_size == 3 && try_fuse_addsub_ldr64(state, op, rd, rn, imm12, next_insn) == 1)
+                                return 1;
+                            if (mem_size == 2 && try_fuse_addsub_ldr32(state, op, rd, rn, imm12, next_insn) == 1)
+                                return 1;
+                            if (mem_size == 1 && try_fuse_addsub_ldr16(state, op, rd, rn, imm12, next_insn) == 1)
+                                return 1;
+                            if (mem_size == 0 && try_fuse_addsub_ldr8(state, op, rd, rn, imm12, next_insn) == 1)
+                                return 1;
+                        } else {
+                            if (mem_size == 3 && try_fuse_addsub_str64(state, op, rd, rn, imm12, next_insn) == 1)
+                                return 1;
+                            if (mem_size == 2 && try_fuse_addsub_str32(state, op, rd, rn, imm12, next_insn) == 1)
+                                return 1;
+                            if (mem_size == 1 && try_fuse_addsub_str16(state, op, rd, rn, imm12, next_insn) == 1)
+                                return 1;
+                            if (mem_size == 0 && try_fuse_addsub_str8(state, op, rd, rn, imm12, next_insn) == 1)
+                                return 1;
+                        }
+                    }
+                }
+            }
         }
 
         // Try specialized 64-bit fast paths (no SP/XZR source)
@@ -3234,21 +3240,25 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
  * Loads and Stores
  */
 static int gen_ldst(struct gen_state *state, uint32_t insn) {
+    // When lazy fault-PC recovery is enabled (default), retry PCs are resolved
+    // out-of-line from block->fault_pcs via _pc, so skip the inline-PC gadget
+    // variants (which add a code-stream word and store LOCAL_jit_saved_pc on
+    // every load/store). When ISH_LAZY_FAULT_PC=0, keep inline-PC fusion.
+    bool use_inline_pc = !arm64_lazy_fault_pc_enabled;
     // Normal-register LDR X unsigned-immediate saves its retry PC in the load
-    // gadget itself (as does its LDR+CBZ/CBNZ fusion). Avoid a separate gadget
-    // dispatch and code-stream pointer for this common case. All other memory
-    // instructions retain the standalone precise-PC save.
-    bool inline_load64_pc = (insn & 0xffc00000) == 0xf9400000 &&
+    // gadget itself (as does its LDR+CBZ/CBNZ fusion) when not using lazy PCs.
+    bool inline_load64_pc = use_inline_pc &&
+                           (insn & 0xffc00000) == 0xf9400000 &&
                            ((insn >> 5) & 0x1f) != 31 && (insn & 0x1f) != 31;
     // Integer unsigned-immediate STR with ordinary base/value registers.
     // No load/branch fusion can consume these stores. Other encodings (SIMD,
     // SP/XZR, signed/unscaled, atomics) retain their existing precise-PC save.
-    bool inline_store_pc = arm64_memory_pc_fusion_enabled &&
+    bool inline_store_pc = use_inline_pc && arm64_memory_pc_fusion_enabled &&
                            (insn & 0x3fc00000) == 0x39000000 &&
                            ((insn >> 5) & 0x1f) != 31 && (insn & 0x1f) != 31;
     // Existing load/CBZ fusions already save this exact load PC internally.
     // The new ordinary unsigned loads use the same rule in their own gadget.
-    bool inline_small_load_pc = arm64_memory_pc_fusion_enabled &&
+    bool inline_small_load_pc = use_inline_pc && arm64_memory_pc_fusion_enabled &&
                                (insn & 0x3fc00000) == 0x39400000 &&
                                ((insn >> 30) & 3) < 3 &&
                                ((insn >> 5) & 0x1f) != 31 && (insn & 0x1f) != 31;
@@ -3475,21 +3485,36 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         bool sign_extend = (opc & 2) != 0;
         bool extend64 = sign_extend && opc == 2;
         if (is_load) {
-            count_ldr_cbz_candidate(state, rn, rt, size, sign_extend);
-            if (!sign_extend && size == 3 && try_fuse_ldr64_cbz64(state, rn, rt, imm12) == 0)
-                return 0;
-            if (!sign_extend && size == 3 && try_fuse_ldr64_sp_cbz64(state, rn, rt, imm12) == 0)
-                return 0;
-            if (sign_extend && size == 2 && try_fuse_ldr32_sx_cbz64(state, rn, rt, imm12) == 0)
-                return 0;
-            if (sign_extend && size < 2 && try_fuse_ldr_sx_cbz(state, rn, rt, imm12, size, extend64) == 0)
-                return 0;
-            if (!sign_extend && size == 2 && try_fuse_ldr32_cbz32(state, rn, rt, imm12) == 0)
-                return 0;
-            if (!sign_extend && size == 1 && try_fuse_ldr16_cbz32(state, rn, rt, imm12) == 0)
-                return 0;
-            if (!sign_extend && size == 0 && try_fuse_ldr8_cbz32(state, rn, rt, imm12) == 0)
-                return 0;
+            uint32_t next_insn;
+            if (gen_peek_next_insn(state, &next_insn)) {
+                if (arm64_fusion_stats_enabled)
+                    count_ldr_cbz_candidate(rn, rt, size, sign_extend, next_insn);
+                if ((next_insn & 0x7e000000) == 0x34000000 &&
+                        (next_insn & 0x1f) == rt && rt != 31 &&
+                        PAGE(state->orig_ip) == PAGE(state->ip)) {
+                    if (!sign_extend && size == 3) {
+                        if (rn != 31 && try_fuse_ldr64_cbz64(state, rn, rt, imm12, next_insn) == 0)
+                            return 0;
+                        if (rn == 31 && try_fuse_ldr64_sp_cbz64(state, rn, rt, imm12, next_insn) == 0)
+                            return 0;
+                    } else if (sign_extend && size == 2) {
+                        if (try_fuse_ldr32_sx_cbz64(state, rn, rt, imm12, next_insn) == 0)
+                            return 0;
+                    } else if (sign_extend && size < 2) {
+                        if (try_fuse_ldr_sx_cbz(state, rn, rt, imm12, size, extend64, next_insn) == 0)
+                            return 0;
+                    } else if (!sign_extend && size == 2) {
+                        if (try_fuse_ldr32_cbz32(state, rn, rt, imm12, next_insn) == 0)
+                            return 0;
+                    } else if (!sign_extend && size == 1) {
+                        if (try_fuse_ldr16_cbz32(state, rn, rt, imm12, next_insn) == 0)
+                            return 0;
+                    } else if (!sign_extend && size == 0) {
+                        if (try_fuse_ldr8_cbz32(state, rn, rt, imm12, next_insn) == 0)
+                            return 0;
+                    }
+                }
+            }
         }
 
         // Use fused gadgets for non-sign-extending loads and all stores
@@ -3515,15 +3540,16 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
                                      (sign_extend ? gadget_load32_sx_imm :
                                       (fast ? gadget_load32_imm_fast :
                                        (sp_fast ? gadget_load32_sp_imm : gadget_load32_imm))); break;
-                    case 3: gadget = fast ? gadget_load64_imm_fast :
-                                     (sp_fast ? gadget_load64_sp_imm : gadget_load64_imm); break;
+                    case 3: gadget = inline_load64_pc ? gadget_load64_imm_fast :
+                                     (fast ? gadget_load64_imm_fast_nopc :
+                                      (sp_fast ? gadget_load64_sp_imm : gadget_load64_imm)); break;
                     default: gen_interrupt(state, INT_UNDEFINED); return 0;
                 }
-                if (gadget == gadget_load64_imm_fast || inline_small_load_pc)
+                if (inline_load64_pc || inline_small_load_pc)
                     gen_fault_pc(state, state->orig_ip);
                 gen(state, (unsigned long) gadget);
                 gen(state, fused_param);
-                if (gadget == gadget_load64_imm_fast || inline_small_load_pc)
+                if (inline_load64_pc || inline_small_load_pc)
                     gen(state, state->orig_ip);
             } else {
                 void *gadget;

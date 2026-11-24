@@ -104,6 +104,7 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
     }
     fd->real_fd = fd_no;
     fd->dir = NULL;
+    fd->flags = flags;
     return fd;
 }
 
@@ -215,7 +216,7 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
 }
 
 ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
-    if (S_ISREG(fd->type) && (fd_getflags(fd) & O_ACCMODE_) == O_RDONLY_) return _EBADF;
+    if (S_ISREG(fd->type) && (__atomic_load_n(&fd->flags, __ATOMIC_RELAXED) & O_ACCMODE_) == O_RDONLY_) return _EBADF;
     if (bufsize) { int err = file_caps_strip(fd); if (err) return err; }
     off_t off = 0;
     if (fd->memfd) {
@@ -252,7 +253,7 @@ ssize_t realfs_pread(struct fd *fd, void *buf, size_t bufsize, off_t off) {
 }
 
 ssize_t realfs_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_t off) {
-    if (S_ISREG(fd->type) && (fd_getflags(fd) & O_ACCMODE_) == O_RDONLY_) return _EBADF;
+    if (S_ISREG(fd->type) && (__atomic_load_n(&fd->flags, __ATOMIC_RELAXED) & O_ACCMODE_) == O_RDONLY_) return _EBADF;
     if (off < 0) return _EINVAL;
     if (bufsize) { int err = file_caps_strip(fd); if (err) return err; }
     if (fd->memfd) {
@@ -524,14 +525,15 @@ int realfs_getpath(struct fd *fd, char *buf) {
      * host persistent path (e.g. /Users/.../MinisChat/minis/<sid>/attachments).
      * This won't start with mount->source, so the normal prefix strip fails.
      * Detect and translate back to the Linux path. */
+    extern volatile bool g_trace_syscalls;
     char linux_path[MAX_PATH];
     if (fakefs_bind_mount_resolve_path(buf, linux_path, sizeof(linux_path))) {
-        if (strstr(buf, "minis") != NULL)
+        if (unlikely(g_trace_syscalls) && strstr(buf, "minis") != NULL)
             fprintf(stderr, "realfs_getpath: bind_mount_resolve OK: \"%s\" -> \"%s\"\n", buf, linux_path);
         strlcpy(buf, linux_path, MAX_PATH);
         return 0;
     }
-    if (strstr(buf, "minis") != NULL)
+    if (unlikely(g_trace_syscalls) && strstr(buf, "minis") != NULL)
         fprintf(stderr, "realfs_getpath: bind_mount_resolve MISS: F_GETPATH=\"%s\" source=\"%s\"\n", buf, fd->mount->source);
 
     if (strcmp(fd->mount->source, "/") != 0 || strcmp(buf, "/") == 0) {
@@ -541,13 +543,15 @@ int realfs_getpath(struct fd *fd, char *buf) {
          * mount->source when the bind mount table has been cleared (e.g. after
          * app restart before mountMinis re-registers the mounts). */
         if (strncmp(buf, fd->mount->source, source_len) == 0) {
-            memmove(buf, buf + source_len, MAX_PATH - source_len);
+            size_t tail_len = strlen(buf + source_len) + 1;
+            memmove(buf, buf + source_len, tail_len);
         } else if (strncmp(fd->mount->source, "/var/", 5) == 0 &&
                    strncmp(buf, "/private", 8) == 0 &&
                    strncmp(buf + 8, fd->mount->source, source_len) == 0) {
             /* F_GETPATH returns /private/var/... but mount->source is /var/...
              * Strip /private prefix + mount->source from buf. */
-            memmove(buf, buf + 8 + source_len, MAX_PATH - 8 - source_len);
+            size_t tail_len = strlen(buf + 8 + source_len) + 1;
+            memmove(buf, buf + 8 + source_len, tail_len);
         } else {
             /* Path is outside mount source (stale bind mount symlink resolved
              * by F_GETPATH). Return root as a safe fallback. */
@@ -799,8 +803,14 @@ int realfs_setflags(struct fd *fd, dword_t flags) {
         return 0;
     }
     int ret = fcntl(fd->real_fd, F_SETFL, open_flags_real_from_fake(flags));
-    int saved_error = ret < 0 ? errno_map() : 0;
-    return saved_error;
+    if (ret < 0)
+        return errno_map();
+    unsigned allowed = O_APPEND_ | O_NONBLOCK_;
+    unsigned old = __atomic_load_n(&fd->flags, __ATOMIC_RELAXED), updated;
+    do {
+        updated = (old & ~allowed) | (flags & allowed);
+    } while (!__atomic_compare_exchange_n(&fd->flags, &old, updated, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return 0;
 }
 
 ssize_t realfs_ioctl_size(int cmd) {
@@ -893,7 +903,7 @@ const struct fs_ops realfs = {
     .mkdir = realfs_mkdir,
 };
 
-static struct fd *realfs_reopen(struct fd *source, int flags) {
+struct fd *realfs_reopen(struct fd *source, int flags) {
     if (!source->memfd) return ERR_PTR(_ENXIO);
     // O_PATH needs its own restricted operation set, not a readable substitute.
     if (flags & O_PATH_) return ERR_PTR(_EOPNOTSUPP);

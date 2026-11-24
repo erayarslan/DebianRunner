@@ -451,7 +451,8 @@ static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
 
 dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
     STRACE("read(%d, 0x%x, %d)", fd_no, buf_addr, size);
-    char *buf = (char *) malloc(size);
+    char stack_buf[4096];
+    char *buf = size <= sizeof(stack_buf) ? stack_buf : (char *) malloc(size);
     if (buf == NULL)
         return _ENOMEM;
     int_t res = sys_read_buf(fd_no, buf, size);
@@ -459,7 +460,8 @@ dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
         if (user_write(buf_addr, buf, res))
             res = _EFAULT;
     }
-    free(buf);
+    if (buf != stack_buf)
+        free(buf);
     return res;
 }
 
@@ -486,7 +488,8 @@ static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
 
 dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
     // FIXME this is a DOS vector, should ideally use vectorized I/O
-    char *buf = malloc(size);
+    char stack_buf[4096];
+    char *buf = size <= sizeof(stack_buf) ? stack_buf : (char *) malloc(size);
     if (buf == NULL)
         return _ENOMEM;
     dword_t res = _EFAULT;
@@ -500,7 +503,8 @@ dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
     res = sys_write_buf(fd_no, buf, size);
 
 out:
-    free(buf);
+    if (buf != stack_buf)
+        free(buf);
     return res;
 }
 
@@ -693,7 +697,8 @@ dword_t sys_pread(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     if (fd == NULL)
         return _EBADF;
     if (!fd->ops->pread && (!fd->ops->lseek || !fd->ops->read)) { fd_close(fd); return _ESPIPE; }
-    char *buf = malloc((size_t)size+1);
+    char stack_buf[4097];
+    char *buf = (size_t)size + 1 <= sizeof(stack_buf) ? stack_buf : malloc((size_t)size + 1);
     if (buf == NULL) { fd_close(fd); return _ENOMEM; }
     lock(&fd->lock);
     ssize_t res;
@@ -720,7 +725,8 @@ dword_t sys_pread(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     }
 out:
     unlock(&fd->lock);
-    free(buf);
+    if (buf != stack_buf)
+        free(buf);
     fd_close(fd);
     return res;
 }
@@ -731,10 +737,12 @@ dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     if (fd == NULL)
         return _EBADF;
     if (!fd->ops->pwrite && (!fd->ops->lseek || !fd->ops->write)) { fd_close(fd); return _ESPIPE; }
-    char *buf = malloc((size_t)size+1);
+    char stack_buf[4097];
+    char *buf = (size_t)size + 1 <= sizeof(stack_buf) ? stack_buf : malloc((size_t)size + 1);
     if (buf == NULL) { fd_close(fd); return _ENOMEM; }
     if (user_read(buf_addr, buf, size)) {
-        free(buf);
+        if (buf != stack_buf)
+            free(buf);
         fd_close(fd);
         return _EFAULT;
     }
@@ -755,7 +763,8 @@ dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
         }
     }
     unlock(&fd->lock);
-    free(buf);
+    if (buf != stack_buf)
+        free(buf);
     fd_close(fd);
     return res;
 }
