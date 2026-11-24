@@ -422,6 +422,7 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
     sqlite3 *db;
     int err = sqlite3_open_v2(path_tmp, &db, SQLITE_OPEN_READONLY, NULL);
     CHECK_ERR();
+    sqlite3_busy_timeout(db, 5000);
     EXEC("begin");
 
     sqlite3_stmt *count_stmt = PREPARE("select count(path) from paths");
@@ -445,7 +446,7 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
         path[path_len + 1] = '\0';
         archive_entry_set_pathname(entry, path);
 
-        if (!progress_update(&p, (double) paths_done / paths_total, path))
+        if (!progress_update(&p, paths_total > 0 ? (double) paths_done / paths_total : 0.0, path))
             CANCEL();
 
         archive_entry_set_ino64(entry, sqlite3_column_int64(query, 1));
@@ -455,8 +456,22 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
         archive_entry_set_gid(entry, stat.gid);
         archive_entry_set_rdev(entry, stat.rdev);
 
+        int fd = -1;
         struct stat real_stat;
-        if (fstatat(root_fd, path, &real_stat, 0) < 0) {
+        if (S_ISREG(stat.mode) || S_ISLNK(stat.mode)) {
+            fd = openat(root_fd, path, O_RDONLY);
+            if (fd < 0) {
+                if (errno == ENOENT) {
+                    printf("skipping %s\n", path);
+                    goto skip;
+                }
+                POSIX_ERR();
+            }
+            if (fstat(fd, &real_stat) < 0) {
+                close(fd);
+                POSIX_ERR();
+            }
+        } else if (fstatat(root_fd, path, &real_stat, 0) < 0) {
             if (errno == ENOENT) {
                 printf("skipping %s\n", path);
                 goto skip;
@@ -473,15 +488,13 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
         archive_entry_set_mtime(entry, real_stat.st_mtime, real_stat.TIMESPEC(m).tv_nsec);
         archive_entry_set_ctime(entry, real_stat.st_ctime, real_stat.TIMESPEC(c).tv_nsec);
 
-        int fd = -1;
-        S_IFMT;
-        if (S_ISREG(stat.mode) || S_ISLNK(stat.mode))
-            fd = openat(root_fd, path, O_RDONLY);
         if (S_ISLNK(stat.mode)) {
             char buf[MAX_PATH+1];
             ssize_t len = read(fd, buf, sizeof(buf)-1);
-            if (len < 0)
+            if (len < 0) {
+                close(fd);
                 POSIX_ERR();
+            }
             buf[len] = '\0';
             archive_entry_set_symlink(entry, buf);
         }
@@ -490,14 +503,14 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
             uint8_t caps[LR_GUEST_CAPS_MAX];
             ssize_t length = lr_guest_caps_get(fd, caps, sizeof caps);
             if (length >= 0) {
-                if (lr_guest_caps_validate(caps, length)) { errno = EINVAL; POSIX_ERR(); }
+                if (lr_guest_caps_validate(caps, length)) { close(fd); errno = EINVAL; POSIX_ERR(); }
                 archive_entry_xattr_add_entry(entry, "security.capability", caps, length);
             } else {
                 bool absent = errno == ENODATA || errno == ENOTSUP || errno == EOPNOTSUPP;
 #ifdef ENOATTR
                 absent |= errno == ENOATTR;
 #endif
-                if (!absent) POSIX_ERR();
+                if (!absent) { close(fd); POSIX_ERR(); }
             }
         }
 
@@ -508,18 +521,29 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
         if (sparse != NULL)
             archive_write_header(archive, sparse);
 
-        if (S_ISREG(stat.mode) && archive_entry_size(entry) != 0) {
+        if (entry != NULL && S_ISREG(stat.mode) && archive_entry_size(entry) != 0) {
             char buf[8192];
-            ssize_t len;
-            while ((len = read(fd, buf, sizeof(buf))) > 0) {
+            int64_t remaining = archive_entry_size(entry);
+            while (remaining > 0) {
+                size_t want = remaining < (int64_t)sizeof(buf) ? (size_t)remaining : sizeof(buf);
+                ssize_t len = read(fd, buf, want);
+                if (len < 0) {
+                    if (errno == EINTR) continue;
+                    close(fd);
+                    POSIX_ERR();
+                }
+                if (len == 0) {
+                    // File shrank while live guest was running; pad remaining bytes with zeros so the tar member stays well-formed.
+                    memset(buf, 0, want);
+                    len = (ssize_t)want;
+                }
                 ssize_t written = archive_write_data(archive, buf, len);
-                if (written < 0)
+                if (written < 0) {
+                    close(fd);
                     ARCHIVE_ERR(archive);
-                if (written != len)
-                    printf("uh oh\n");
+                }
+                remaining -= len;
             }
-            if (len < 0)
-                POSIX_ERR();
         }
         if (fd != -1)
             close(fd);

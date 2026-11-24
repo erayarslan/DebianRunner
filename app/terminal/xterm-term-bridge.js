@@ -728,7 +728,20 @@
     window.exports = {
         write(data) {
             const bytes = typeof data === 'string' ? latin1StringToBytes(data) : new Uint8Array(data);
-            term.write(bytes, scheduleScrollSync);
+            const bufBefore = term.buffer.active;
+            const wasAtBottom = bufBefore.type === 'normal' && bufBefore.viewportY >= bufBefore.baseY;
+            term.write(bytes, () => {
+                const bufAfter = term.buffer.active;
+                if (wasAtBottom && bufAfter.type === 'normal' && bufAfter.viewportY < bufAfter.baseY) {
+                    suppressNativeScrollEcho = true;
+                    try {
+                        term.scrollToBottom();
+                    } finally {
+                        suppressNativeScrollEcho = false;
+                    }
+                }
+                scheduleScrollSync();
+            });
             if (bytes.includes(0x1b))
                 syncApplicationCursor();
         },
@@ -898,8 +911,16 @@
             setXtermAppActive(!!focused);
         },
         scrollToBottom() {
-            term.scrollToBottom();
-            scheduleScrollSync();
+            suppressNativeScrollEcho = true;
+            try {
+                term.scrollToBottom();
+            } finally {
+                suppressNativeScrollEcho = false;
+            }
+            const cellHeight = getCellSize().height;
+            if (cellHeight)
+                lastNativeScrollTop = term.buffer.active.baseY * cellHeight;
+            syncScroll();
         },
         newScrollTop(top) {
             if (!Number.isFinite(top))
@@ -1070,18 +1091,8 @@
                 mouseTracking,
             });
         }
-
-        if (scrollHeight !== lastNativeScrollHeight) {
-            native.newScrollHeight(scrollHeight);
-            lastNativeScrollHeight = scrollHeight;
-        }
-        const acknowledgesNativeScroll = nativeScrollRequest?.buffer === buffer &&
-            nativeScrollRequest.line === buffer.viewportY &&
-            nativeScrollRequest.cellHeight === cellHeight;
         nativeScrollRequest = null;
-        if (!acknowledgesNativeScroll && scrollTop !== lastNativeScrollTop) {
-            native.newScrollTop(scrollTop);
-        }
+        lastNativeScrollHeight = scrollHeight;
         lastNativeScrollTop = scrollTop;
         if (term.hasSelection())
             notifySelection(false);

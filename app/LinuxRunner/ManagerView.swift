@@ -688,6 +688,343 @@ private struct SSHServerView: View {
     }
 }
 
+// MARK: - Environment Snapshots (preserved across Wipe)
+
+struct EnvironmentSnapshot: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let createdAt: Date
+    let sizeBytes: Int64
+    let sha256: String
+    let defaultUser: String
+    let distribution: String
+    let version: String
+
+    init?(_ dict: [String: Any]) {
+        guard let id = dict["id"] as? String, !id.isEmpty else { return nil }
+        self.id = id
+        self.name = (dict["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? id
+        let ts = (dict["created_at"] as? NSNumber)?.doubleValue ?? 0
+        self.createdAt = Date(timeIntervalSince1970: ts)
+        self.sizeBytes = (dict["size_bytes"] as? NSNumber)?.int64Value ?? 0
+        self.sha256 = dict["sha256"] as? String ?? ""
+        self.defaultUser = (dict["default_user"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "root"
+        self.distribution = (dict["distribution"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Debian GNU/Linux"
+        self.version = (dict["version"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "13.7"
+    }
+
+    static func loadAll() -> [EnvironmentSnapshot] {
+        LRRuntimeBridge.snapshots().compactMap(EnvironmentSnapshot.init)
+    }
+
+    var formattedSize: String {
+        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+    }
+
+    var formattedDate: String {
+        createdAt.formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+final class SnapshotCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    func isCancelled() -> Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+}
+
+private struct SnapshotsView: View {
+    @ObservedObject var manager: EnvironmentManager
+    @Binding var share: ExportItem?
+    var onRestored: (() -> Void)? = nil
+    var onWipeScheduled: (() -> Void)? = nil
+    @State private var snapshots: [EnvironmentSnapshot] = []
+    @State private var snapshotName = ""
+    @State private var creating = false
+    @State private var restoring: EnvironmentSnapshot?
+    @State private var progress: Double = 0
+    @State private var statusMessage = ""
+    @State private var cancellation = SnapshotCancellation()
+    @State private var error: String?
+    @State private var confirmDelete: EnvironmentSnapshot?
+    @State private var confirmRestore: EnvironmentSnapshot?
+    @State private var runningRestoreTarget: EnvironmentSnapshot?
+    @State private var wipeScheduledAlert = false
+
+    private var busy: Bool { creating || restoring != nil || manager.busy }
+    private var hasEnvironment: Bool { !manager.environments.isEmpty }
+    private var canRestoreNow: Bool { !LRRuntimeBridge.isRunning() && LRRuntimeBridge.canStartRuntime() }
+
+    var body: some View {
+        List {
+            if hasEnvironment {
+                Section {
+                    if creating {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(statusMessage.isEmpty ? "Creating snapshot…" : statusMessage)
+                                .font(.subheadline)
+                            ProgressView(value: progress)
+                            Button("Cancel Snapshot", role: .destructive) {
+                                cancellation.cancel()
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    } else {
+                        TextField("Snapshot name (optional)", text: $snapshotName)
+                            .disabled(busy)
+                        Button {
+                            createSnapshot()
+                        } label: {
+                            Label("Create Snapshot Now", systemImage: "camera.fill")
+                        }
+                        .disabled(busy)
+                    }
+                } header: {
+                    Text("New Snapshot")
+                } footer: {
+                    Text("Saves a verified backup of your Debian Minimal filesystem, packages, SSH keys, and Linux accounts. Snapshots are kept when you wipe Debian Minimal so you can restore them on next launch.")
+                }
+            }
+
+            if let active = restoring {
+                Section("Restoring Snapshot") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Restoring \"\(active.name)\"").font(.headline)
+                        Text(statusMessage.isEmpty ? "Verifying and importing snapshot…" : statusMessage)
+                            .font(.caption).foregroundColor(.secondary)
+                        ProgressView(value: progress)
+                        Button("Cancel Restore", role: .destructive) {
+                            cancellation.cancel()
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+
+            if let error {
+                Section {
+                    Text(error).font(.footnote).foregroundColor(.red)
+                }
+            }
+
+            Section {
+                if snapshots.isEmpty {
+                    Text("No snapshots saved yet.")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(snapshots) { snap in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(snap.name).font(.headline)
+                                Spacer()
+                                Text(snap.formattedSize).font(.caption.monospacedDigit()).foregroundColor(.secondary)
+                            }
+                            Text("\(snap.formattedDate) · \(snap.distribution) \(snap.version) · user: \(snap.defaultUser)")
+                                .font(.caption).foregroundColor(.secondary)
+                            HStack(spacing: 10) {
+                                Button {
+                                    if canRestoreNow {
+                                        confirmRestore = snap
+                                    } else {
+                                        runningRestoreTarget = snap
+                                    }
+                                } label: {
+                                    Label("Restore", systemImage: "clock.arrow.circlepath")
+                                }
+                                .buttonStyle(.borderedProminent).controlSize(.small).disabled(busy)
+
+                                Button {
+                                    if let url = LRRuntimeBridge.snapshotArchiveURL(id: snap.id) {
+                                        share = ExportItem(url: url, deleteAfterShare: false)
+                                    } else {
+                                        error = "Snapshot archive could not be found."
+                                    }
+                                } label: {
+                                    Label("Export", systemImage: "square.and.arrow.up")
+                                }
+                                .buttonStyle(.bordered).controlSize(.small).disabled(busy)
+
+                                Spacer()
+
+                                Button(role: .destructive) {
+                                    confirmDelete = snap
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.bordered).controlSize(.small).disabled(busy)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            } header: {
+                Text("Saved Snapshots (\(snapshots.count))")
+            } footer: {
+                Text("Snapshots survive Wipe Debian Minimal. After wiping and reopening DebianRunner, choose any snapshot on the first screen to restore it.")
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("Snapshots")
+        .onAppear(perform: refresh)
+        .toolbar {
+            Button(action: refresh) { Image(systemName: "arrow.clockwise") }.disabled(busy)
+        }
+        .confirmationDialog(
+            "Delete Snapshot?",
+            isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
+            titleVisibility: .visible
+        ) {
+            if let snap = confirmDelete {
+                Button("Delete \"\(snap.name)\"", role: .destructive) {
+                    confirmDelete = nil
+                    deleteSnapshot(snap)
+                }
+            }
+            Button("Cancel", role: .cancel) { confirmDelete = nil }
+        } message: {
+            if let snap = confirmDelete {
+                Text("Permanently remove \"\(snap.name)\" (\(snap.formattedSize))?")
+            }
+        }
+        .confirmationDialog(
+            "Restore Snapshot?",
+            isPresented: Binding(get: { confirmRestore != nil }, set: { if !$0 { confirmRestore = nil } }),
+            titleVisibility: .visible
+        ) {
+            if let snap = confirmRestore {
+                Button("Restore \"\(snap.name)\"") {
+                    confirmRestore = nil
+                    restoreSnapshot(snap)
+                }
+            }
+            Button("Cancel", role: .cancel) { confirmRestore = nil }
+        } message: {
+            if let snap = confirmRestore {
+                Text("Replace the current stopped Debian Minimal environment with \"\(snap.name)\" (\(snap.formattedSize)) and start it now?")
+            }
+        }
+        .alert(
+            "Wipe & Relaunch to Restore",
+            isPresented: Binding(get: { runningRestoreTarget != nil }, set: { if !$0 { runningRestoreTarget = nil } })
+        ) {
+            Button("Cancel", role: .cancel) { runningRestoreTarget = nil }
+            Button("Wipe & Prepare Restore", role: .destructive) {
+                runningRestoreTarget = nil
+                manager.wipeAll { needsRestart, failure in
+                    if let failure {
+                        error = failure
+                    } else if needsRestart {
+                        onWipeScheduled?()
+                        wipeScheduledAlert = true
+                    } else {
+                        onRestored?()
+                    }
+                }
+            }
+        } message: {
+            if let snap = runningRestoreTarget {
+                Text("Debian Minimal is currently mounted in this session. Wipe it and reopen DebianRunner — your saved snapshots are kept so you can restore \"\(snap.name)\" right on the first screen.")
+            }
+        }
+        .alert("Restart to Restore Snapshot", isPresented: $wipeScheduledAlert) {
+            Button("Close DebianRunner Now", role: .destructive) { exit(0) }
+            Button("Later", role: .cancel) { }
+        } message: {
+            Text("Close DebianRunner and open it again. The old environment will be wiped cleanly and you can pick your snapshot immediately on launch.")
+        }
+    }
+
+    private func refresh() {
+        snapshots = EnvironmentSnapshot.loadAll()
+    }
+
+    private func createSnapshot() {
+        guard !busy else { return }
+        error = nil
+        creating = true
+        progress = 0
+        statusMessage = "Preparing snapshot…"
+        let token = SnapshotCancellation()
+        cancellation = token
+        let label = snapshotName
+        LRRuntimeBridge.createSnapshot(named: label, progress: { fraction, message in
+            progress = fraction
+            statusMessage = message
+        }, cancel: {
+            token.isCancelled()
+        }, completion: { _, err in
+            creating = false
+            progress = 0
+            statusMessage = ""
+            if let err {
+                if (err as NSError).code == CocoaError.userCancelled.rawValue {
+                    error = "Snapshot cancelled."
+                } else {
+                    error = err.localizedDescription
+                }
+            } else {
+                snapshotName = ""
+                refresh()
+            }
+        })
+    }
+
+    private func deleteSnapshot(_ snap: EnvironmentSnapshot) {
+        error = nil
+        do {
+            try LRRuntimeBridge.deleteSnapshot(id: snap.id)
+            refresh()
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func restoreSnapshot(_ snap: EnvironmentSnapshot) {
+        guard !busy else { return }
+        error = nil
+        restoring = snap
+        progress = 0
+        statusMessage = "Verifying and restoring snapshot…"
+        let token = SnapshotCancellation()
+        cancellation = token
+        LRRuntimeBridge.restoreSnapshot(id: snap.id, progress: { fraction, message in
+            progress = fraction
+            statusMessage = message
+        }, cancel: {
+            token.isCancelled()
+        }, completion: { rootName, err in
+            restoring = nil
+            progress = 0
+            statusMessage = ""
+            if let err {
+                if (err as NSError).code == CocoaError.userCancelled.rawValue {
+                    error = "Snapshot restore cancelled."
+                } else {
+                    error = err.localizedDescription
+                }
+                return
+            }
+            guard let rootName else {
+                error = "Snapshot restore returned no environment."
+                return
+            }
+            var env = LinuxEnvironment(name: "Debian Minimal", rootfsName: rootName)
+            env.distribution = snap.distribution
+            env.distributionID = "debian"
+            env.packageManager = "apt"
+            env.rootfsVersion = snap.version
+            env.defaultShell = "/bin/bash"
+            env.installationState = "Restored from snapshot \"\(snap.name)\""
+            manager.environments = [env]
+            try? manager.persist()
+            LRRuntimeBridge.setNextRootName(rootName)
+            _ = LRRuntimeBridge.startRuntime()
+            manager.refresh()
+            onRestored?()
+        })
+    }
+}
+
 struct ManagerView: View {
     @StateObject private var manager = EnvironmentManager()
     @StateObject private var ssh = SSHServiceController()
@@ -714,6 +1051,7 @@ struct ManagerView: View {
     @State private var confirmWipe = false
     @State private var wipeScheduledAlert = false
     @State private var wipeScheduled = LRRuntimeBridge.isWipePending()
+    @State private var snapshotCount = LRRuntimeBridge.snapshots().count
     @Environment(\.scenePhase) private var phase
 
     var body: some View {
@@ -732,6 +1070,7 @@ struct ManagerView: View {
             LongTaskCenter.shared.start()
             runtimeRunning = LRRuntimeBridge.isRunning()
             wipeScheduled = LRRuntimeBridge.isWipePending()
+            snapshotCount = LRRuntimeBridge.snapshots().count
             if runtimeRunning {
                 ssh.ensureDefaultSSHIfNeeded()
                 ssh.refresh(queryGuest: false)
@@ -753,6 +1092,7 @@ struct ManagerView: View {
         #endif
         .fullScreenCover(isPresented: $setup, onDismiss: {
             runtimeRunning = LRRuntimeBridge.isRunning()
+            snapshotCount = LRRuntimeBridge.snapshots().count
             manager.refresh()
             if runtimeRunning { ssh.ensureDefaultSSHIfNeeded() }
             if terminalAfterSetup {
@@ -774,18 +1114,19 @@ struct ManagerView: View {
                     } else {
                         runtimeRunning = LRRuntimeBridge.isRunning()
                         wipeScheduled = false
+                        snapshotCount = LRRuntimeBridge.snapshots().count
                         ssh.status = [:]
                     }
                 }
             }
         } message: {
-            Text("Permanently erase Debian Minimal, including all installed APT packages, Linux home files, SSH keys, and DebianRunner Shared files? Export anything you need first. You can reinstall a clean Debian Minimal environment afterwards.")
+            Text("Permanently erase Debian Minimal, including all installed APT packages, Linux home files, SSH keys, and DebianRunner Shared files? Saved snapshots are kept and can be restored on next launch.")
         }
         .alert("Restart to Complete Wipe", isPresented: $wipeScheduledAlert) {
             Button("Close DebianRunner Now", role: .destructive) { exit(0) }
             Button("Later", role: .cancel) { }
         } message: {
-            Text("Debian Minimal is currently mounted. Close DebianRunner now and reopen it — the old filesystem will be wiped cleanly before startup so you can install fresh.")
+            Text("Debian Minimal is currently mounted. Close DebianRunner now and reopen it — the old filesystem will be wiped cleanly before startup so you can install fresh or restore a saved snapshot.")
         }
         .sheet(isPresented: $diagnostics) { DeveloperDiagnosticsView() }
         .fullScreenCover(item: $session) { item in
@@ -803,6 +1144,7 @@ struct ManagerView: View {
             guard newPhase == .active else { return }
             runtimeRunning = LRRuntimeBridge.isRunning()
             wipeScheduled = LRRuntimeBridge.isWipePending()
+            snapshotCount = LRRuntimeBridge.snapshots().count
             manager.refresh()
             if runtimeRunning { ssh.refresh(queryGuest: true) }
         }
@@ -919,8 +1261,8 @@ struct ManagerView: View {
                     else { Image(systemName: uninstalled ? "arrow.down.circle.fill" : runtimeRunning ? "terminal.fill" : "power").font(.title3.weight(.semibold)) }
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(uninstalled ? "Install Debian Minimal" : runtimeRunning ? "Open Terminal" : startingRuntime ? "Starting Debian…" : "Start Debian Minimal").font(.headline)
-                    Text(uninstalled ? "Download & verify Debian 13 (trixie) ARM64" : runtimeRunning ? "Open an interactive Debian shell" : "Boot the ARM64 Linux runtime").font(.caption).opacity(0.85)
+                    Text(uninstalled ? (snapshotCount > 0 ? "Install or Restore Debian" : "Install Debian Minimal") : runtimeRunning ? "Open Terminal" : startingRuntime ? "Starting Debian…" : "Start Debian Minimal").font(.headline)
+                    Text(uninstalled ? (snapshotCount > 0 ? "Install fresh or restore from \(snapshotCount) saved snapshot\(snapshotCount == 1 ? "" : "s")" : "Download & verify Debian 13 (trixie) ARM64") : runtimeRunning ? "Open an interactive Debian shell" : "Boot the ARM64 Linux runtime").font(.caption).opacity(0.85)
                 }
                 Spacer()
                 Image(systemName: "chevron.right").font(.headline).opacity(0.7)
@@ -939,8 +1281,24 @@ struct ManagerView: View {
     }
 
     private func startSetup() {
-        setupStep = SetupStep.install.rawValue
+        snapshotCount = LRRuntimeBridge.snapshots().count
+        setupStep = snapshotCount > 0 ? SetupStep.welcome.rawValue : SetupStep.install.rawValue
         setup = true
+    }
+
+    private func handleSnapshotRestored() {
+        runtimeRunning = LRRuntimeBridge.isRunning()
+        wipeScheduled = LRRuntimeBridge.isWipePending()
+        snapshotCount = LRRuntimeBridge.snapshots().count
+        manager.refresh()
+        if runtimeRunning {
+            if terminal.sessionTerminalUUID == nil {
+                terminal.loadViewIfNeeded()
+                terminal.startNewSession()
+            }
+            ssh.ensureDefaultSSHIfNeeded()
+            ssh.refresh(queryGuest: false)
+        }
     }
 
     private var debianEnvironmentView: some View {
@@ -994,6 +1352,14 @@ struct ManagerView: View {
                             NavigationLink(destination: LinuxUsersView()) { Label("Linux Users", systemImage: "person.2") }
                         }
                         NavigationLink(destination: FileSharingView(environment: environment, manager: manager, share: $share)) { Label("Files & Apple Files", systemImage: "folder") }
+                        NavigationLink(destination: SnapshotsView(manager: manager, share: $share, onRestored: handleSnapshotRestored, onWipeScheduled: { wipeScheduled = true })) {
+                            HStack {
+                                Label("Snapshots", systemImage: "clock.arrow.circlepath")
+                                Spacer()
+                                Text(snapshotCount == 0 ? "None" : "\(snapshotCount)")
+                                    .font(.caption).foregroundColor(.secondary)
+                            }
+                        }
                         NavigationLink(destination: StorageManagementView(environments: manager.environments)) { Label("Storage", systemImage: "internaldrive") }
                         if !active {
                             Text("Start Debian Minimal to manage APT packages and Linux users.").font(.caption).foregroundColor(.secondary)
@@ -1035,7 +1401,7 @@ struct ManagerView: View {
                         .disabled(manager.busy)
                         .accessibilityIdentifier("Wipe Debian Minimal")
                     } header: { Text("Reset Environment") } footer: {
-                        Text("Erases your Debian Minimal root filesystem, packages, Linux home files, SSH host keys, and Shared files so you can reinstall from scratch. Export any files you want to keep first.")
+                        Text("Erases your Debian Minimal root filesystem, packages, Linux home files, SSH host keys, and Shared files. Saved snapshots are preserved so you can restore one or reinstall fresh after wiping.")
                     }
                 }
                 .listStyle(.insetGrouped)
@@ -1049,7 +1415,7 @@ struct ManagerView: View {
                                     Text("Debian 13 (trixie) Minimal").font(.headline).foregroundColor(.primary)
                                     Text("Official ARM64 minimal userspace with APT, bash, built-in OpenSSH server, and Apple Files access.")
                                         .font(.caption).foregroundColor(.secondary).multilineTextAlignment(.leading)
-                                    Label("Install Debian Minimal", systemImage: "arrow.down.circle.fill")
+                                    Label(snapshotCount > 0 ? "Install Fresh or Restore Snapshot" : "Install Debian Minimal", systemImage: "arrow.down.circle.fill")
                                         .font(.subheadline.weight(.semibold)).foregroundColor(.accentColor)
                                 }
                                 Spacer(minLength: 0)
@@ -1058,6 +1424,23 @@ struct ManagerView: View {
                             .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
                         }
                         .buttonStyle(HomeTileStyle()).disabled(manager.busy).accessibilityIdentifier("Install Debian Minimal")
+                        if snapshotCount > 0 {
+                            NavigationLink(destination: SnapshotsView(manager: manager, share: $share, onRestored: handleSnapshotRestored, onWipeScheduled: { wipeScheduled = true })) {
+                                HStack(spacing: 14) {
+                                    LRIconTile(symbol: "clock.arrow.circlepath", colors: [.teal, .blue], size: 48)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Saved Snapshots (\(snapshotCount))").font(.headline).foregroundColor(.primary)
+                                        Text("Restore your previous Debian Minimal environment or manage saved backups.")
+                                            .font(.caption).foregroundColor(.secondary).multilineTextAlignment(.leading)
+                                    }
+                                    Spacer(minLength: 0)
+                                    Image(systemName: "chevron.right").font(.subheadline.weight(.semibold)).foregroundColor(.secondary)
+                                }
+                                .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+                                .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
+                            }
+                            .buttonStyle(HomeTileStyle())
+                        }
                         if manager.busy { ProgressView("Preparing environment…") }
                     }
                     .padding(.horizontal, 20).padding(.top, 16).padding(.bottom, 96)
@@ -1066,9 +1449,13 @@ struct ManagerView: View {
             }
         }
         .navigationTitle("Debian Minimal")
+        .onAppear {
+            snapshotCount = LRRuntimeBridge.snapshots().count
+        }
         .toolbar {
             Button {
                 runtimeRunning = LRRuntimeBridge.isRunning()
+                snapshotCount = LRRuntimeBridge.snapshots().count
                 manager.refresh()
                 if runtimeRunning { ssh.refresh(queryGuest: true) }
             } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh Debian Minimal")
@@ -1115,6 +1502,7 @@ struct ManagerView: View {
                 NavigationLink(destination: NetworkDiagnosticsView()) { SettingsLabel("Network", "wifi", .blue) }
             }
             Section("Storage & Maintenance") {
+                NavigationLink(destination: SnapshotsView(manager: manager, share: $share, onRestored: handleSnapshotRestored, onWipeScheduled: { wipeScheduled = true })) { SettingsLabel("Snapshots", "clock.arrow.circlepath", .teal) }
                 NavigationLink(destination: StorageManagementView(environments: manager.environments)) { SettingsLabel("Storage", "internaldrive.fill", .gray) }
                 Button {
                     Task.detached {
@@ -1240,9 +1628,13 @@ struct TerminalScreen: View {
             .padding(.horizontal, 16).padding(.vertical, 8)
             NativeController(controller: controller)
         }.background(Color.black.ignoresSafeArea())
-         .onAppear { currentTerminalViewController = controller }
+         .onAppear {
+             currentTerminalViewController = controller
+             controller.onSessionEnded = { dismiss() }
+         }
          .onDisappear {
              if currentTerminalViewController === controller { currentTerminalViewController = nil }
+             controller.onSessionEnded = nil
          }
     }
 }
@@ -1399,12 +1791,18 @@ struct PackageView: View {
     }
 }
 
-struct ExportItem: Identifiable { let id = UUID(); let url: URL }
+struct ExportItem: Identifiable {
+    let id = UUID()
+    let url: URL
+    var deleteAfterShare = true
+}
 struct ShareView: UIViewControllerRepresentable {
     let item: ExportItem
     func makeUIViewController(context: Context) -> UIActivityViewController {
         let controller = UIActivityViewController(activityItems: [item.url], applicationActivities: nil)
-        controller.completionWithItemsHandler = { _, _, _, _ in LRRuntimeBridge.deleteExport(item.url) }
+        controller.completionWithItemsHandler = { _, _, _, _ in
+            if item.deleteAfterShare { LRRuntimeBridge.deleteExport(item.url) }
+        }
         return controller
     }
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
@@ -1841,6 +2239,7 @@ struct StorageManagementView: View {
             var values: [String: Int64] = [:]
             for e in items { values["\(e.name) rootfs"] = StorageUsage.bytes(LRRuntimeBridge.rootURL(e.rootfsName)); values["\(e.name) shared files"] = StorageUsage.bytes(LRRuntimeBridge.exchangeURL(e.rootfsName)); values["\(e.name) package cache (part of rootfs)"] = StorageUsage.bytes(LRRuntimeBridge.rootURL(e.rootfsName).appendingPathComponent("data/var/cache")) }
             let base = LRRuntimeBridge.managedStorageURL()
+            values["Snapshots"] = StorageUsage.bytes(base.appendingPathComponent("snapshots"))
             values["Diagnostics"] = StorageUsage.bytes(base.deletingLastPathComponent().appendingPathComponent("LinuxRunnerDiagnostics"))
             values["Installation downloads"] = StorageUsage.bytes(base.appendingPathComponent("downloads"))
             values["Installation staging"] = StorageUsage.bytes(base.appendingPathComponent("installer-temporary"))

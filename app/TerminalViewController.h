@@ -19,6 +19,7 @@
 @property (nonatomic, copy) NSArray<NSString *> *runnerCommand;
 @property (nonatomic, copy) NSString *runnerDirectory;
 @property BOOL runnerReportsExit;
+@property (nonatomic, copy, nullable) void (^onSessionEnded)(void);
 
 - (void)startNewSession;
 /// Types text into this terminal's session (as if from the keyboard).

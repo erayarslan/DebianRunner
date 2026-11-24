@@ -78,6 +78,20 @@ void LRSetDatalessMaterialization(void);
 + (void)performPendingWipeIfNeeded;
 + (BOOL)isWipePending;
 + (void)wipeEnvironmentWithCompletion:(void (^)(BOOL needsRestart, NSError * _Nullable error))completion NS_SWIFT_NAME(wipeEnvironment(completion:));
+// Environment snapshots (tar.gz + JSON metadata in ContainerURL/snapshots, preserved across Wipe).
++ (NSArray<NSDictionary<NSString *, id> *> *)snapshots;
++ (NSURL * _Nullable)snapshotArchiveURLForID:(NSString *)snapshotID NS_SWIFT_NAME(snapshotArchiveURL(id:));
++ (BOOL)deleteSnapshotWithID:(NSString *)snapshotID error:(NSError **)error NS_SWIFT_NAME(deleteSnapshot(id:));
++ (void)createSnapshotNamed:(NSString *)name
+                   progress:(void (^)(double fraction, NSString *message))progress
+                     cancel:(BOOL (^)(void))cancel
+                 completion:(void (^)(NSDictionary<NSString *, id> * _Nullable snapshot, NSError * _Nullable error))completion
+                 NS_SWIFT_NAME(createSnapshot(named:progress:cancel:completion:));
++ (void)restoreSnapshotWithID:(NSString *)snapshotID
+                     progress:(void (^)(double fraction, NSString *message))progress
+                       cancel:(BOOL (^)(void))cancel
+                   completion:(void (^)(NSString * _Nullable rootName, NSError * _Nullable error))completion
+                   NS_SWIFT_NAME(restoreSnapshot(id:progress:cancel:completion:));
 + (void)handleDidEnterBackground;
 + (void)handleWillEnterForeground;
 + (BOOL)fileProviderEnabled;

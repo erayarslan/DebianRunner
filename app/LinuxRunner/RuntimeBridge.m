@@ -811,6 +811,314 @@ static void LRClearAllEnvironmentUserDefaults(void) {
     LRBootEvent("[WIPE] completed pending Debian Minimal wipe before runtime mount");
 }
 
+// ---- Environment Snapshots (preserved across Wipe) --------------------------
+
+static BOOL snapshotOperationActive = NO;
+
+static NSURL *LRSnapshotsDirectoryURL(void) {
+    NSURL *dir = [ContainerURL() URLByAppendingPathComponent:@"snapshots" isDirectory:YES];
+    [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static BOOL LRValidSnapshotID(NSString *snapshotID) {
+    if (![snapshotID isKindOfClass:NSString.class] || snapshotID.length == 0 || snapshotID.length > 80)
+        return NO;
+    for (NSUInteger i = 0; i < snapshotID.length; i++) {
+        unichar c = [snapshotID characterAtIndex:i];
+        BOOL ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+        if (!ok) return NO;
+    }
+    return YES;
+}
+
+static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^cancel)(void), NSError **error) {
+    int fd = open(fileURL.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        if (error) *error = lrError(errno, @"Snapshot archive could not be opened for verification.");
+        return nil;
+    }
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    uint8_t buf[65536];
+    uint64_t total = 0;
+    for (;;) {
+        if (cancel && cancel()) {
+            close(fd);
+            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil];
+            return nil;
+        }
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            int err = errno;
+            close(fd);
+            if (error) *error = lrError(err, @"Failed reading snapshot archive while computing checksum.");
+            return nil;
+        }
+        if (n == 0) break;
+        CC_SHA256_Update(&ctx, buf, (CC_LONG)n);
+        total += (uint64_t)n;
+    }
+    close(fd);
+    if (sizeOut) *sizeOut = total;
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &ctx);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (NSUInteger i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+        [hex appendFormat:@"%02x", digest[i]];
+    return hex;
+}
+
++ (NSArray<NSDictionary<NSString *, id> *> *)snapshots {
+    NSURL *dir = LRSnapshotsDirectoryURL();
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSArray<NSURL *> *files = [fm contentsOfDirectoryAtURL:dir includingPropertiesForKeys:@[NSURLFileSizeKey] options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+    NSMutableArray<NSDictionary<NSString *, id> *> *list = [NSMutableArray new];
+    for (NSURL *file in files) {
+        if (![file.pathExtension isEqualToString:@"json"]) continue;
+        NSData *data = [NSData dataWithContentsOfURL:file];
+        if (!data) continue;
+        NSDictionary *meta = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![meta isKindOfClass:NSDictionary.class]) continue;
+        NSString *sid = [meta[@"id"] isKindOfClass:NSString.class] ? meta[@"id"] : nil;
+        if (!LRValidSnapshotID(sid)) continue;
+        NSURL *archive = [dir URLByAppendingPathComponent:[sid stringByAppendingString:@".tar.gz"]];
+        if (![fm fileExistsAtPath:archive.path]) continue;
+        [list addObject:meta];
+    }
+    [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        double ta = [a[@"created_at"] doubleValue];
+        double tb = [b[@"created_at"] doubleValue];
+        if (ta > tb) return NSOrderedAscending;
+        if (ta < tb) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    return list;
+}
+
++ (NSURL *)snapshotArchiveURLForID:(NSString *)snapshotID {
+    if (!LRValidSnapshotID(snapshotID)) return nil;
+    NSURL *archive = [LRSnapshotsDirectoryURL() URLByAppendingPathComponent:[snapshotID stringByAppendingString:@".tar.gz"]];
+    return [NSFileManager.defaultManager fileExistsAtPath:archive.path] ? archive : nil;
+}
+
++ (BOOL)deleteSnapshotWithID:(NSString *)snapshotID error:(NSError **)error {
+    if (!LRValidSnapshotID(snapshotID)) {
+        if (error) *error = lrError(EINVAL, @"Invalid snapshot identifier.");
+        return NO;
+    }
+    NSURL *dir = LRSnapshotsDirectoryURL();
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *archive = [dir URLByAppendingPathComponent:[snapshotID stringByAppendingString:@".tar.gz"]];
+    NSURL *meta = [dir URLByAppendingPathComponent:[snapshotID stringByAppendingString:@".json"]];
+    NSError *err = nil;
+    if ([fm fileExistsAtPath:archive.path] && ![fm removeItemAtURL:archive error:&err]) {
+        if (error) *error = err;
+        return NO;
+    }
+    if ([fm fileExistsAtPath:meta.path] && ![fm removeItemAtURL:meta error:&err]) {
+        if (error) *error = err;
+        return NO;
+    }
+    [self logCategory:@"SNAPSHOT" event:[NSString stringWithFormat:@"deleted snapshot id=%@", snapshotID]];
+    return YES;
+}
+
++ (void)createSnapshotNamed:(NSString *)name
+                   progress:(void (^)(double fraction, NSString *message))progress
+                     cancel:(BOOL (^)(void))cancel
+                 completion:(void (^)(NSDictionary<NSString *, id> * _Nullable snapshot, NSError * _Nullable error))completion {
+    NSAssert(NSThread.isMainThread, @"Snapshot creation starts on the main thread");
+    if (snapshotOperationActive || environmentDeletionActive) {
+        completion(nil, lrError(EBUSY, @"Wait for the current environment operation to finish."));
+        return;
+    }
+    NSString *rootName = self.activeRootName.length ? self.activeRootName : Roots.instance.defaultRoot;
+    if (!validRoot(rootName) || ![Roots.instance.roots containsObject:rootName]) {
+        completion(nil, lrError(ENOENT, @"No Debian Minimal installation found to snapshot."));
+        return;
+    }
+    NSString *trimmedName = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSDate *now = NSDate.date;
+    if (trimmedName.length == 0) {
+        NSDateFormatter *fmt = [NSDateFormatter new];
+        fmt.dateFormat = @"MMM d, HH:mm";
+        trimmedName = [NSString stringWithFormat:@"Snapshot %@", [fmt stringFromDate:now]];
+    }
+    NSString *defaultUser = self.defaultLinuxUser ?: @"root";
+    NSDateFormatter *idFmt = [NSDateFormatter new];
+    idFmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    idFmt.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *shortUUID = [[NSUUID.UUID.UUIDString substringToIndex:6] lowercaseString];
+    NSString *snapshotID = [NSString stringWithFormat:@"snap-%@-%@", [idFmt stringFromDate:now], shortUUID];
+
+    snapshotOperationActive = YES;
+    [self beginAwake:@"snapshot-create"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSURL *dir = LRSnapshotsDirectoryURL();
+        NSURL *tmpArchive = [dir URLByAppendingPathComponent:[snapshotID stringByAppendingString:@".tar.gz.tmp"]];
+        NSURL *finalArchive = [dir URLByAppendingPathComponent:[snapshotID stringByAppendingString:@".tar.gz"]];
+        NSURL *metaURL = [dir URLByAppendingPathComponent:[snapshotID stringByAppendingString:@".json"]];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        [fm removeItemAtURL:tmpArchive error:nil];
+
+        LRInstallProgress *reporter = [LRInstallProgress new];
+        reporter.progress = ^(double value, NSString *message) {
+            double scaled = MIN(0.85, MAX(0.0, value * 0.85));
+            NSString *label = message.length ? message : @"Archiving Debian Minimal filesystem…";
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (progress) progress(scaled, label);
+            });
+        };
+        reporter.cancel = cancel;
+
+        NSError *err = nil;
+        BOOL exported = [Roots.instance exportRootNamed:rootName toArchive:tmpArchive error:&err progressReporter:reporter];
+        if (!exported) {
+            [fm removeItemAtURL:tmpArchive error:nil];
+            if (!err && cancel && cancel())
+                err = [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                snapshotOperationActive = NO;
+                [self endAwake:@"snapshot-create"];
+                completion(nil, err ?: lrError(EIO, @"Failed to export Debian Minimal snapshot."));
+            });
+            return;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (progress) progress(0.90, @"Computing snapshot checksum…");
+        });
+        uint64_t sizeBytes = 0;
+        NSString *sha256 = LRSHA256ForFileURL(tmpArchive, &sizeBytes, cancel, &err);
+        if (!sha256) {
+            [fm removeItemAtURL:tmpArchive error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                snapshotOperationActive = NO;
+                [self endAwake:@"snapshot-create"];
+                completion(nil, err ?: lrError(EIO, @"Failed to verify snapshot checksum."));
+            });
+            return;
+        }
+
+        if (![fm moveItemAtURL:tmpArchive toURL:finalArchive error:&err]) {
+            [fm removeItemAtURL:tmpArchive error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                snapshotOperationActive = NO;
+                [self endAwake:@"snapshot-create"];
+                completion(nil, err);
+            });
+            return;
+        }
+
+        NSDictionary<NSString *, id> *meta = @{
+            @"id": snapshotID,
+            @"name": trimmedName,
+            @"created_at": @(now.timeIntervalSince1970),
+            @"size_bytes": @(sizeBytes),
+            @"sha256": sha256,
+            @"default_user": defaultUser,
+            @"distribution": @"Debian GNU/Linux",
+            @"version": @"13.7",
+        };
+        NSData *json = [NSJSONSerialization dataWithJSONObject:meta options:NSJSONWritingPrettyPrinted error:&err];
+        if (!json || ![json writeToURL:metaURL options:NSDataWritingAtomic error:&err]) {
+            [fm removeItemAtURL:finalArchive error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                snapshotOperationActive = NO;
+                [self endAwake:@"snapshot-create"];
+                completion(nil, err ?: lrError(EIO, @"Failed to save snapshot metadata."));
+            });
+            return;
+        }
+
+        [self logCategory:@"SNAPSHOT" event:[NSString stringWithFormat:@"created id=%@ name=%@ bytes=%llu user=%@", snapshotID, trimmedName, (unsigned long long)sizeBytes, defaultUser]];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            snapshotOperationActive = NO;
+            [self endAwake:@"snapshot-create"];
+            if (progress) progress(1.0, @"Snapshot saved");
+            completion(meta, nil);
+        });
+    });
+}
+
++ (void)restoreSnapshotWithID:(NSString *)snapshotID
+                     progress:(void (^)(double fraction, NSString *message))progress
+                       cancel:(BOOL (^)(void))cancel
+                   completion:(void (^)(NSString * _Nullable rootName, NSError * _Nullable error))completion {
+    NSAssert(NSThread.isMainThread, @"Snapshot restore starts on the main thread");
+    if (snapshotOperationActive || environmentDeletionActive) {
+        completion(nil, lrError(EBUSY, @"Wait for the current environment operation to finish."));
+        return;
+    }
+    if (bootAttempted) {
+        completion(nil, lrError(EBUSY, @"Debian Minimal is already running in this session. Wipe Debian Minimal and reopen the app to restore a snapshot cleanly."));
+        return;
+    }
+    if (!LRValidSnapshotID(snapshotID)) {
+        completion(nil, lrError(EINVAL, @"Invalid snapshot identifier."));
+        return;
+    }
+    NSURL *dir = LRSnapshotsDirectoryURL();
+    NSURL *archiveURL = [dir URLByAppendingPathComponent:[snapshotID stringByAppendingString:@".tar.gz"]];
+    NSURL *metaURL = [dir URLByAppendingPathComponent:[snapshotID stringByAppendingString:@".json"]];
+    NSData *metaData = [NSData dataWithContentsOfURL:metaURL];
+    NSDictionary *meta = metaData ? [NSJSONSerialization JSONObjectWithData:metaData options:0 error:nil] : nil;
+    NSString *sha256 = [meta[@"sha256"] isKindOfClass:NSString.class] ? meta[@"sha256"] : nil;
+    if (!meta || sha256.length != 64 || ![NSFileManager.defaultManager fileExistsAtPath:archiveURL.path]) {
+        completion(nil, lrError(ENOENT, @"Snapshot files are missing or corrupted."));
+        return;
+    }
+    NSString *defaultUser = [meta[@"default_user"] isKindOfClass:NSString.class] ? meta[@"default_user"] : @"root";
+    NSString *dist = [meta[@"distribution"] isKindOfClass:NSString.class] ? meta[@"distribution"] : @"Debian GNU/Linux";
+    NSString *ver = [meta[@"version"] isKindOfClass:NSString.class] ? meta[@"version"] : @"13.7";
+    NSString *rootName = [NSString stringWithFormat:@"debian-%lld", (long long)NSDate.date.timeIntervalSince1970];
+
+    snapshotOperationActive = YES;
+    [self beginAwake:@"snapshot-restore"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (Roots.instance.roots.count > 0) {
+            NSError *destroyErr = nil;
+            [Roots.instance forceDestroyAllRoots:&destroyErr];
+        }
+        LRInstallProgress *reporter = [LRInstallProgress new];
+        reporter.progress = ^(double value, NSString *message) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (progress) progress(value, message.length ? message : @"Restoring snapshot…");
+            });
+        };
+        reporter.cancel = cancel;
+
+        NSError *err = nil;
+        NSDictionary *rootMeta = @{
+            @"distributionID": @"debian",
+            @"distribution": dist,
+            @"version": ver,
+            @"packageManager": @"apt",
+            @"defaultShell": @"/bin/bash",
+            @"restoredFromSnapshot": snapshotID,
+        };
+        BOOL ok = [Roots.instance importVerifiedRootFromArchive:archiveURL name:rootName sha256:sha256 metadata:rootMeta error:&err progressReporter:reporter];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            snapshotOperationActive = NO;
+            [self endAwake:@"snapshot-restore"];
+            if (!ok) {
+                completion(nil, err ?: lrError(EIO, @"Failed to restore snapshot."));
+                return;
+            }
+            Roots.instance.defaultRoot = rootName;
+            if (defaultUser.length > 0 && ![defaultUser isEqualToString:@"root"]) {
+                [NSUserDefaults.standardUserDefaults setObject:defaultUser forKey:[@"LinuxRunnerDefaultUser." stringByAppendingString:rootName]];
+            }
+            [NSUserDefaults.standardUserDefaults synchronize];
+            [self logCategory:@"SNAPSHOT" event:[NSString stringWithFormat:@"restored id=%@ into root=%@ user=%@", snapshotID, rootName, defaultUser]];
+            if (progress) progress(1.0, @"Snapshot restored");
+            completion(rootName, nil);
+        });
+    });
+}
+
 + (void)wipeEnvironmentWithCompletion:(void (^)(BOOL needsRestart, NSError * _Nullable error))completion {
     NSAssert(NSThread.isMainThread, @"Environment wipe starts on the main thread");
     if (environmentDeletionActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"]) {

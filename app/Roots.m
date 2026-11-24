@@ -210,17 +210,16 @@ static void root_import_progress_callback(void *cookie, double progress, const c
             userInfo:@{NSLocalizedDescriptionKey:@"Invalid or duplicate environment root identifier."}];
         return NO;
     }
-    // The managed Debian installer supplies its archive hash only after
-    // authenticating every package. Verify a private snapshot, then import
-    // those exact bytes.
-    unsigned long long maximumBytes = 512ULL * 1024 * 1024;
+    // The managed Debian installer or snapshot manager supplies its archive hash
+    // before importing. Verify a private copy, then import those exact bytes.
+    unsigned long long maximumBytes = 4ULL * 1024 * 1024 * 1024;
     NSDictionary *attributes = archive ? [archive resourceValuesForKeys:
         @[NSURLIsRegularFileKey, NSURLIsSymbolicLinkKey, NSURLFileSizeKey] error:error] : nil;
     if (![attributes[NSURLIsRegularFileKey] boolValue] ||
         [attributes[NSURLIsSymbolicLinkKey] boolValue] ||
         [attributes[NSURLFileSizeKey] unsignedLongLongValue] > maximumBytes) {
         if (error) *error = [NSError errorWithDomain:@"dev.linuxrunner.rootfs" code:EINVAL
-            userInfo:@{NSLocalizedDescriptionKey:@"Select a regular rootfs archive up to 512 MiB."}];
+            userInfo:@{NSLocalizedDescriptionKey:@"Select a regular rootfs archive up to 4 GiB."}];
         return NO;
     }
     NSURL *verifiedArchive = [NSFileManager.defaultManager.temporaryDirectory
@@ -252,7 +251,8 @@ static void root_import_progress_callback(void *cookie, double progress, const c
         }
         if (ioError) break;
         CC_SHA256_Update(&hash, buffer, (CC_LONG)count);
-        [progress updateProgress:maximumBytes ? .2 * (double)copied / maximumBytes : 0 message:@"Copying and verifying the selected filesystem"];
+        unsigned long long expectedBytes = (unsigned long long)sourceStat.st_size;
+        [progress updateProgress:expectedBytes ? .2 * (double)copied / expectedBytes : 0 message:@"Copying and verifying the selected filesystem"];
     }
     if (input >= 0) close(input);
     if (output >= 0 && close(output) < 0 && !ioError) ioError = errno;

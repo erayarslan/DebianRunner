@@ -394,7 +394,15 @@ session_failed:
     }
     [self.sessionTerminal destroy];
     self.sessionTerminal = nil;
+    self.terminal = nil;
+    self.sessionPid = 0;
     current = NULL; // it's been freed
+    [self.termView resignFirstResponder];
+    if (self.onSessionEnded) {
+        void (^callback)(void) = self.onSessionEnded;
+        dispatch_async(dispatch_get_main_queue(), callback);
+        return;
+    }
     [self startNewSession];
 }
 #endif
@@ -586,58 +594,90 @@ session_failed:
     self.barButtonWidth.constant = buttonWidth;
 }
 
-// DebianRunner's terminal keys: two spacious rows of 6 keys (removed /, -, HOME, END, PGUP, PGDN):
-//   ESC   TAB    ~    ↑    |   CLIP
-//   CTRL  ALT    ←    ↓    →   HIDE
-// plain labels on black; Ctrl and Alt latch for the next key and turn blue.
+// DebianRunner's terminal shortcut bar: clean single-line pill row:
+//   ESC  TAB  CTRL  ALT  ←  ↓  ↑  →  HIDE
+// Ctrl and Alt latch for the next key with a blue filled pill highlight.
 - (UIView *)linuxKeyBar {
     static const void *key = &key;
     UIView *bar = objc_getAssociatedObject(self, key);
     if (bar) return bar;
-    bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 86)];
-    bar.backgroundColor = UIColor.blackColor; bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    UIStackView *grid = [UIStackView new]; grid.axis = UILayoutConstraintAxisVertical; grid.distribution = UIStackViewDistributionFillEqually; grid.translatesAutoresizingMaskIntoConstraints = NO;
-    [bar addSubview:grid];
-    [NSLayoutConstraint activateConstraints:@[[grid.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:4], [grid.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-4], [grid.topAnchor constraintEqualToAnchor:bar.topAnchor constant:2], [grid.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor constant:-2]]];
-    NSArray *rows = @[@[@"ESC", @"TAB", @"~", @"↑", @"|", @"CLIP"], @[@"CTRL", @"ALT", @"←", @"↓", @"→", @"HIDE"]];
-    for (NSArray *row in rows) {
-        UIStackView *line = [UIStackView new]; line.distribution = UIStackViewDistributionFillEqually; [grid addArrangedSubview:line];
-        for (NSString *label in row) {
-            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-            b.tintColor = UIColor.whiteColor; b.layer.cornerRadius = 8;
-            if ([label isEqualToString:@"CLIP"] || [label isEqualToString:@"HIDE"]) {
-                BOOL clip = [label isEqualToString:@"CLIP"];
-                [b setImage:[UIImage systemImageNamed:clip ? @"doc.on.clipboard" : @"keyboard.chevron.compact.down" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightSemibold]] forState:UIControlStateNormal];
-                b.accessibilityLabel = clip ? @"Clipboard" : @"Hide Keyboard";
-                if (clip) {
-                    __weak typeof(self) weak = self;
-                    b.menu = [UIMenu menuWithTitle:@"" children:@[
-                        [UIAction actionWithTitle:@"Paste" image:[UIImage systemImageNamed:@"doc.on.clipboard"] identifier:nil handler:^(UIAction *a) { [weak.termView paste:nil]; }],
-                        [UIAction actionWithTitle:@"Copy Selection" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction *a) { [weak.termView copy:nil]; }],
-                        [UIAction actionWithTitle:@"Select All" image:[UIImage systemImageNamed:@"selection.pin.in.out"] identifier:nil handler:^(UIAction *a) { [weak.termView selectAll:nil]; }]]];
-                    b.showsMenuAsPrimaryAction = YES;
-                } else [b addTarget:self action:@selector(hideKeyboard:) forControlEvents:UIControlEventTouchUpInside];
-                [line addArrangedSubview:b]; continue;
-            }
+    bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 46)];
+    bar.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+    bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+
+    UIView *hairline = [UIView new];
+    hairline.backgroundColor = [UIColor colorWithWhite:0.24 alpha:1.0];
+    hairline.translatesAutoresizingMaskIntoConstraints = NO;
+    [bar addSubview:hairline];
+
+    UIStackView *line = [UIStackView new];
+    line.axis = UILayoutConstraintAxisHorizontal;
+    line.distribution = UIStackViewDistributionFillEqually;
+    line.spacing = 5;
+    line.translatesAutoresizingMaskIntoConstraints = NO;
+    [bar addSubview:line];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [hairline.topAnchor constraintEqualToAnchor:bar.topAnchor],
+        [hairline.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor],
+        [hairline.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor],
+        [hairline.heightAnchor constraintEqualToConstant:0.5],
+        [line.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:5],
+        [line.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-5],
+        [line.topAnchor constraintEqualToAnchor:bar.topAnchor constant:5],
+        [line.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor constant:-5],
+    ]];
+
+    NSArray *keys = @[@"ESC", @"TAB", @"CTRL", @"ALT", @"←", @"↓", @"↑", @"→", @"HIDE"];
+    NSDictionary *symbols = @{
+        @"←": @"arrow.left",
+        @"↓": @"arrow.down",
+        @"↑": @"arrow.up",
+        @"→": @"arrow.right",
+        @"HIDE": @"keyboard.chevron.compact.down",
+    };
+    UIColor *pillBg = [UIColor colorWithWhite:0.18 alpha:1.0];
+    UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightSemibold];
+
+    for (NSString *label in keys) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.backgroundColor = pillBg;
+        b.tintColor = UIColor.whiteColor;
+        b.layer.cornerRadius = 7;
+        b.layer.masksToBounds = YES;
+        b.accessibilityIdentifier = [@"Term " stringByAppendingString:label];
+
+        NSString *symbolName = symbols[label];
+        if (symbolName) {
+            [b setImage:[UIImage systemImageNamed:symbolName withConfiguration:symCfg] forState:UIControlStateNormal];
+            b.accessibilityLabel = [label isEqualToString:@"HIDE"] ? @"Hide Keyboard" : label;
+        } else {
             [b setTitle:label forState:UIControlStateNormal];
-            b.titleLabel.font = [UIFont systemFontOfSize:label.length > 3 ? 13 : label.length > 2 ? 14 : 17 weight:UIFontWeightSemibold];
-            b.titleLabel.adjustsFontSizeToFitWidth = YES; b.titleLabel.minimumScaleFactor = 0.7;
+            b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+            b.titleLabel.adjustsFontSizeToFitWidth = YES;
+            b.titleLabel.minimumScaleFactor = 0.72;
             [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-            [b setTitleColor:UIColor.systemBlueColor forState:UIControlStateSelected];
-            b.accessibilityIdentifier = [@"Term " stringByAppendingString:label];
-            [b addTarget:self action:@selector(linuxKey:) forControlEvents:UIControlEventTouchUpInside];
-            if ([label isEqualToString:@"CTRL"]) self.termView.controlKey = b;
-            if ([label isEqualToString:@"ALT"]) self.termView.altKey = b;
-            [line addArrangedSubview:b];
+            [b setTitleColor:UIColor.whiteColor forState:UIControlStateSelected];
         }
+
+        if ([label isEqualToString:@"HIDE"]) {
+            [b addTarget:self action:@selector(hideKeyboard:) forControlEvents:UIControlEventTouchUpInside];
+        } else {
+            [b addTarget:self action:@selector(linuxKey:) forControlEvents:UIControlEventTouchUpInside];
+        }
+        if ([label isEqualToString:@"CTRL"]) self.termView.controlKey = b;
+        if ([label isEqualToString:@"ALT"]) self.termView.altKey = b;
+        [line addArrangedSubview:b];
     }
     objc_setAssociatedObject(self, key, bar, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return bar;
 }
 - (void)linuxKey:(UIButton *)button {
-    NSString *label = [button titleForState:UIControlStateNormal];
+    NSString *ident = button.accessibilityIdentifier;
+    NSString *label = [ident hasPrefix:@"Term "] ? [ident substringFromIndex:5] : [button titleForState:UIControlStateNormal];
     if ([label isEqualToString:@"CTRL"] || [label isEqualToString:@"ALT"]) {
-        button.selected = !button.selected;   // blue label while latched; cleared after one key
+        button.selected = !button.selected;
+        button.backgroundColor = button.selected ? UIColor.systemBlueColor : [UIColor colorWithWhite:0.18 alpha:1.0];
         return;
     }
     NSDictionary *sequences = @{@"ESC": @"\x1b", @"TAB": @"\t"};
@@ -645,8 +685,10 @@ session_failed:
     else if ([label isEqualToString:@"↓"]) [self pressKey:[self.terminal arrow:'B']];
     else if ([label isEqualToString:@"←"]) [self pressKey:[self.terminal arrow:'D']];
     else if ([label isEqualToString:@"→"]) [self pressKey:[self.terminal arrow:'C']];
-    else if (sequences[label]) [self.terminal sendInput:[sequences[label] dataUsingEncoding:NSUTF8StringEncoding]];
-    else [self pressKey:label];   // "~", "|": through Ctrl/Alt latches like typed text
+    else if (sequences[label]) {
+        [self.termView scrollToBottomForUserInput];
+        [self.terminal sendInput:[sequences[label] dataUsingEncoding:NSUTF8StringEncoding]];
+    }
 }
 - (void)hideKeyboard:(id)sender { [self.termView resignFirstResponder]; }
 - (IBAction)pressEscape:(id)sender {

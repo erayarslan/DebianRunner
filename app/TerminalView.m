@@ -121,6 +121,7 @@ struct rowcol {
 @property (nonatomic) NSInteger terminalBaseY;
 @property (nonatomic) BOOL terminalAltScreen;
 @property (nonatomic) BOOL terminalMouseTracking;
+@property (nonatomic) BOOL pinnedToBottom;
 @property (nonatomic) NSInteger lastSentScrollLine;
 @property (nonatomic) NSInteger pendingScrollLine;
 @property (nonatomic) BOOL hasPendingScrollLine;
@@ -170,6 +171,7 @@ static NSString *LRTerminalBackground(NSString *hex) {
     scrollbarView.showsHorizontalScrollIndicator = NO;
     scrollbarView.decelerationRate = UIScrollViewDecelerationRateNormal;
     scrollbarView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    self.pinnedToBottom = YES;
     self.lastSentScrollLine = -1;
     self.clipsToBounds = YES;
     [self addSubview:scrollbarView];
@@ -245,6 +247,29 @@ static NSString *LRTerminalBackground(NSString *hex) {
                selector:@selector(applicationWillResignActive:)
                    name:UIApplicationWillResignActiveNotification
                  object:UIApplication.sharedApplication];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    if (self.terminalCellHeight > 1.0 && !self.terminalAltScreen) {
+        CGFloat viewH = self.scrollbarView.bounds.size.height;
+        CGFloat targetHeight = self.terminalBaseY * self.terminalCellHeight + viewH;
+        BOOL userScrolling = self.scrollbarView.isTracking || self.scrollbarView.isDragging || self.scrollbarView.isDecelerating;
+        if (fabs(self.scrollbarView.contentSize.height - targetHeight) > 0.5) {
+            self.updatingTerminalScroll = YES;
+            self.scrollbarView.contentSize = CGSizeMake(0, targetHeight);
+            self.updatingTerminalScroll = NO;
+        }
+        if (self.pinnedToBottom && !userScrolling) {
+            CGFloat maxOffset = MAX(0, targetHeight - viewH);
+            if (fabs(self.scrollbarView.contentOffset.y - maxOffset) > 0.5) {
+                self.updatingTerminalScroll = YES;
+                [self.scrollbarView setContentOffset:CGPointMake(0, maxOffset) animated:NO];
+                self.updatingTerminalScroll = NO;
+            }
+            self.lastSentScrollLine = self.terminalBaseY;
+        }
+    }
 }
 
 - (void)didMoveToWindow {
@@ -332,9 +357,16 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
     self.draggingHandle = NO;
     self.selectedText = nil;
     self.selectedLinkURL = nil;
+    self.pinnedToBottom = YES;
+    self.terminalBaseY = 0;
+    self.terminalAltScreen = NO;
     self.lastSentScrollLine = -1;
     self.hasPendingScrollLine = NO;
     self.scrollEvalInFlight = NO;
+    self.updatingTerminalScroll = YES;
+    self.scrollbarView.contentSize = CGSizeZero;
+    self.scrollbarView.contentOffset = CGPointZero;
+    self.updatingTerminalScroll = NO;
     self.startSelectionHandle.hidden = YES;
     self.endSelectionHandle.hidden = YES;
     [self dismissSelectionMenu];
@@ -493,7 +525,9 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         if (isfinite(cellWidth) && cellWidth > 1.0) self.terminalCellWidth = cellWidth;
         self.terminalCols = [state[@"cols"] integerValue];
         self.terminalRows = [state[@"rows"] integerValue];
-        self.terminalBaseY = MAX(0, [state[@"baseY"] integerValue]);
+        NSInteger baseY = MAX(0, [state[@"baseY"] integerValue]);
+        NSInteger viewportY = MAX(0, [state[@"viewportY"] integerValue]);
+        self.terminalBaseY = baseY;
         BOOL altScreen = [state[@"altScreen"] boolValue];
         self.terminalAltScreen = altScreen;
         self.terminalMouseTracking = [state[@"mouseTracking"] boolValue];
@@ -502,24 +536,32 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         self.scrollbarView.scrollEnabled = !altScreen && !self.draggingSelection;
 
         BOOL userScrolling = self.scrollbarView.isTracking || self.scrollbarView.isDragging || self.scrollbarView.isDecelerating;
-        if (isfinite(newHeight) && newHeight >= 0 && fabs(self.scrollbarView.contentSize.height - newHeight) > 0.5) {
+        CGFloat viewH = self.scrollbarView.bounds.size.height;
+        // Derive contentSize from baseY * cellHeight + scrollbarView height so
+        // maxOffset == baseY * cellHeight exactly (ignoring CSS padding differences).
+        CGFloat targetHeight = self.terminalCellHeight > 1.0 ? (baseY * self.terminalCellHeight + viewH) : newHeight;
+        if (isfinite(targetHeight) && targetHeight >= 0 && fabs(self.scrollbarView.contentSize.height - targetHeight) > 0.5) {
             self.updatingTerminalScroll = YES;
-            self.scrollbarView.contentSize = CGSizeMake(0, newHeight);
+            self.scrollbarView.contentSize = CGSizeMake(0, targetHeight);
             self.updatingTerminalScroll = NO;
         }
-        if (!userScrolling && isfinite(newOffset) && newOffset >= 0) {
-            CGFloat maxOffset = MAX(0, self.scrollbarView.contentSize.height - self.scrollbarView.bounds.size.height);
-            CGFloat clamped = MIN(newOffset, maxOffset);
-            if (fabs(self.scrollbarView.contentOffset.y - clamped) > 0.5) {
+        if (!userScrolling && !altScreen) {
+            CGFloat maxOffset = MAX(0, self.scrollbarView.contentSize.height - viewH);
+            BOOL jsAtBottom = (viewportY >= baseY);
+            CGFloat desired = jsAtBottom || self.pinnedToBottom
+                ? maxOffset
+                : (self.terminalCellHeight > 1.0 ? MIN(viewportY * self.terminalCellHeight, maxOffset) : MIN(MAX(0, newOffset), maxOffset));
+            if (jsAtBottom) self.pinnedToBottom = YES;
+            if (fabs(self.scrollbarView.contentOffset.y - desired) > 0.5) {
                 self.updatingTerminalScroll = YES;
-                [self.scrollbarView setContentOffset:CGPointMake(0, clamped) animated:NO];
+                [self.scrollbarView setContentOffset:CGPointMake(0, desired) animated:NO];
                 self.updatingTerminalScroll = NO;
             }
-            if (self.terminalCellHeight > 0)
-                self.lastSentScrollLine = llround(clamped / self.terminalCellHeight);
+            if (self.terminalCellHeight > 1.0)
+                self.lastSentScrollLine = self.pinnedToBottom ? baseY : llround(desired / self.terminalCellHeight);
         }
     } else if ([message.name isEqualToString:@"newScrollHeight"]) {
-        if (![message.body isKindOfClass:NSNumber.class])
+        if (self.terminalCellHeight > 1.0 || ![message.body isKindOfClass:NSNumber.class])
             return;
         CGFloat newHeight = [message.body doubleValue];
         if (!isfinite(newHeight) || newHeight < 0)
@@ -530,7 +572,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
             self.updatingTerminalScroll = NO;
         }
     } else if ([message.name isEqualToString:@"newScrollTop"]) {
-        if (![message.body isKindOfClass:NSNumber.class])
+        if (self.terminalCellHeight > 1.0 || ![message.body isKindOfClass:NSNumber.class])
             return;
         // Never fight UIKit while the user is dragging or flicking with momentum.
         if (self.scrollbarView.isTracking || self.scrollbarView.isDragging || self.scrollbarView.isDecelerating)
@@ -604,13 +646,30 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
     }
 }
 
+- (void)scrollToBottomForUserInput {
+    if (self.terminalAltScreen)
+        return;
+    self.pinnedToBottom = YES;
+    self.hasPendingScrollLine = NO;
+    CGFloat maxOffset = MAX(0, self.scrollbarView.contentSize.height - self.scrollbarView.bounds.size.height);
+    self.updatingTerminalScroll = YES;
+    [self.scrollbarView setContentOffset:CGPointMake(0, maxOffset) animated:NO];
+    self.updatingTerminalScroll = NO;
+    self.lastSentScrollLine = self.terminalBaseY;
+    [self.terminal.webView evaluateJavaScript:@"exports.scrollToBottom?.()" completionHandler:nil];
+}
+
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
-    // Terminal output updates the indicator, not the user's scroll position.
+    // Terminal output and layout updates move the indicator, not the user's scroll position.
     if (self.updatingTerminalScroll || self.terminalAltScreen)
+        return;
+    BOOL userDriven = scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating;
+    if (!userDriven)
         return;
     if (self.terminalCellHeight > 1.0 && self.terminalBaseY >= 0) {
         NSInteger targetLine = llround(scrollView.contentOffset.y / self.terminalCellHeight);
         targetLine = MAX(0, MIN(self.terminalBaseY, targetLine));
+        self.pinnedToBottom = (targetLine >= self.terminalBaseY);
         [self sendCoalescedScrollToLine:targetLine];
     } else {
         [self.terminal.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.newScrollTop(%f)", scrollView.contentOffset.y] completionHandler:nil];
@@ -728,8 +787,10 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
     if (self.controlKey.highlighted)
         self.controlKey.selected = YES;
     if (self.controlKey.selected) {
-        if (!self.controlKey.highlighted)
+        if (!self.controlKey.highlighted) {
             self.controlKey.selected = NO;
+            self.controlKey.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
+        }
         if (text.length == 1)
             return [self insertControlChar:[text characterAtIndex:0]];
     }
@@ -737,9 +798,11 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
     text = [text stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
     if (self.altKey.selected && text.length == 1) {
         self.altKey.selected = NO;
+        self.altKey.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
         [self.altKey sendActionsForControlEvents:UIControlEventValueChanged];
         text = [@"\x1b" stringByAppendingString:text];
     }
+    [self scrollToBottomForUserInput];
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     [self.terminal sendInput:data];
 }
@@ -751,6 +814,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         if (ch == '6') ch = '^';
         if (ch != '\0')
             ch = toupper(ch) ^ 0x40;
+        [self scrollToBottomForUserInput];
         [self.terminal sendInput:[NSData dataWithBytes:&ch length:1]];
     }
 }
@@ -816,6 +880,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         safe = [safe stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
         NSString *wrapped = [NSString stringWithFormat:@"\x1b[200~%@\x1b[201~", safe];
         NSData *data = [wrapped dataUsingEncoding:NSUTF8StringEncoding];
+        [self scrollToBottomForUserInput];
         if (data)
             [self.terminal sendInput:data];
         return;

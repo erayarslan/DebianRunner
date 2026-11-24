@@ -22,7 +22,15 @@ struct SetupWizardView: View {
     @State private var passwordlessSudo = true
     @State private var working: String?
     @State private var problem: String?
+    @State private var snapshots: [EnvironmentSnapshot] = []
+    @State private var pendingRestore: EnvironmentSnapshot?
+    @State private var restoringSnapshot: EnvironmentSnapshot?
+    @State private var restoreProgress: Double = 0
+    @State private var restoreMessage = ""
+    @State private var restoreCancel = SnapshotCancellation()
+    @State private var restoredFromSnapshotName: String?
     private var step: SetupStep { SetupStep(rawValue: stepRaw) ?? .welcome }
+    private var isBusy: Bool { working != nil || debian.running || manager.busy || restoringSnapshot != nil }
 
     var body: some View {
         NavigationView {
@@ -31,14 +39,31 @@ struct SetupWizardView: View {
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
                         Button(step == .done ? "Close" : "Later") { dismiss() }
-                            .disabled(working != nil || debian.running || manager.busy)
+                            .disabled(isBusy)
                     }
                 }
         }
         .navigationViewStyle(.stack)
         .overlay(alignment: .bottom) { InstallProgressCard() }
-        .interactiveDismissDisabled(working != nil || debian.running || manager.busy)
+        .interactiveDismissDisabled(isBusy)
         .onAppear(perform: resume)
+        .confirmationDialog(
+            "Restore Snapshot?",
+            isPresented: Binding(get: { pendingRestore != nil }, set: { if !$0 { pendingRestore = nil } }),
+            titleVisibility: .visible
+        ) {
+            if let snap = pendingRestore {
+                Button("Restore \"\(snap.name)\"") {
+                    pendingRestore = nil
+                    startSnapshotRestore(snap)
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingRestore = nil }
+        } message: {
+            if let snap = pendingRestore {
+                Text("Restore Debian Minimal from \"\(snap.name)\" (\(snap.formattedSize), saved \(snap.formattedDate))? Your packages, files, SSH keys, and Linux accounts from that snapshot will be ready immediately.")
+            }
+        }
     }
 
     private var title: String {
@@ -65,6 +90,16 @@ struct SetupWizardView: View {
                     Text("Uses your existing Debian Minimal installation, accounts, and files. To start fresh, wipe Debian Minimal from the Debian tab.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+            } else if !snapshots.isEmpty {
+                snapshotRestoreSection(title: "Restore from Snapshot")
+                Section("Or Start Fresh") {
+                    Button {
+                        stepRaw = SetupStep.install.rawValue
+                    } label: {
+                        Label("Install Fresh Debian Minimal", systemImage: "arrow.down.circle")
+                    }
+                    .disabled(isBusy)
+                }
             } else {
                 Section {
                     Button("Continue") {
@@ -84,14 +119,21 @@ struct SetupWizardView: View {
         case .account: account
         case .done:
             Section {
-                Label("Debian minimal is ready", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                Text("Install command-line packages any time from Packages, connect remotely using the built-in SSH Server, or browse Debian files directly from the Apple Files app.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                if let restored = restoredFromSnapshotName {
+                    Label("Restored from \"\(restored)\"", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Your Debian Minimal snapshot is booted and ready with its saved packages, files, and Linux accounts.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                } else {
+                    Label("Debian minimal is ready", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Install command-line packages any time from Packages, connect remotely using the built-in SSH Server, or browse Debian files directly from the Apple Files app.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
             }
             Section {
                 Button {
                     stepRaw = SetupStep.welcome.rawValue
                     setupRoot = ""
+                    restoredFromSnapshotName = nil
                     dismiss()
                     openTerminal()
                 } label: {
@@ -102,6 +144,50 @@ struct SetupWizardView: View {
         }
         if let working { Section { HStack(spacing: 12) { ProgressView(); Text(working) } } }
         if let problem { Section { Text(problem).foregroundStyle(.red) } }
+    }
+
+    @ViewBuilder private func snapshotRestoreSection(title: String) -> some View {
+        Section {
+            if let active = restoringSnapshot {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Restoring \"\(active.name)\"").font(.headline)
+                    Text(restoreMessage.isEmpty ? "Verifying and importing snapshot…" : restoreMessage)
+                        .font(.caption).foregroundStyle(.secondary)
+                    ProgressView(value: restoreProgress)
+                    Button("Cancel Restore", role: .destructive) {
+                        restoreCancel.cancel()
+                    }
+                }
+                .padding(.vertical, 4)
+            } else {
+                ForEach(snapshots) { snap in
+                    Button {
+                        pendingRestore = snap
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .font(.title3)
+                                .foregroundColor(.accentColor)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(snap.name).font(.headline).foregroundColor(.primary)
+                                Text("\(snap.formattedDate) · \(snap.formattedSize) · \(snap.defaultUser)")
+                                    .font(.caption).foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Text("Restore")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundColor(.accentColor)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .disabled(isBusy)
+                }
+            }
+        } header: {
+            Text(title)
+        } footer: {
+            Text("Saved snapshots are kept across wipes and verified by SHA-256 checksum before restoring.")
+        }
     }
 
     @ViewBuilder private var install: some View {
@@ -121,7 +207,7 @@ struct SetupWizardView: View {
                 Button("Cancel", role: .destructive) { debian.cancel() }
             } else {
                 Button("Install Debian Minimal") { startInstall() }
-                    .disabled(working != nil || free < max(Int64(1 << 30), download + installed))
+                    .disabled(isBusy || free < max(Int64(1 << 30), download + installed))
             }
             if let failure = debian.failure {
                 Text(failure).foregroundStyle(.red)
@@ -129,6 +215,9 @@ struct SetupWizardView: View {
             }
         } footer: {
             Text("Downloads official Debian minimal packages verified against Debian's signed InRelease and SHA-256 package index. No desktop or GUI packages are installed.")
+        }
+        if manager.environments.isEmpty && !snapshots.isEmpty && !debian.running {
+            snapshotRestoreSection(title: "Or Restore from Snapshot")
         }
     }
 
@@ -174,6 +263,7 @@ struct SetupWizardView: View {
     }
 
     private func resume() {
+        snapshots = EnvironmentSnapshot.loadAll()
         if step == .relaunch, LRRuntimeBridge.isRunning(), LRRuntimeBridge.activeRootName() == setupRoot {
             stepRaw = SetupStep.account.rawValue
         }
@@ -193,8 +283,9 @@ struct SetupWizardView: View {
     }
 
     private func startInstall() {
-        guard !debian.running, !manager.busy, working == nil else { return }
+        guard !isBusy else { return }
         problem = nil
+        restoredFromSnapshotName = nil
         debian.install { environment in
             manager.acceptInstalled(environment)
             setupRoot = environment.rootfsName
@@ -209,14 +300,64 @@ struct SetupWizardView: View {
         }
     }
 
-    private func bootInstalledRoot(_ root: String) {
+    private func startSnapshotRestore(_ snap: EnvironmentSnapshot) {
+        guard !isBusy else { return }
+        problem = nil
+        restoringSnapshot = snap
+        restoreProgress = 0
+        restoreMessage = "Verifying and importing snapshot…"
+        let token = SnapshotCancellation()
+        restoreCancel = token
+        LRRuntimeBridge.restoreSnapshot(id: snap.id, progress: { fraction, message in
+            restoreProgress = fraction
+            restoreMessage = message
+        }, cancel: {
+            token.isCancelled()
+        }, completion: { rootName, err in
+            restoringSnapshot = nil
+            restoreProgress = 0
+            restoreMessage = ""
+            if let err {
+                if (err as NSError).code == CocoaError.userCancelled.rawValue {
+                    problem = "Snapshot restore cancelled."
+                } else {
+                    problem = err.localizedDescription
+                }
+                return
+            }
+            guard let rootName else {
+                problem = "Snapshot restore returned no environment."
+                return
+            }
+            var environment = LinuxEnvironment(name: "Debian Minimal", rootfsName: rootName)
+            environment.distribution = snap.distribution
+            environment.distributionID = "debian"
+            environment.packageManager = "apt"
+            environment.rootfsVersion = snap.version
+            environment.defaultShell = "/bin/bash"
+            environment.installationState = "Restored from snapshot \"\(snap.name)\""
+            manager.acceptInstalled(environment)
+            setupRoot = rootName
+            restoredFromSnapshotName = snap.name
+            LRRuntimeBridge.setNextRootName(rootName)
+            if LRRuntimeBridge.isRunning() && LRRuntimeBridge.activeRootName() == rootName {
+                stepRaw = SetupStep.done.rawValue
+            } else if !LRRuntimeBridge.isRunning() && LRRuntimeBridge.canStartRuntime() {
+                bootInstalledRoot(rootName, skipAccount: true)
+            } else {
+                stepRaw = SetupStep.relaunch.rawValue
+            }
+        })
+    }
+
+    private func bootInstalledRoot(_ root: String, skipAccount: Bool = false) {
         working = "Starting Debian minimal…"
         DispatchQueue.main.async {
             let result = LRRuntimeBridge.startRuntime()
             working = nil
             manager.refresh()
             if LRRuntimeBridge.isRunning() && LRRuntimeBridge.activeRootName() == root {
-                stepRaw = SetupStep.account.rawValue
+                stepRaw = skipAccount ? SetupStep.done.rawValue : SetupStep.account.rawValue
             } else {
                 if result != 0 {
                     problem = "Debian minimal was installed, but starting the runtime failed (\(result)). " + LRRuntimeBridge.runtimeStatus()
