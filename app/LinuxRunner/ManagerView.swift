@@ -255,7 +255,7 @@ private struct LinuxUsersView: View {
         List {
             Section("Active Debian Environment") {
                 Text(LRRuntimeBridge.activeRootName().isEmpty ? "Not running" : LRRuntimeBridge.activeRootName()).font(.caption).foregroundColor(.secondary)
-                Text("Select the default Linux user shown for Termius SSH connections and Shared folder ownership.").font(.footnote)
+                Text("Select the default Linux user shown for SSH connections and Shared folder ownership.").font(.footnote)
                 Text("Linux UID permissions apply inside DebianRunner. Accounts do not create separate iOS security identities.").font(.footnote).foregroundColor(.secondary)
             }
             Section("Default Linux User") {
@@ -270,9 +270,6 @@ private struct LinuxUsersView: View {
                 Button("Set as Default User") {
                     do { _ = try LRRuntimeBridge.setDefaultLinuxUser(selected) }
                     catch { self.error = error.localizedDescription }
-                }.disabled(!running || !accounts.contains(where: { $0["name"] == selected }))
-                Button("Open in Termius as \(selected)") {
-                    TermiusLauncher.openQuick(username: selected) { msg in error = msg }
                 }.disabled(!running || !accounts.contains(where: { $0["name"] == selected }))
             }
             Section("Create Linux User") {
@@ -331,156 +328,6 @@ private struct LinuxUsersView: View {
     }
 }
 
-// MARK: - Termius Redirect & Auto-Open
-
-@MainActor enum TermiusLauncher {
-    static let autoOpenOnLaunchKey = "DebianRunner.termiusAutoOpenOnLaunch"
-    static let launchModeKey = "DebianRunner.termiusLaunchMode"
-    static let shortcutNameKey = "DebianRunner.termiusShortcutName"
-    static let appStoreURL = URL(string: "https://apps.apple.com/app/id549039908")!
-    static var didAutoOpenThisLaunch = false
-
-    static var isTermiusInstalled: Bool {
-        URL(string: "termius://").map { UIApplication.shared.canOpenURL($0) } ?? false
-    }
-
-    static var autoOpenOnLaunch: Bool {
-        get { UserDefaults.standard.bool(forKey: autoOpenOnLaunchKey) }
-        set { UserDefaults.standard.set(newValue, forKey: autoOpenOnLaunchKey) }
-    }
-
-    static var launchMode: String {
-        get { UserDefaults.standard.string(forKey: launchModeKey) ?? "termius" }
-        set { UserDefaults.standard.set(newValue, forKey: launchModeKey) }
-    }
-
-    static var shortcutName: String {
-        get { UserDefaults.standard.string(forKey: shortcutNameKey) ?? "DebianRunner" }
-        set { UserDefaults.standard.set(newValue, forKey: shortcutNameKey) }
-    }
-
-    static func preferredUsername(allowRoot: Bool = LRRuntimeBridge.sshAllowRootLogin()) -> String {
-        let user = LRRuntimeBridge.defaultLinuxUser()
-        if !user.isEmpty && (user != "root" || allowRoot) { return user }
-        if let firstNonRoot = LRRuntimeBridge.linuxAccounts().first(where: { $0["name"] != "root" && ($0["uid"].flatMap(Int.init) ?? 0) >= 1000 })?["name"] {
-            return firstNonRoot
-        }
-        return "root"
-    }
-
-    static func sshURL(user: String, host: String = "127.0.0.1", port: String = "2222") -> URL? {
-        var components = URLComponents()
-        components.scheme = "ssh"
-        components.user = user.isEmpty ? nil : user
-        components.host = host
-        components.port = Int(port) ?? 2222
-        return components.url
-    }
-
-    static func shortcutURL(name: String) -> URL? {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        var components = URLComponents()
-        components.scheme = "shortcuts"
-        components.host = "run-shortcut"
-        components.queryItems = [URLQueryItem(name: "name", value: trimmed)]
-        return components.url
-    }
-
-    /// Ensure background keep-alive stays active so sshd on 127.0.0.1:2222 remains
-    /// reachable after switching from DebianRunner into Termius on the same device.
-    static func ensureBackgroundKeepAlive() {
-        if !BackgroundRunner.shared.enabled {
-            UserDefaults.standard.set(true, forKey: BackgroundRunner.defaultsKey)
-            BackgroundRunner.shared.apply(true)
-        }
-    }
-
-    static func open(ssh: SSHServiceController, username: String? = nil, onNotice: (@MainActor (String) -> Void)? = nil) {
-        guard LRRuntimeBridge.isRunning() else {
-            onNotice?("Start Debian Minimal first before opening Termius.")
-            return
-        }
-        ensureBackgroundKeepAlive()
-        if ssh.isRunning {
-            openApp(port: ssh.port, username: username)
-        } else if ssh.isInstalled {
-            ssh.start { started in
-                if started {
-                    openApp(port: ssh.port, username: username)
-                } else {
-                    onNotice?("OpenSSH server did not start. Open Termius & SSH to check the log.")
-                }
-            }
-        } else if !ssh.installing {
-            ssh.installAndStart()
-            onNotice?("Installing OpenSSH server… tap Open in Termius once installation completes.")
-        } else {
-            onNotice?("OpenSSH server is installing… please wait a moment.")
-        }
-    }
-
-    static func openQuick(username: String? = nil, onNotice: (@MainActor (String) -> Void)? = nil) {
-        guard LRRuntimeBridge.isRunning() else {
-            onNotice?("Start Debian Minimal first before opening Termius.")
-            return
-        }
-        ensureBackgroundKeepAlive()
-        let status = LRRuntimeBridge.sshStatus()
-        let port = status["ssh.port"] ?? "2222"
-        if status["ssh"] == "running" {
-            openApp(port: port, username: username)
-        } else if LRRuntimeBridge.sshBinaryInstalled() {
-            LRRuntimeBridge.runSSHAction("start") { updated in
-                Task { @MainActor in
-                    if updated["ssh"] == "running" {
-                        openApp(port: updated["ssh.port"] ?? port, username: username)
-                    } else {
-                        onNotice?("OpenSSH server did not start. Open Termius & SSH to check the log.")
-                    }
-                }
-            }
-        } else {
-            onNotice?("OpenSSH server is not installed yet. Open Termius & SSH to install it.")
-        }
-    }
-
-    static func openApp(port: String = "2222", username: String? = nil) {
-        let user = username ?? preferredUsername()
-        let mode = launchMode
-        if mode == "shortcut", let url = shortcutURL(name: shortcutName), UIApplication.shared.canOpenURL(url) {
-            LRRuntimeBridge.logCategory("TERMIUS", event: "redirect via Apple Shortcut name=\(shortcutName)")
-            UIApplication.shared.open(url, options: [:], completionHandler: nil)
-            return
-        }
-        if mode == "ssh", let url = sshURL(user: user, host: "127.0.0.1", port: port), UIApplication.shared.canOpenURL(url) {
-            LRRuntimeBridge.logCategory("TERMIUS", event: "redirect via ssh:// user=\(user) port=\(port)")
-            UIApplication.shared.open(url, options: [:], completionHandler: nil)
-            return
-        }
-        if let termiusURL = URL(string: "termius://"), UIApplication.shared.canOpenURL(termiusURL) {
-            LRRuntimeBridge.logCategory("TERMIUS", event: "redirect to Termius app host=127.0.0.1:\(port) user=\(user)")
-            UIApplication.shared.open(termiusURL, options: [:], completionHandler: nil)
-            return
-        }
-        LRRuntimeBridge.logCategory("TERMIUS", event: "Termius not installed; opening App Store")
-        UIApplication.shared.open(appStoreURL, options: [:], completionHandler: nil)
-    }
-
-    static func maybeAutoOpenOnLaunch(ssh: SSHServiceController, setupPresented: Bool) {
-        guard autoOpenOnLaunch, !didAutoOpenThisLaunch, !setupPresented,
-              LRRuntimeBridge.isRunning(), ssh.isRunning,
-              UIApplication.shared.applicationState == .active else { return }
-        didAutoOpenThisLaunch = true
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 350_000_000)
-            guard UIApplication.shared.applicationState == .active, LRRuntimeBridge.isRunning(), ssh.isRunning else { return }
-            ensureBackgroundKeepAlive()
-            openApp(port: ssh.port)
-        }
-    }
-}
-
 // MARK: - Built-in OpenSSH Server Controller & Screen
 @MainActor final class SSHServiceController: ObservableObject {
     @Published var status: [String: String] = [:]
@@ -529,11 +376,8 @@ private struct LinuxUsersView: View {
         }
     }
 
-    func start(completion: (@MainActor (Bool) -> Void)? = nil) {
-        guard LRRuntimeBridge.isRunning(), !busy, !installing else {
-            completion?(isRunning)
-            return
-        }
+    func start() {
+        guard LRRuntimeBridge.isRunning(), !busy, !installing else { return }
         error = nil; busy = true
         LRRuntimeBridge.runSSHAction("start") { [weak self] updated in
             Task { @MainActor in
@@ -541,11 +385,9 @@ private struct LinuxUsersView: View {
                 self.busy = false
                 self.status = updated
                 self.logTail = LRRuntimeBridge.sshLogTail()
-                let started = updated["ssh"] == "running"
-                if !started {
+                if updated["ssh"] != "running" {
                     self.error = "OpenSSH server did not start. Expand SSH Server Log below for details."
                 }
-                completion?(started)
             }
         }
     }
@@ -627,12 +469,8 @@ private struct SSHServerView: View {
     @State private var autoStart = LRRuntimeBridge.sshAutoStart()
     @State private var allowRootLogin = LRRuntimeBridge.sshAllowRootLogin()
     @AppStorage(BackgroundRunner.defaultsKey) private var keepRunningInBackground = false
-    @AppStorage(TermiusLauncher.autoOpenOnLaunchKey) private var autoOpenTermiusOnLaunch = false
-    @AppStorage(TermiusLauncher.launchModeKey) private var termiusLaunchMode = "termius"
-    @AppStorage(TermiusLauncher.shortcutNameKey) private var termiusShortcutName = "DebianRunner"
     @ObservedObject private var backgroundRunner = BackgroundRunner.shared
     @State private var copied: String?
-    @State private var termiusNotice: String?
     @State private var runtimeRunning = LRRuntimeBridge.isRunning()
     @Environment(\.scenePhase) private var scenePhase
     private let timer = Timer.publish(every: 8, on: .main, in: .common).autoconnect()
@@ -666,9 +504,6 @@ private struct SSHServerView: View {
                 if !runtimeRunning {
                     notice("Start Debian Minimal from the Home or Debian tab to run the OpenSSH server.", symbol: "power", color: .orange)
                 }
-                if let termiusNotice {
-                    notice(termiusNotice, symbol: "info.circle.fill", color: .blue)
-                }
                 if needsNonRootUserNotice {
                     VStack(alignment: .leading, spacing: 8) {
                         Label("Create a Linux user or enable Allow Root Login", systemImage: "person.badge.key.fill")
@@ -682,7 +517,6 @@ private struct SSHServerView: View {
                     .padding(14).frame(maxWidth: .infinity, alignment: .leading)
                     .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.orange.opacity(0.12)))
                 }
-                termiusCard
                 if ssh.isRunning {
                     connectionCard
                 }
@@ -693,7 +527,7 @@ private struct SSHServerView: View {
             .padding(.horizontal, 20).padding(.vertical, 12).padding(.bottom, 96)
         }
         .background(Color(.systemGroupedBackground).ignoresSafeArea())
-        .navigationTitle("Termius & SSH")
+        .navigationTitle("SSH Server")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             runtimeRunning = LRRuntimeBridge.isRunning()
@@ -713,8 +547,8 @@ private struct SSHServerView: View {
         return HStack(spacing: 14) {
             LRIconTile(symbol: "network", colors: [.green, .teal], size: 48)
             VStack(alignment: .leading, spacing: 3) {
-                Text("Termius & OpenSSH Server").font(.headline)
-                Text("Local Termius (127.0.0.1:\(ssh.port)), remote SSH, scp & SFTP")
+                Text("OpenSSH Server").font(.headline)
+                Text("Local (127.0.0.1:\(ssh.port)) and LAN SSH, scp & SFTP")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 4)
@@ -727,78 +561,23 @@ private struct SSHServerView: View {
         .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    private var termiusCard: some View {
-        let installed = TermiusLauncher.isTermiusInstalled
-        return LRCard(title: "Termius", symbol: "arrow.up.forward.app.fill", colors: [.blue, .indigo], value: installed ? "Installed" : "App Store") {
-            Button {
-                termiusNotice = nil
-                TermiusLauncher.open(ssh: ssh) { msg in termiusNotice = msg }
-            } label: {
-                Label(installed ? "Open in Termius" : "Get Termius on App Store", systemImage: "arrow.up.forward.app.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(installed && !runtimeRunning)
-
-            VStack(spacing: 0) {
-                copyRow("Host", "127.0.0.1")
-                Divider().padding(.leading, 12)
-                copyRow("Port", ssh.port)
-                Divider().padding(.leading, 12)
-                copyRow("User", loginUser)
-            }
-            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color(.tertiarySystemGroupedBackground)))
-
-            Toggle("Auto-Open Termius on Launch", isOn: $autoOpenTermiusOnLaunch)
-            Text("When enabled, DebianRunner starts SSH, keeps Linux awake in the background, and automatically switches to Termius on launch.")
-                .font(.caption).foregroundColor(.secondary)
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Redirect Mode").font(.subheadline.weight(.semibold))
-                Picker("Redirect Mode", selection: $termiusLaunchMode) {
-                    Text("Termius App").tag("termius")
-                    Text("SSH Link").tag("ssh")
-                    Text("Apple Shortcut").tag("shortcut")
-                }
-                .pickerStyle(.segmented)
-
-                if termiusLaunchMode == "shortcut" {
-                    TextField("Shortcut name (e.g. DebianRunner)", text: $termiusShortcutName)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                    Text("For 1-tap auto-connect: save 127.0.0.1:\(ssh.port) in Termius, open Apple Shortcuts → New Shortcut → add Termius's \"Connect to a host\" action, and enter that Shortcut's exact name above.")
-                        .font(.caption).foregroundColor(.secondary)
-                } else if termiusLaunchMode == "ssh" {
-                    Text("Opens ssh://\(loginUser)@127.0.0.1:\(ssh.port) (auto-connects in SSH clients that handle ssh:// links; falls back to Termius).")
-                        .font(.caption).foregroundColor(.secondary)
-                } else {
-                    Text("Launches Termius directly (termius://) and keeps Linux running in the background so your saved 127.0.0.1:\(ssh.port) host connects immediately.")
-                        .font(.caption).foregroundColor(.secondary)
-                }
-            }
-        }
-    }
-
     private var connectionCard: some View {
         let ip = SSHServiceController.wifiAddress() ?? "iPhone-IP"
         let localCmd = "ssh -p \(ssh.port) \(loginUser)@127.0.0.1"
         let cmd = "ssh -p \(ssh.port) \(loginUser)@\(ip)"
         let sftpCmd = "sftp -P \(ssh.port) \(loginUser)@\(ip)"
-        return LRCard(title: "Connect from Other Devices", symbol: "laptopcomputer.and.iphone", colors: [.green, .mint], value: ":\(ssh.port)") {
+        return LRCard(title: "Connect", symbol: "laptopcomputer.and.iphone", colors: [.green, .mint], value: ":\(ssh.port)") {
             VStack(spacing: 0) {
                 copyRow("Local", localCmd)
                 Divider().padding(.leading, 12)
-                copyRow("SSH", cmd)
+                copyRow("LAN SSH", cmd)
                 Divider().padding(.leading, 12)
                 copyRow("SFTP", sftpCmd)
                 Divider().padding(.leading, 12)
                 copyRow("Wi-Fi IP", ip)
             }
             .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color(.tertiarySystemGroupedBackground)))
-            Text("Use 127.0.0.1:\(ssh.port) in Termius on this iPhone, or the Wi-Fi IP from any Mac, PC, or SSH client on the same network using your Linux password or ~/.ssh/authorized_keys.")
+            Text("Connect to 127.0.0.1:\(ssh.port) from Termius or any SSH client on this iPhone (enable Keep Linux Running in Background below), or use the Wi-Fi IP from another device on the same network with your Linux password or ~/.ssh/authorized_keys.")
                 .font(.caption).foregroundColor(.secondary)
         }
     }
@@ -1263,11 +1042,9 @@ struct ManagerView: View {
     @AppStorage("LinuxRunner.developerMode") private var developerMode = false
     @AppStorage("LinuxRunner.keepScreenAwake") private var keepScreenAwake = true
     @AppStorage(BackgroundRunner.defaultsKey) private var keepRunningInBackground = false
-    @AppStorage(TermiusLauncher.autoOpenOnLaunchKey) private var autoOpenTermiusOnLaunch = false
     @ObservedObject private var backgroundRunner = BackgroundRunner.shared
     @AppStorage("LinuxRunner.experimentalMemoryPCFusion") private var memoryPCFusion = true
     @AppStorage("LinuxRunner.appearance") private var appearance = "dark"
-    @State private var openTermiusAfterSetup = false
     @State private var setup = false
     @AppStorage("LinuxRunnerSetup.step") private var setupStep = "welcome"
     @State private var diagnostics = false
@@ -1300,7 +1077,6 @@ struct ManagerView: View {
             if runtimeRunning {
                 ssh.ensureDefaultSSHIfNeeded()
                 ssh.refresh(queryGuest: false)
-                TermiusLauncher.maybeAutoOpenOnLaunch(ssh: ssh, setupPresented: setup)
             }
             // First launch without Debian minimal installed, or setup waiting for its relaunch/account step.
             if !SetupAutoPresentation.shown && !simulatorSuppressesSetup &&
@@ -1308,9 +1084,6 @@ struct ManagerView: View {
                 SetupAutoPresentation.shown = true
                 setup = true
             }
-        }
-        .onChange(of: ssh.status) { _ in
-            TermiusLauncher.maybeAutoOpenOnLaunch(ssh: ssh, setupPresented: setup)
         }
         #if targetEnvironment(simulator)
         .onAppear {
@@ -1322,12 +1095,8 @@ struct ManagerView: View {
             snapshotCount = LRRuntimeBridge.snapshots().count
             manager.refresh()
             if runtimeRunning { ssh.ensureDefaultSSHIfNeeded() }
-            if openTermiusAfterSetup {
-                openTermiusAfterSetup = false
-                openInTermius()
-            }
         }) {
-            SetupWizardView(manager: manager, openTermius: { openTermiusAfterSetup = true })
+            SetupWizardView(manager: manager)
         }
         .alert("Wipe Debian Minimal?", isPresented: $confirmWipe) {
             Button("Cancel", role: .cancel) { }
@@ -1405,19 +1174,11 @@ struct ManagerView: View {
         }
     }
 
-    private func openInTermius() {
-        TermiusLauncher.open(ssh: ssh) { notice in
-            manager.error = notice
-        }
-    }
-
     private func primaryHomeAction() {
         if manager.environments.isEmpty {
             startSetup()
         } else if !runtimeRunning {
             startRuntime()
-        } else {
-            openInTermius()
         }
     }
 
@@ -1431,16 +1192,18 @@ struct ManagerView: View {
                             .font(.subheadline).foregroundColor(.secondary).lineLimit(1)
                     }
                     Spacer()
-                    HomeStatus(phase: runtimePhase, open: primaryHomeAction)
+                    HomeStatus(phase: runtimePhase, open: runtimeRunning ? nil : primaryHomeAction)
                 }
-                primaryAction
+                if manager.environments.isEmpty || !runtimeRunning {
+                    primaryAction
+                }
                 HStack(spacing: 14) {
                     NavigationLink(destination: AppStoreView(manager: manager)) {
                         HomeTile(title: "Packages", symbol: "shippingbox.fill", colors: [.blue, .indigo], large: true)
                     }
                     .buttonStyle(HomeTileStyle()).disabled(activeEnvironment == nil).accessibilityIdentifier("Packages")
                     NavigationLink(destination: SSHServerView(ssh: ssh)) {
-                        HomeTile(title: "Termius & SSH", symbol: "network", colors: [.green, .teal], large: true, badge: ssh.isRunning)
+                        HomeTile(title: "SSH Server", symbol: "network", colors: [.green, .teal], large: true, badge: ssh.isRunning)
                     }
                     .buttonStyle(HomeTileStyle()).accessibilityIdentifier("SSH Server")
                 }
@@ -1480,12 +1243,12 @@ struct ManagerView: View {
             HStack(spacing: 14) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(0.18)).frame(width: 44, height: 44)
-                    if startingRuntime || (runtimeRunning && ssh.busy) { ProgressView().tint(.white) }
-                    else { Image(systemName: uninstalled ? "arrow.down.circle.fill" : runtimeRunning ? "arrow.up.forward.app.fill" : "power").font(.title3.weight(.semibold)) }
+                    if startingRuntime { ProgressView().tint(.white) }
+                    else { Image(systemName: uninstalled ? "arrow.down.circle.fill" : "power").font(.title3.weight(.semibold)) }
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(uninstalled ? (snapshotCount > 0 ? "Install or Restore Debian" : "Install Debian Minimal") : runtimeRunning ? "Open in Termius" : startingRuntime ? "Starting Debian…" : "Start Debian Minimal").font(.headline)
-                    Text(uninstalled ? (snapshotCount > 0 ? "Install fresh or restore from \(snapshotCount) saved snapshot\(snapshotCount == 1 ? "" : "s")" : "Download & verify Debian 13 (trixie) ARM64") : runtimeRunning ? (ssh.isRunning ? "Connect via SSH · 127.0.0.1:\(ssh.port)" : ssh.installing ? "Installing OpenSSH server…" : "Starts SSH & opens Termius") : "Boot the ARM64 Linux runtime").font(.caption).opacity(0.85)
+                    Text(uninstalled ? (snapshotCount > 0 ? "Install or Restore Debian" : "Install Debian Minimal") : startingRuntime ? "Starting Debian…" : "Start Debian Minimal").font(.headline)
+                    Text(uninstalled ? (snapshotCount > 0 ? "Install fresh or restore from \(snapshotCount) saved snapshot\(snapshotCount == 1 ? "" : "s")" : "Download & verify Debian 13 (trixie) ARM64") : "Boot the ARM64 Linux runtime").font(.caption).opacity(0.85)
                 }
                 Spacer()
                 Image(systemName: "chevron.right").font(.headline).opacity(0.7)
@@ -1494,8 +1257,8 @@ struct ManagerView: View {
             .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(LinearGradient(colors: [Color(red: 0.16, green: 0.42, blue: 0.85), Color(red: 0.36, green: 0.24, blue: 0.80)], startPoint: .topLeading, endPoint: .bottomTrailing)))
         }
         .buttonStyle(HomeTileStyle())
-        .disabled(!uninstalled && !runtimeRunning && (startingRuntime || !LRRuntimeBridge.canStartRuntime()))
-        .accessibilityIdentifier(uninstalled ? "Install Debian Minimal" : runtimeRunning ? "Open in Termius" : "Start Linux Runtime")
+        .disabled(!uninstalled && (startingRuntime || !LRRuntimeBridge.canStartRuntime()))
+        .accessibilityIdentifier(uninstalled ? "Install Debian Minimal" : "Start Linux Runtime")
     }
 
     private func homeTile(_ title: String, _ symbol: String, _ colors: [Color], large: Bool = false, enabled: Bool = true, action: @escaping () -> Void) -> some View {
@@ -1539,9 +1302,7 @@ struct ManagerView: View {
                                 }
                             }
                         }.padding(.vertical, 4)
-                        if active {
-                            Button { openInTermius() } label: { Label("Open in Termius", systemImage: "arrow.up.forward.app.fill") }
-                        } else {
+                        if !active {
                             Button { startRuntime() } label: {
                                 Label(startingRuntime ? "Starting Debian…" : "Start Debian Minimal", systemImage: "power")
                             }
@@ -1560,7 +1321,7 @@ struct ManagerView: View {
                     Section("Environment") {
                         NavigationLink(destination: SSHServerView(ssh: ssh)) {
                             HStack {
-                                Label("Termius & SSH Server", systemImage: "network")
+                                Label("SSH Server", systemImage: "network")
                                 Spacer()
                                 Text(ssh.isRunning ? "Running · :\(ssh.port)" : ssh.installing ? "Installing…" : ssh.isInstalled ? "Stopped" : "Not Installed")
                                     .font(.caption).foregroundColor(ssh.isRunning ? .green : .secondary)
@@ -1699,15 +1460,14 @@ struct ManagerView: View {
                 if keepRunningInBackground {
                     Text(backgroundRunner.status).font(.caption).foregroundColor(.green)
                 }
-                Toggle(isOn: $autoOpenTermiusOnLaunch) { SettingsLabel("Auto-Open Termius on Launch", "arrow.up.forward.app.fill", .blue) }
             } header: { Text("General") } footer: {
-                Text("Keep Linux Running in Background uses a silent mixed audio and continuous location keep-alive so SSH, Termius sessions, and background services stay awake when switching apps or locking your iPhone.")
+                Text("Keep Linux Running in Background uses a silent mixed audio and continuous location keep-alive so SSH sessions and background services stay awake when switching apps or locking your iPhone.")
             }
             Section("Performance") {
                 NavigationLink(destination: SystemResourcesView()) { SettingsLabel("CPU & Memory", "speedometer", .indigo) }
             }
             Section("Linux Environment") {
-                NavigationLink(destination: SSHServerView(ssh: ssh)) { SettingsLabel("Termius & SSH Server", "network", .green) }
+                NavigationLink(destination: SSHServerView(ssh: ssh)) { SettingsLabel("SSH Server", "network", .green) }
                 NavigationLink(destination: LinuxUsersView()) { SettingsLabel("Linux Users", "person.2.fill", .blue) }
                 NavigationLink(destination: FileSharingView(environment: currentEnvironment, manager: manager, share: $share)) { SettingsLabel("File Sharing", "folder.fill", .cyan) }
                 NavigationLink(destination: DevicesView()) { SettingsLabel("Devices", "cable.connector", .orange) }

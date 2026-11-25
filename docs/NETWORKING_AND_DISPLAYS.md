@@ -1,6 +1,6 @@
 # Networking
 
-DebianRunner translates Linux networking calls onto host iOS APIs. Inspect the native network status at **Settings → Linux Environment → Network** and compare over SSH in Termius:
+DebianRunner translates Linux networking calls onto host iOS APIs. Inspect the native network status at **Settings → Linux Environment → Network** and compare over SSH:
 
 ```sh
 ip addr
@@ -24,13 +24,13 @@ Routes reflect available host routing information, not a separate Linux network 
 
 Bluetooth networking, raw packet capture, Wi-Fi scanning/monitor mode, and host interface/route administration are unsupported.
 
-## Built-in SSH Server & Termius
+## Built-in SSH Server
 
-DebianRunner includes an OpenSSH server managed in **Home → Termius & SSH** (or **Debian → Termius & SSH** / **Settings → Linux Environment → Termius & SSH**):
+DebianRunner includes an OpenSSH server managed in **Home → SSH Server** (or **Debian → SSH Server** / **Settings → Linux Environment → SSH Server**):
 
 - **SSH Server**: OpenSSH (`sshd`) listening on TCP port `2222` (`0.0.0.0:2222`), installed and started by default with TCP/SSH keepalives (`ClientAliveInterval=15`, `UsePAM=no`, `UseDNS=no`).
-- **On-device Termius access**: Connect locally to `127.0.0.1:2222` from Termius on the same iPhone/iPad; **Open in Termius** starts `sshd` and turns on background keep-alive automatically.
-- Regular Linux users can log in with password or `~/.ssh/authorized_keys`; root login is off by default and can be toggled in **Termius & SSH**.
+- **On-device & LAN access**: Connect locally to `127.0.0.1:2222` from Termius or any SSH client on the same iPhone/iPad, or use the device's Wi-Fi IP from another machine on the same network.
+- Regular Linux users can log in with password or `~/.ssh/authorized_keys`; root login is off by default and can be toggled in **SSH Server**.
 
 The SSH server is reachable locally on `127.0.0.1:2222` and on the same Wi-Fi network while DebianRunner is active or running with **Keep Linux Running in Background** enabled.
 

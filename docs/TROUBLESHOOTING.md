@@ -22,20 +22,19 @@ If **Restart DebianRunner** appears (for example when installing a second enviro
 
 Only one modifying `dpkg`/`apt` operation can run in an environment at a time. On first boot, `/usr/lib/linuxrunner/initialize-debian.sh` runs `dpkg --configure -a` and builds the CA trust store; managed package and mode installers automatically wait for it. Never delete `/var/lib/dpkg/lock*` while a package process is active.
 
-## Debian Runtime or Termius Connection Fails
+## Debian Runtime or SSH Connection Fails
 
 Check the Home header status pill. Tap **Start Debian Minimal** if the runtime is stopped. If you want to start over cleanly, open the **Debian** tab and tap **Wipe Debian Minimal…**.
 
-Check the active user in **Settings → Linux Environment → Linux Users**, and verify with `id` and `pwd` after connecting via Termius.
+Check the active user in **Settings → Linux Environment → Linux Users**, and verify with `id` and `pwd` after connecting over SSH.
 
-## Built-in SSH Server & Termius
+## Built-in SSH Server
 
-- Ensure Debian Minimal is running before connecting. Open **Home → Termius & SSH** to check status and expand **SSH Server Log**.
-- On the same iPhone/iPad, configure your Termius host to connect to `127.0.0.1` on port `2222`. Tapping **Open in Termius** starts `sshd` and enables **Keep Linux Running in Background** automatically before switching apps.
-- For 1-tap auto-connect into a saved host, create an Apple Shortcut with Termius's **Connect to a host** action and choose **Apple Shortcut** under **Redirect Mode** in **Termius & SSH**.
-- Root login is disabled by default; create a regular user in **Settings → Linux Environment → Linux Users** (or toggle **Allow Root Login** in **Termius & SSH** and set a root password) and connect with `ssh -p 2222 <user>@127.0.0.1` (same device) or `ssh -p 2222 <user>@<iPhone-IP>` (LAN).
+- Ensure Debian Minimal is running before connecting. Open **Home → SSH Server** to check status and expand **SSH Server Log**.
+- On the same iPhone/iPad, connect from Termius or any SSH client to `127.0.0.1` on port `2222`, and enable **Keep Linux Running in Background** (in **SSH Server** or **Settings → General**) so iOS keeps `sshd` alive when you switch apps or lock your screen.
+- Root login is disabled by default; create a regular user in **Settings → Linux Environment → Linux Users** (or toggle **Allow Root Login** in **SSH Server** and set a root password) and connect with `ssh -p 2222 <user>@127.0.0.1` (same device) or `ssh -p 2222 <user>@<iPhone-IP>` (LAN).
 - For LAN connections from another device, verify both devices share the same Wi-Fi network and that DebianRunner has Local Network permission in iOS Settings.
-- Allow **Always** location permission when prompted for **Keep Linux Running in Background** so iOS keeps `sshd` alive while you work in Termius or lock your screen.
+- Allow **Always** location permission when prompted for **Keep Linux Running in Background** so iOS keeps SSH sessions active in the background.
 
 ## Debian Minimal Data After Re-signing
 

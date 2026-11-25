@@ -12,10 +12,10 @@ DebianRunner runs **Debian GNU/Linux 13 (trixie) minimal ARM64** in headless SSH
 
 | Workload | Scope |
 | --- | --- |
-| Shells & coreutils (`bash`, `sh`, `tmux`, `vim`, `nano`, `jq`, `ripgrep`) | Supported over the built-in OpenSSH server via Termius (`127.0.0.1:2222`) or LAN SSH. |
+| Shells & coreutils (`bash`, `sh`, `tmux`, `vim`, `nano`, `jq`, `ripgrep`) | Supported over the built-in OpenSSH server (`127.0.0.1:2222` on-device or LAN SSH) using Termius or any SSH client. |
 | Package management (`apt`, `apt-get`, `dpkg`) | Supported headlessly via **Packages** or directly over SSH. |
 | Languages & runtimes (`python3`, `nodejs`, `npm`, `gcc`, `git`) | Supported under the ARM64 interpreter; compute-heavy builds are slower than native execution. |
-| Built-in OpenSSH server & Termius handoff (`sshd` on port `2222`) | Installed and started by default; controlled via **Home → Termius & SSH** and **Debian → Termius & SSH**. |
+| Built-in OpenSSH server (`sshd` on port `2222`) | Installed and started by default; controlled via **Home → SSH Server** and **Debian → SSH Server**. |
 | Apple Files rootfs mount | Full Linux `/` browsable in Apple **Files** via embedded `iSHFileProvider.appex` when signed with an App Group. |
 | Embedded serial (`/dev/ttyBLE0-3`, `/dev/ttyMIDI0-3`) | Bluetooth LE serial and USB-MIDI serial adapters exposed under **Devices**. Direct USB serial chips (CH340/CP210x/FTDI) are not exposed by iOS. |
 | Graphical desktop / GUI apps (X11, Wayland, GPU) | **Not supported.** Desktop and GPU components are removed in this headless build. |

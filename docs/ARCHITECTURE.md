@@ -10,7 +10,7 @@ ARM64 interpreter (Asbestos threaded gadgets)
        │
 Linux syscall compatibility: processes, threads, signals, memory, files, PTYs, sockets
        │
-iOS/iPadOS host APIs: storage (fakefs), SwiftUI manager & Termius SSH handoff, networking, BLE/MIDI serial
+iOS/iPadOS host APIs: storage (fakefs), SwiftUI manager & OpenSSH server, networking, BLE/MIDI serial
 ```
 
 ## Load and Execute ARM64 Programs

@@ -1,7 +1,7 @@
 import SwiftUI
 
 // Guided setup: Welcome → Install Debian Minimal → (boot or restart into it) →
-// Account (optional) → Ready → Open in Termius. Uses the authenticated Debian 13
+// Account (optional) → Ready. Uses the authenticated Debian 13
 // minimal package installer and native account setup (password hashed in the
 // app; tools installed if absent). Opens automatically only when no Debian
 // environment exists or when a restart into a newly installed environment is
@@ -10,7 +10,6 @@ enum SetupStep: String { case welcome, install, relaunch, account, done }
 
 struct SetupWizardView: View {
     @ObservedObject var manager: EnvironmentManager
-    var openTermius: () -> Void
     @Environment(\.dismiss) private var dismiss
     @AppStorage("LinuxRunnerSetup.step") private var stepRaw = SetupStep.welcome.rawValue
     @AppStorage("LinuxRunnerSetup.root") private var setupRoot = ""
@@ -126,7 +125,7 @@ struct SetupWizardView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 } else {
                     Label("Debian minimal is ready", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Connect using Termius via SSH on this iPhone (127.0.0.1:2222 as \(loginUser)), install packages from Packages, or browse Debian files in Apple Files.")
+                    Text("Connect over SSH from Termius or any SSH client (127.0.0.1:2222 as \(loginUser)), install packages from Packages, or browse Debian files in Apple Files.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
@@ -136,13 +135,11 @@ struct SetupWizardView: View {
                     setupRoot = ""
                     restoredFromSnapshotName = nil
                     dismiss()
-                    openTermius()
                 } label: {
-                    Label("Open in Termius", systemImage: "arrow.up.forward.app.fill").font(.headline)
+                    Label("Done", systemImage: "checkmark.circle.fill").font(.headline)
                 }
-                .disabled(!LRRuntimeBridge.isRunning())
             } footer: {
-                Text("DebianRunner keeps Linux running in the background while you work in Termius. Save host 127.0.0.1, port 2222, username \(loginUser) in Termius.")
+                Text("Open SSH Server on Home to view local (127.0.0.1:2222) and Wi-Fi LAN SSH details or enable background keep-alive while using another SSH client.")
             }
         }
         if let working { Section { HStack(spacing: 12) { ProgressView(); Text(working) } } }

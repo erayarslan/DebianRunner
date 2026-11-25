@@ -5,7 +5,7 @@ Headless **Debian GNU/Linux 13 (trixie) minimal ARM64** userspace for iPhone and
 ## Features
 
 - **Debian 13 Minimal ARM64** — First-launch verified download of official Debian trixie minimal packages (Turkish HTTPS mirrors with `deb.debian.org` fallback).
-- **Termius SSH Workflow** — No built-in WebView terminal; built-in OpenSSH (`sshd` on `127.0.0.1:2222` and Wi-Fi LAN) starts automatically with 1-tap **Open in Termius** handoff (`termius://`, `ssh://`, or Apple Shortcuts auto-connect), opt-in **Auto-Open Termius on Launch**, and background keep-alive.
+- **Built-in OpenSSH Server** — Headless runtime with no embedded terminal; OpenSSH (`sshd` on `127.0.0.1:2222` and Wi-Fi LAN) starts automatically with background keep-alive so you can connect from Termius or any SSH client.
 - **APT, Services & Accounts** — Native **Packages** UI for `apt`/`dpkg`, built-in `systemctl`/`journalctl`/`loginctl` service manager (user & system `.service` units with auto-start/restart), and account creation with passwordless `sudo` enabled by default.
 - **Apple Files & Task Manager** — Browse the Debian rootfs directly in Apple's **Files** app, configure guest CPU/memory, and monitor live processes.
 
