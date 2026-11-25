@@ -46,8 +46,10 @@ static void db_retry_sleep(int attempt) {
 static bool db_exec_retry(struct fakefs_db *fs, sqlite3_stmt *stmt) {
     for (int attempt = 0; attempt < DB_RETRY_MAX; attempt++) {
         int err = sqlite3_step(stmt);
-        if (err == SQLITE_ROW || err == SQLITE_DONE || err == SQLITE_OK)
+        if (err == SQLITE_ROW || err == SQLITE_DONE || err == SQLITE_OK) {
+            fs->last_exec_ok = true;
             return err == SQLITE_ROW;
+        }
         int errcode = sqlite3_errcode(fs->db);
         if (errcode == SQLITE_BUSY || errcode == SQLITE_LOCKED) {
             sqlite3_reset(stmt);
@@ -55,9 +57,11 @@ static bool db_exec_retry(struct fakefs_db *fs, sqlite3_stmt *stmt) {
             continue;
         }
         db_check_error(fs);
+        fs->last_exec_ok = false;
         return false;
     }
     printk("WARNING: db_exec_retry exhausted %d attempts, proceeding\n", DB_RETRY_MAX);
+    fs->last_exec_ok = false;
     return false;
 }
 
@@ -266,6 +270,21 @@ void db_exec_reset(struct fakefs_db *fs, sqlite3_stmt *stmt) {
 // "WAL-Index Format": iChange at byte 8, mxFrame at 16, aSalt at 32; duplicate
 // copy at byte +48), which every committing connection updates and maps;
 // reading it costs no system call. Fallback: size and mtime of db and WAL.
+static bool cache_read_shm_token(const volatile uint32_t *hdr, uint32_t out[4]) {
+    // SQLite writes WAL-index header copy 1, issues a barrier, then writes copy 2.
+    // On weakly-ordered ARM64, read copy 2 first, then acquire-fence, then copy 1,
+    // and require isInit (byte 12 of each 48-byte copy) to be non-zero.
+    uint32_t init2 = hdr[15] & 0xffu;
+    uint32_t token2[4] = {hdr[14], hdr[16], hdr[20], hdr[21]};
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    uint32_t init1 = hdr[3] & 0xffu;
+    uint32_t token1[4] = {hdr[2], hdr[4], hdr[8], hdr[9]};
+    if (!init1 || !init2 || memcmp(token1, token2, sizeof token1) != 0)
+        return false;
+    memcpy(out, token1, sizeof token1);
+    return true;
+}
+
 static bool cache_check_shm(struct fakefs_db *fs) {
     if (!fs->shm_header && fs->db_path) {
         char shm[4096];
@@ -281,12 +300,10 @@ static bool cache_check_shm(struct fakefs_db *fs) {
         }
     }
     if (!fs->shm_header) return false;
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    uint32_t token[4] = {fs->shm_header[2], fs->shm_header[4], fs->shm_header[8], fs->shm_header[9]};
-    uint32_t token2[4] = {fs->shm_header[14], fs->shm_header[16], fs->shm_header[20], fs->shm_header[21]};
-    if (memcmp(token, token2, sizeof token) != 0) {
-        // Another connection is mid-update of the WAL-index header: invalidate
-        // conservatively and clear shm_token so the next look resynchronizes.
+    uint32_t token[4];
+    if (!cache_read_shm_token(fs->shm_header, token)) {
+        // Another connection is mid-update (or uninitialized) in the WAL-index
+        // header: invalidate conservatively and clear shm_token to resync next look.
         fs->generation++;
         memset(fs->shm_token, 0, sizeof fs->shm_token);
         return true;
@@ -301,14 +318,13 @@ static void cache_check_external_writes(struct fakefs_db *fs) {
     if (!fs->db_path) { fs->generation++; return; }   // cannot tell: no caching
     if (cache_check_shm(fs)) return;
     if (fs->db_fd < 0) fs->db_fd = open(fs->db_path, O_RDONLY | O_CLOEXEC);
-    if (fs->wal_fd < 0) {
-        char wal[4096];
-        snprintf(wal, sizeof wal, "%s-wal", fs->db_path);
-        fs->wal_fd = open(wal, O_RDONLY | O_CLOEXEC);
-    }
+    char wal[4096];
+    snprintf(wal, sizeof wal, "%s-wal", fs->db_path);
     struct stat db_st = {0}, wal_st = {0};
     bool ok = fs->db_fd >= 0 && fstat(fs->db_fd, &db_st) == 0;
-    if (fs->wal_fd >= 0 && fstat(fs->wal_fd, &wal_st) != 0) ok = false;
+    // stat() the WAL path on each fallback check so a WAL unlink/recreate
+    // after checkpoint never leaves a cached fd pinned to an unlinked inode.
+    if (stat(wal, &wal_st) != 0 && errno != ENOENT) ok = false;
 #ifdef __APPLE__
     int64_t db_mtime = (int64_t) db_st.st_mtimespec.tv_sec * 1000000000 + db_st.st_mtimespec.tv_nsec;
     int64_t wal_mtime = (int64_t) wal_st.st_mtimespec.tv_sec * 1000000000 + wal_st.st_mtimespec.tv_nsec;
@@ -323,41 +339,28 @@ static void cache_check_external_writes(struct fakefs_db *fs) {
         fs->file_token.wal_size = wal_st.st_size; fs->file_token.wal_mtime = wal_mtime;
     }
 }
-// Advance shm_token / file_token after our own COMMIT (still under fs->lock)
+// Advance shm_token after our own COMMIT (still under fs->lock)
 // so our commit does not trigger a spurious external-write invalidation.
 static void cache_record_own_commit(struct fakefs_db *fs) {
     if (!fs->db_path) return;
+    bool wrote = sqlite3_total_changes(fs->db) != fs->write_pre_changes;
     if (fs->shm_header) {
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        uint32_t token[4] = {fs->shm_header[2], fs->shm_header[4], fs->shm_header[8], fs->shm_header[9]};
-        uint32_t token2[4] = {fs->shm_header[14], fs->shm_header[16], fs->shm_header[20], fs->shm_header[21]};
-        // Only absorb the token if both header copies match, the WAL salts are
-        // unchanged, and iChange advanced by 0 (read-only/no-op write txn) or 1
-        // (exactly our commit). Any concurrent external commit or WAL reset
-        // leaves shm_token untouched so the next cache_check_shm() invalidates.
-        if (memcmp(token, token2, sizeof token) == 0 &&
+        uint32_t token[4];
+        // Require the exact expected iChange delta: +0 if our write transaction
+        // modified no rows, +1 if it actually wrote. That prevents a concurrent
+        // external commit immediately after a no-op write txn from being absorbed.
+        uint32_t expected_change = wrote ? (uint32_t)(fs->shm_token[0] + 1) : fs->shm_token[0];
+        if (cache_read_shm_token(fs->shm_header, token) &&
                 token[2] == fs->shm_token[2] && token[3] == fs->shm_token[3] &&
-                (token[0] == fs->shm_token[0] || token[0] == (uint32_t)(fs->shm_token[0] + 1))) {
+                token[0] == expected_change) {
             memcpy(fs->shm_token, token, sizeof token);
         }
         return;
     }
-    if (fs->db_fd >= 0) {
-        struct stat db_st = {0}, wal_st = {0};
-        bool ok = fstat(fs->db_fd, &db_st) == 0;
-        if (fs->wal_fd >= 0 && fstat(fs->wal_fd, &wal_st) != 0) ok = false;
-        if (ok) {
-#ifdef __APPLE__
-            int64_t db_mtime = (int64_t) db_st.st_mtimespec.tv_sec * 1000000000 + db_st.st_mtimespec.tv_nsec;
-            int64_t wal_mtime = (int64_t) wal_st.st_mtimespec.tv_sec * 1000000000 + wal_st.st_mtimespec.tv_nsec;
-#else
-            int64_t db_mtime = (int64_t) db_st.st_mtim.tv_sec * 1000000000 + db_st.st_mtim.tv_nsec;
-            int64_t wal_mtime = (int64_t) wal_st.st_mtim.tv_sec * 1000000000 + wal_st.st_mtim.tv_nsec;
-#endif
-            fs->file_token.db_size = db_st.st_size; fs->file_token.db_mtime = db_mtime;
-            fs->file_token.wal_size = wal_st.st_size; fs->file_token.wal_mtime = wal_mtime;
-        }
-    }
+    // Without shm_header we cannot atomically distinguish our commit from a
+    // concurrent external commit after releasing the WAL lock; invalidate on write.
+    if (wrote)
+        fs->generation++;
 }
 
 void db_begin_read(struct fakefs_db *fs) {
@@ -375,6 +378,7 @@ void db_begin_write(struct fakefs_db *fs) {
     // raced ahead of BEGIN IMMEDIATE is observed and shm_token records the
     // exact pre-commit state.
     cache_check_external_writes(fs);
+    fs->write_pre_changes = sqlite3_total_changes(fs->db);
 }
 static void db_end(struct fakefs_db *fs, sqlite3_stmt *end) {
     bool was_write = fs->in_txn && !fs->read_pending;
@@ -408,8 +412,10 @@ inode_t path_get_inode(struct fakefs_db *fs, const char *path) {
     inode_t inode = 0;
     if (db_exec(fs, fs->stmt.path_get_inode))
         inode = sqlite3_column_int64(fs->stmt.path_get_inode, 0);
+    bool exec_ok = fs->last_exec_ok;
     db_reset(fs, fs->stmt.path_get_inode);
-    path_cache_store(fs, path, inode != 0, inode);
+    if (exec_ok)
+        path_cache_store(fs, path, inode != 0, inode);
     return inode;
 }
 bool path_read_stat(struct fakefs_db *fs, const char *path, struct ish_stat *stat, inode_t *inode) {
@@ -428,6 +434,7 @@ bool path_read_stat(struct fakefs_db *fs, const char *path, struct ish_stat *sta
     // select inode, stat from stats natural join paths where path = ?
     bind_path(fs->stmt.path_read_stat, 1, path);
     bool exists = db_exec(fs, fs->stmt.path_read_stat);
+    bool exec_ok = fs->last_exec_ok;
     inode_t found_inode = 0; struct ish_stat found_stat = {0};
     if (exists) {
         found_inode = sqlite3_column_int64(fs->stmt.path_read_stat, 0);
@@ -436,9 +443,11 @@ bool path_read_stat(struct fakefs_db *fs, const char *path, struct ish_stat *sta
         if (stat) *stat = found_stat;
     }
     db_reset(fs, fs->stmt.path_read_stat);
-    path_cache_store(fs, path, exists, found_inode);
-    if (exists)
-        inode_cache_store(fs, found_inode, true, &found_stat);
+    if (exec_ok) {
+        path_cache_store(fs, path, exists, found_inode);
+        if (exists)
+            inode_cache_store(fs, found_inode, true, &found_stat);
+    }
     return exists;
 }
 inode_t path_create(struct fakefs_db *fs, const char *path, struct ish_stat *stat) {
@@ -472,13 +481,15 @@ bool inode_read_stat_if_exist(struct fakefs_db *fs, inode_t inode, struct ish_st
     // select stat from stats where inode = ?
     sqlite3_bind_int64(fs->stmt.inode_read_stat, 1, inode);
     bool exist = db_exec(fs, fs->stmt.inode_read_stat);
+    bool exec_ok = fs->last_exec_ok;
     struct ish_stat found = {0};
     if (exist) {
         found = *(struct ish_stat *) sqlite3_column_blob(fs->stmt.inode_read_stat, 0);
         *stat = found;
     }
     db_reset(fs, fs->stmt.inode_read_stat);
-    inode_cache_store(fs, inode, exist, exist ? &found : NULL);
+    if (exec_ok)
+        inode_cache_store(fs, inode, exist, exist ? &found : NULL);
     return exist;
 }
 void inode_write_stat(struct fakefs_db *fs, inode_t inode, struct ish_stat *stat) {
@@ -577,23 +588,29 @@ extern int fakefs_rebuild(struct fakefs_db *fs, int root_fd);
 extern int fakefs_migrate(struct fakefs_db *fs, int root_fd);
 
 int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
+    fs->db = NULL;
+    memset(&fs->stmt, 0, sizeof(fs->stmt));
+    fs->lock = NULL;
     fs->read_pending = fs->in_txn = false;
+    fs->last_exec_ok = false;
+    fs->write_pre_changes = 0;
     fs->generation = 1;
     fs->path_cache = NULL; fs->inode_cache = NULL;
     fs->cache_hits = fs->cache_misses = 0;
     fs->db_path = strdup(db_path);
-    fs->db_fd = fs->wal_fd = -1;   // opened only if the WAL index is unavailable
+    fs->db_fd = -1;   // opened only if the WAL index is unavailable
     memset(&fs->file_token, 0, sizeof(fs->file_token));
     fs->shm_header = NULL;
     memset(fs->shm_token, 0, sizeof(fs->shm_token));
+    int fail_ret = _EIO;
     // fs->lock serializes every access to fs->db, so SQLITE_OPEN_NOMUTEX avoids
     // redundant per-connection mutex overhead while preserving multi-process WAL
     // locking with iSHFileProvider.appex (never use locking_mode=EXCLUSIVE).
     int err = sqlite3_open_v2(db_path, &fs->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, NULL);
     if (err != SQLITE_OK) {
         printk("error opening database: %s\n", sqlite3_errmsg(fs->db));
-        sqlite3_close(fs->db);
-        return _EINVAL;
+        fail_ret = _EINVAL;
+        goto init_fail;
     }
     sqlite3_busy_timeout(fs->db, 5000);
     sqlite3_create_function(fs->db, "change_prefix", 3, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_func_change_prefix, NULL, NULL);
@@ -663,8 +680,10 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
 #endif
 
     err = fakefs_migrate(fs, root_fd);
-    if (err < 0)
-        return err;
+    if (err < 0) {
+        fail_ret = err;
+        goto init_fail;
+    }
 
     // after the filesystem is compressed, transmitted, and uncompressed, the
     // inode numbers will be different. to detect this, the inode of the
@@ -675,15 +694,20 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     ino_t db_inode = statbuf.st_ino;
     sqlite3_stmt *statement = NULL;
     if (db_prepare_checked(fs, "select db_inode from meta", &statement) != SQLITE_OK) goto init_fail;
-    if (db_step_checked(fs, statement, "select db_inode from meta") == SQLITE_ROW) {
+    int sel_rc = db_step_checked(fs, statement, "select db_inode from meta");
+    if (sel_rc == SQLITE_ROW) {
         if ((uint64_t) sqlite3_column_int64(statement, 0) != db_inode) {
             sqlite3_finalize(statement);
             statement = NULL;
-            int err = fakefs_rebuild(fs, root_fd);
+            err = fakefs_rebuild(fs, root_fd);
             if (err < 0) {
-                return err;
+                fail_ret = err;
+                goto init_fail;
             }
         }
+    } else if (sel_rc != SQLITE_DONE) {
+        sqlite3_finalize(statement);
+        goto init_fail;
     }
     if (statement != NULL)
         sqlite3_finalize(statement);
@@ -728,24 +752,22 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
 
 init_fail:
     // [T-fakefs-db-init-no-die] A SQLite error during init no longer aborts the
-    // whole app. Close the half-open db and return an error so the fakefs mount
-    // fails gracefully (the caller handles a negative return).
+    // whole app. Finalize any prepared statements, close the half-open db, and
+    // free auxiliary resources so the fakefs mount fails cleanly without leaks.
     printk("fakefs db init: FAILED for %s — mount aborted (app kept alive)\n", db_path);
-    if (fs->db) {
-        sqlite3_close(fs->db);
-        fs->db = NULL;
-    }
-    return _EIO;
+    fake_db_deinit(fs);
+    return fail_ret;
 }
 
 int fake_db_deinit(struct fakefs_db *fs) {
     free(fs->path_cache); fs->path_cache = NULL;
     free(fs->inode_cache); fs->inode_cache = NULL;
     if (fs->db_fd >= 0) close(fs->db_fd);
-    if (fs->wal_fd >= 0) close(fs->wal_fd);
-    fs->db_fd = fs->wal_fd = -1;
+    fs->db_fd = -1;
     free(fs->db_path); fs->db_path = NULL;
     if (fs->shm_header) { munmap((void *) fs->shm_header, 136); fs->shm_header = NULL; }
+    if (fs->lock) { sqlite3_mutex_free(fs->lock); fs->lock = NULL; }
+    int rc = SQLITE_OK;
     if (fs->db) {
         sqlite3_finalize(fs->stmt.begin_deferred);
         sqlite3_finalize(fs->stmt.begin_immediate);
@@ -762,7 +784,9 @@ int fake_db_deinit(struct fakefs_db *fs) {
         sqlite3_finalize(fs->stmt.path_rename);
         sqlite3_finalize(fs->stmt.path_from_inode);
         sqlite3_finalize(fs->stmt.try_cleanup_inode);
-        return sqlite3_close(fs->db);
+        memset(&fs->stmt, 0, sizeof(fs->stmt));
+        rc = sqlite3_close(fs->db);
+        fs->db = NULL;
     }
-    return SQLITE_OK;
+    return rc;
 }

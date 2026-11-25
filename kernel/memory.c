@@ -547,6 +547,9 @@ static int pt_map_accounted(struct mem *mem, page_t start, pages_t pages,
             pt_unmap(mem, page, 1);
             pt = mem_pt_new(mem, page);
         }
+        // Invalidate any stale cached instruction-fault block from before this
+        // page was mapped (O(1) lock-free no-op when page was never decoded).
+        asbestos_invalidate_page(mem->mmu.asbestos, page);
         pt->data = data;
         pt->offset = ((page - start) << PAGE_BITS) + offset;
         pt->flags = flags;
@@ -723,7 +726,7 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
                 continue;
             return _ENOMEM;
         }
-        if (!entry->data->page_pool && ((flags & ~entry->flags) & (P_READ | P_WRITE)))
+        if (!entry->data->page_pool && ((flags & ~entry->flags) & P_RWX))
             need_host_mprotect = true;
     }
 
@@ -732,44 +735,68 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
     // Run before mutating entry->flags so a host mprotect failure never leaves
     // guest flags claiming permissions the host rejected.
     if (need_host_mprotect) {
-        int prot = PROT_READ | ((flags & P_WRITE) ? PROT_WRITE : 0);
+        int base_prot = PROT_READ | ((flags & P_WRITE) ? PROT_WRITE : 0);
+        size_t subpages = real_page_size / PAGE_SIZE;
         struct data *mprot_data = NULL;
         uintptr_t mprot_start = 0;
         uintptr_t mprot_end = 0;
+        int mprot_prot = 0;
         for (page_t page = start; page < end; mem_next_page(mem, &page)) {
             struct pt_entry *entry = mem_pt(mem, page);
             if (entry == NULL)
                 continue;
-            if (entry->data->page_pool || !((flags & ~entry->flags) & (P_READ | P_WRITE)))
+            if (entry->data->page_pool || !((flags & ~entry->flags) & P_RWX))
                 continue;
             uintptr_t host_page = ((uintptr_t)((char *)entry->data->data + entry->offset)) & ~(real_page_size - 1);
             uintptr_t host_page_end = host_page + real_page_size;
+            // On 16 KiB host pages, never strip PROT_WRITE from a host page while
+            // any sibling 4 KiB guest page backed by it retains P_WRITE. Anonymous
+            // backing with any P_RWX permission always keeps PROT_READ|PROT_WRITE.
+            int prot = (entry->flags & P_ANONYMOUS) ? (PROT_READ | PROT_WRITE) : base_prot;
+            if (!(prot & PROT_WRITE) && subpages > 1) {
+                page_t scan_lo = page >= subpages - 1 ? page - (subpages - 1) : 0;
+                page_t scan_hi = (page <= MEM_PAGES - subpages) ? page + subpages : MEM_PAGES;
+                for (page_t sib = scan_lo; sib < scan_hi; sib++) {
+                    if (sib >= start && sib < end)
+                        continue;
+                    struct pt_entry *se = mem_pt(mem, sib);
+                    if (se == NULL || se->data != entry->data)
+                        continue;
+                    uintptr_t sib_host = ((uintptr_t)((char *)se->data->data + se->offset)) & ~(real_page_size - 1);
+                    if (sib_host == host_page && (se->flags & P_WRITE)) {
+                        prot |= PROT_WRITE;
+                        break;
+                    }
+                }
+            }
             if (mprot_end == 0) {
                 mprot_data = entry->data;
                 mprot_start = host_page;
                 mprot_end = host_page_end;
-            } else if (entry->data == mprot_data && host_page >= mprot_start && host_page_end <= mprot_end) {
+                mprot_prot = prot;
+            } else if (entry->data == mprot_data && host_page >= mprot_start && host_page_end <= mprot_end && prot == mprot_prot) {
                 // Already covered by the current pending host-page range.
-            } else if (entry->data == mprot_data && host_page == mprot_end) {
+            } else if (entry->data == mprot_data && host_page == mprot_end && prot == mprot_prot) {
                 mprot_end = host_page_end;
             } else {
-                if (mprotect((void *)mprot_start, mprot_end - mprot_start, prot) < 0) {
+                if (mprotect((void *)mprot_start, mprot_end - mprot_start, mprot_prot) < 0) {
                     int saved = errno;
                     if (runtime_memory_failure)
-                        runtime_memory_failure("mprotect", mprot_start, mprot_end - mprot_start, prot, 0, saved);
+                        runtime_memory_failure("mprotect", mprot_start, mprot_end - mprot_start, mprot_prot, 0, saved);
                     errno = saved;
                     return errno_map();
                 }
                 mprot_data = entry->data;
                 mprot_start = host_page;
                 mprot_end = host_page_end;
+                mprot_prot = prot;
             }
         }
         if (mprot_end != 0) {
-            if (mprotect((void *)mprot_start, mprot_end - mprot_start, prot) < 0) {
+            if (mprotect((void *)mprot_start, mprot_end - mprot_start, mprot_prot) < 0) {
                 int saved = errno;
                 if (runtime_memory_failure)
-                    runtime_memory_failure("mprotect", mprot_start, mprot_end - mprot_start, prot, 0, saved);
+                    runtime_memory_failure("mprotect", mprot_start, mprot_end - mprot_start, mprot_prot, 0, saved);
                 errno = saved;
                 return errno_map();
             }
@@ -794,9 +821,9 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
         atomic_fetch_add_explicit(&anon_page_count, accounting_delta, memory_order_relaxed);
 #endif
     int err = mem_set_reservation_flags(mem, start, pages, flags);
+    mem_changed(mem);
     if (err < 0)
         return err;
-    mem_changed(mem);
 #if ANON_MMAP_LIMIT_PAGES > 0
     if (g_trace_syscalls && (pages >= 4096 || accounting_delta >= 4096 || accounting_delta <= -4096))
         printk("MEMORY_ACCOUNT: operation=protect tid=%d address=%#llx pages=%llu flags=%#x delta=%ld committed-after=%ld\n", current ? current->pid : 0,
@@ -957,11 +984,12 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
         // Use trylock: if contended, return NULL for INT_GPF retry from
         // handle_interrupt where the lock upgrade is safe.
         read_wrunlock(&mem->lock);
-        if (in_jit) {
+        if (in_jit || type == MEM_EXEC) {
             if (!write_wrtrylock(&mem->lock)) {
-                // Can't get write lock — other threads hold/read-wait on this
-                // writer-preferred rwlock. Re-acquire read without blocking a
-                // queued writer, then return NULL for GPF retry outside JIT.
+                // Can't get write lock — either inside JIT or decoding instructions
+                // while holding asbestos->lock (blocking write_wrlock would ABBA-deadlock
+                // with mem->lock writers calling asbestos_invalidate). Return NULL for
+                // GPF retry outside JIT and asbestos->lock.
                 reacquire_read_after_failed_jit_upgrade(&mem->lock);
                 return NULL;
             }
@@ -1007,7 +1035,7 @@ check_reservation: ;
             return NULL;
         }
         read_wrunlock(&mem->lock);
-        if (in_jit) {
+        if (in_jit || type == MEM_EXEC) {
             if (!write_wrtrylock(&mem->lock)) {
                 reacquire_read_after_failed_jit_upgrade(&mem->lock);
                 if (current) __atomic_store_n(&current->diagnostic_memory_stage, 0, __ATOMIC_RELAXED);

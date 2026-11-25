@@ -56,7 +56,7 @@ install_packages() {
             stage "Finishing an interrupted installation"
             if ! dpkg --force-confdef --force-confold --configure -a >> "$apt_log" 2>&1; then
                 stage "Repairing missing packages"
-                apt-get -o APT::Status-Fd=3 -f install -y 3> "$status_file" >> "$apt_log" 2>&1 || { classify_failure "$label"; return 1; }
+                apt-get -o APT::Status-Fd=3 -f install -y 3> "$status_file" >> "$apt_log" 2>&1 || { cat "$apt_log"; classify_failure "$label"; return 1; }
             fi
         fi
         stage "Checking package dependencies"

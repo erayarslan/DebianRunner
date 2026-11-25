@@ -74,7 +74,7 @@ PYADHOC
     python3 scripts/validate-ipa.py "$ipa" --report "$release/$artifact.validation.json" ||
         { echo 'IPA validation failed; do not publish this artifact.' >&2; exit 1; }
     printf 'UNSIGNED IPA (ad-hoc signed, no Apple signature). Requires signing and provisioning before physical-device installation.\nBundle ID: %s\nApp group: group.%s\nEmbedded extensions: iSHFileProvider.appex (Apple Files rootfs provider)\nPrivate Application Support fallback: supported\n' \
-        "${BUNDLE_ID:-dev.debianrunner.app}" "${BUNDLE_ID:-dev.debianrunner.app}" > "$release/SIGNING-STATUS.txt"
+        "${BUNDLE_ID:-dev.debianrunner.app}" "${BUNDLE_ID:-dev.debianrunner.app}" > "$release/$artifact.signing-status.txt"
 else
     options="${EXPORT_OPTIONS_PLIST:-$release/ExportOptions.plist}"
     if [[ -z ${EXPORT_OPTIONS_PLIST:-} ]]; then
@@ -92,7 +92,7 @@ PY
     exported="$release/export/LinuxRunner.ipa"
     test -f "$exported" || { echo 'Xcode did not produce LinuxRunner.ipa.' >&2; exit 1; }
     cp "$exported" "$ipa"
-    printf 'Signed by Xcode export method %s. Verify on the intended physical device.\n' "${EXPORT_METHOD:-custom ExportOptions.plist}" > "$release/SIGNING-STATUS.txt"
+    printf 'Signed by Xcode export method %s. Verify on the intended physical device.\n' "${EXPORT_METHOD:-custom ExportOptions.plist}" > "$release/$artifact.signing-status.txt"
 fi
 python3 - "$release/$artifact.entitlements.plist" "${BUNDLE_ID:-dev.debianrunner.app}" "$diagnostic" <<'PYENT'
 import plistlib, sys

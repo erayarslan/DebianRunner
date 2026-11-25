@@ -22,16 +22,38 @@ INVOKED_AS="$(basename "$0")"
 current_uid() { id -u; }
 current_user() { id -un; }
 
-pid_alive() {
+current_boot_id() {
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
+}
+
+pid_starttime() {
     local p="${1:-}"
+    [ -n "$p" ] && [ -r "/proc/$p/stat" ] || return 1
+    awk '{sub(/^.*\) /, ""); print $20}' "/proc/$p/stat" 2>/dev/null || true
+}
+
+pid_alive() {
+    local p="${1:-}" expect_boot="${2:-}" expect_start="${3:-}"
     [ -n "$p" ] || return 1
     case "$p" in *[!0-9]*) return 1 ;; esac
     [ "$p" -gt 1 ] 2>/dev/null || return 1
+    if [ -n "$expect_boot" ]; then
+        local cur_boot
+        cur_boot="$(current_boot_id)"
+        if [ -n "$cur_boot" ] && [ "$expect_boot" != "$cur_boot" ]; then
+            return 1
+        fi
+    fi
     kill -0 "$p" 2>/dev/null || return 1
-    if [ -r "/proc/$p/stat" ]; then
+    if [ -r /proc/self/stat ]; then
         local st
-        st="$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null || true)"
-        [ "$st" = "Z" ] && return 1
+        st="$(awk '{sub(/^.*\) /, ""); print $1}' "/proc/$p/stat" 2>/dev/null || true)"
+        [ -n "$st" ] && [ "$st" != "Z" ] && [ "$st" != "X" ] || return 1
+        if [ -n "$expect_start" ]; then
+            local cur_start
+            cur_start="$(pid_starttime "$p")"
+            [ -n "$cur_start" ] && [ "$cur_start" = "$expect_start" ] || return 1
+        fi
     fi
     return 0
 }
@@ -40,41 +62,49 @@ normalize_unit() {
     local u="$1"
     u="${u%.}"
     case "$u" in
-        *.*) printf '%s' "$u" ;;
-        *)   printf '%s.service' "$u" ;;
+        *.service|*.socket|*.target|*.timer|*.mount|*.automount|*.swap|*.path|*.slice|*.scope|*.device)
+            printf '%s' "$u"
+            ;;
+        *)
+            printf '%s.service' "$u"
+            ;;
     esac
 }
 
 parse_duration_sec() {
     local raw="${1:-0}"
-    raw="${raw// /}"
-    case "$raw" in
-        *ms)
-            local n="${raw%ms}"
-            awk -v n="$n" 'BEGIN { v = n / 1000.0; if (v < 0.1) v = 0.1; printf "%.2f", v }'
-            ;;
-        *min)
-            local n="${raw%min}"
-            awk -v n="$n" 'BEGIN { printf "%.0f", n * 60 }'
-            ;;
-        *m)
-            local n="${raw%m}"
-            awk -v n="$n" 'BEGIN { printf "%.0f", n * 60 }'
-            ;;
-        *h)
-            local n="${raw%h}"
-            awk -v n="$n" 'BEGIN { printf "%.0f", n * 3600 }'
-            ;;
-        *s)
-            printf '%s' "${raw%s}"
-            ;;
-        ''|*[!0-9.]*)
-            printf '1'
-            ;;
-        *)
-            printf '%s' "$raw"
-            ;;
-    esac
+    awk -v s="$raw" 'BEGIN {
+        gsub(/^[ \t]+|[ \t]+$/, "", s)
+        if (s == "") { print "1"; exit }
+        if (s ~ /^[0-9]+(\.[0-9]+)?$/) { printf "%s", s; exit }
+        total = 0; matched = 0
+        while (length(s) > 0) {
+            gsub(/^[ \t]+/, "", s)
+            if (length(s) == 0) break
+            if (!match(s, /^[0-9]+(\.[0-9]+)?/)) { matched = 0; break }
+            num = substr(s, RSTART, RLENGTH) + 0
+            s = substr(s, RSTART + RLENGTH)
+            gsub(/^[ \t]+/, "", s)
+            unit = ""
+            if (match(s, /^[A-Za-z]+/)) {
+                unit = tolower(substr(s, RSTART, RLENGTH))
+                s = substr(s, RSTART + RLENGTH)
+            }
+            if (unit == "" || unit == "s" || unit == "sec" || unit == "second" || unit == "seconds") mult = 1
+            else if (unit == "ms" || unit == "msec" || unit == "millisecond" || unit == "milliseconds") mult = 0.001
+            else if (unit == "us" || unit == "usec" || unit == "microsecond" || unit == "microseconds") mult = 0.000001
+            else if (unit == "m" || unit == "min" || unit == "minute" || unit == "minutes") mult = 60
+            else if (unit == "h" || unit == "hr" || unit == "hour" || unit == "hours") mult = 3600
+            else if (unit == "d" || unit == "day" || unit == "days") mult = 86400
+            else { matched = 0; break }
+            total += num * mult
+            matched = 1
+        }
+        if (!matched) { print "1"; exit }
+        if (total > 0 && total < 0.1) total = 0.1
+        if (total == int(total)) printf "%.0f", total
+        else printf "%.2f", total
+    }'
 }
 
 utc_systemd_now() {
@@ -92,10 +122,10 @@ state_root_for_scope() {
     if [ "$scope" = "user" ]; then
         local uid
         uid="$(current_uid)"
-        if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR}" ]; then
-            printf '%s/debianrunner-systemd' "$XDG_RUNTIME_DIR"
-        elif [ -d /run/debianrunner-systemd ] && [ -w /run/debianrunner-systemd ]; then
+        if [ -d /run/debianrunner-systemd ] && [ -w /run/debianrunner-systemd ]; then
             printf '/run/debianrunner-systemd/user-%s' "$uid"
+        elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR}" ]; then
+            printf '%s/debianrunner-systemd' "$XDG_RUNTIME_DIR"
         else
             printf '/tmp/debianrunner-systemd-user-%s' "$uid"
         fi
@@ -107,7 +137,7 @@ state_root_for_scope() {
 log_dir_for_scope() {
     local scope="$1"
     if [ "$scope" = "user" ]; then
-        printf '%s/debianrunner-systemd/logs' "${XDG_STATE_HOME:-$HOME/.local/state}"
+        printf '%s/debianrunner-systemd/logs' "${XDG_STATE_HOME:-${HOME:-/root}/.local/state}"
     else
         printf '/var/log/debianrunner-systemd'
     fi
@@ -116,7 +146,7 @@ log_dir_for_scope() {
 config_dir_for_scope() {
     local scope="$1"
     if [ "$scope" = "user" ]; then
-        printf '%s/systemd/user' "${XDG_CONFIG_HOME:-$HOME/.config}"
+        printf '%s/systemd/user' "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}"
     else
         printf '/etc/systemd/system'
     fi
@@ -126,7 +156,7 @@ unit_search_dirs() {
     local scope="$1"
     if [ "$scope" = "user" ]; then
         printf '%s\n' \
-            "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" \
+            "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/systemd/user" \
             "/etc/systemd/user" \
             "/run/systemd/user" \
             "/usr/local/lib/systemd/user" \
@@ -445,25 +475,40 @@ read_unit_status() {
     ST_SUB="dead"
     ST_MAIN_PID="0"
     ST_SUP_PID="0"
+    ST_BOOT_ID=""
+    ST_MAIN_START=""
+    ST_SUP_START=""
     ST_SINCE=""
     ST_SINCE_MONO="0"
     ST_EXIT="0"
+
+    local cur_boot saved_boot=""
+    cur_boot="$(current_boot_id)"
+    [ -f "$sdir/boot_id" ] && saved_boot="$(cat "$sdir/boot_id" 2>/dev/null || true)"
+    ST_BOOT_ID="$saved_boot"
+    if [ -n "$cur_boot" ] && [ -n "$saved_boot" ] && [ "$saved_boot" != "$cur_boot" ]; then
+        return 0
+    fi
 
     [ -f "$sdir/active_since" ] && ST_SINCE="$(cat "$sdir/active_since" 2>/dev/null || true)"
     [ -f "$sdir/active_since_mono" ] && ST_SINCE_MONO="$(cat "$sdir/active_since_mono" 2>/dev/null || echo 0)"
     [ -f "$sdir/exit_code" ] && ST_EXIT="$(cat "$sdir/exit_code" 2>/dev/null || echo 0)"
 
-    local mpid="" spid="" saved_sub=""
+    local mpid="" spid="" mstart="" sstart="" saved_sub=""
     [ -f "$sdir/main.pid" ] && mpid="$(cat "$sdir/main.pid" 2>/dev/null || true)"
+    [ -f "$sdir/main.start" ] && mstart="$(cat "$sdir/main.start" 2>/dev/null || true)"
     [ -f "$sdir/supervisor.pid" ] && spid="$(cat "$sdir/supervisor.pid" 2>/dev/null || true)"
+    [ -f "$sdir/supervisor.start" ] && sstart="$(cat "$sdir/supervisor.start" 2>/dev/null || true)"
     [ -f "$sdir/sub_state" ] && saved_sub="$(cat "$sdir/sub_state" 2>/dev/null || true)"
+    ST_MAIN_START="$mstart"
+    ST_SUP_START="$sstart"
 
-    if pid_alive "$mpid"; then
+    if pid_alive "$mpid" "$saved_boot" "$mstart"; then
         ST_ACTIVE="active"
         ST_SUB="running"
         ST_MAIN_PID="$mpid"
-        pid_alive "$spid" && ST_SUP_PID="$spid"
-    elif pid_alive "$spid"; then
+        pid_alive "$spid" "$saved_boot" "$sstart" && ST_SUP_PID="$spid"
+    elif pid_alive "$spid" "$saved_boot" "$sstart"; then
         ST_SUP_PID="$spid"
         if [ "$saved_sub" = "auto-restart" ]; then
             ST_ACTIVE="activating"
@@ -506,9 +551,53 @@ unit_is_enabled_state() {
 
 # ── Environment & Command Execution ──────────────────────────────────────────
 
+RESOLVED_UID=""
+RESOLVED_GID=""
+RESOLVED_USER=""
+RESOLVED_HOME=""
+resolve_unit_identity() {
+    local scope="$1"
+    RESOLVED_UID=""
+    RESOLVED_GID=""
+    RESOLVED_USER=""
+    RESOLVED_HOME=""
+    if [ "$scope" != "system" ] || [ "$(current_uid)" -ne 0 ]; then
+        return 0
+    fi
+    if [ -n "$U_USER" ]; then
+        local pw_line=""
+        if command -v getent >/dev/null 2>&1; then
+            pw_line="$(getent passwd "$U_USER" 2>/dev/null || true)"
+        fi
+        if [ -z "$pw_line" ] && [ -r /etc/passwd ]; then
+            pw_line="$(awk -F: -v u="$U_USER" '$1==u || $3==u {print; exit}' /etc/passwd 2>/dev/null || true)"
+        fi
+        [ -n "$pw_line" ] || { echo "Unknown User=$U_USER" >&2; return 1; }
+        local _p _g
+        IFS=: read -r RESOLVED_USER _p RESOLVED_UID RESOLVED_GID _g RESOLVED_HOME _ <<< "$pw_line"
+        [ -n "$RESOLVED_UID" ] && [ -n "$RESOLVED_GID" ] || return 1
+        export -- HOME="${RESOLVED_HOME:-/root}" USER="$RESOLVED_USER" LOGNAME="$RESOLVED_USER"
+    fi
+    if [ -n "$U_GROUP" ]; then
+        local gr_line=""
+        if command -v getent >/dev/null 2>&1; then
+            gr_line="$(getent group "$U_GROUP" 2>/dev/null || true)"
+        fi
+        if [ -z "$gr_line" ] && [ -r /etc/group ]; then
+            gr_line="$(awk -F: -v g="$U_GROUP" '$1==g || $3==g {print; exit}' /etc/group 2>/dev/null || true)"
+        fi
+        [ -n "$gr_line" ] || { echo "Unknown Group=$U_GROUP" >&2; return 1; }
+        local _gn _gp
+        IFS=: read -r _gn _gp RESOLVED_GID _ <<< "$gr_line"
+        [ -n "$RESOLVED_GID" ] || return 1
+        [ -n "$RESOLVED_UID" ] || RESOLVED_UID=0
+    fi
+    return 0
+}
+
 apply_unit_environment() {
     local scope="$1" unit="$2"
-    local ef opt f line k v
+    local ef opt line k v
     for ef in "${U_ENV_FILES[@]}"; do
         opt=0
         if [[ "$ef" == -* ]]; then
@@ -523,15 +612,22 @@ apply_unit_environment() {
         while IFS= read -r line || [ -n "$line" ]; do
             line="${line%$'\r'}"
             line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
             case "$line" in ''|'#'*|';'*) continue ;; esac
+            [[ "$line" == export[[:space:]]* ]] && line="${line#export}" && line="${line#"${line%%[![:space:]]*}"}"
             [[ "$line" == *=* ]] || continue
             k="${line%%=*}"
             v="${line#*=}"
-            case "$v" in
-                '"'*'"') v="${v#\"}"; v="${v%\"}" ;;
-                "'"*"'") v="${v#\'}"; v="${v%\'}" ;;
-            esac
-            export "$k=$v"
+            k="${k%"${k##*[![:space:]]}"}"
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+            if [[ "$v" == \"*\" && "${#v}" -ge 2 && "${v:1:${#v}-2}" != *\"* ]]; then
+                v="${v#\"}"; v="${v%\"}"
+            elif [[ "$v" == \'*\' && "${#v}" -ge 2 && "${v:1:${#v}-2}" != *\'* ]]; then
+                v="${v#\'}"; v="${v%\'}"
+            fi
+            [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+            export -- "$k=$v"
         done < "$ef"
     done
 
@@ -539,7 +635,11 @@ apply_unit_environment() {
     for kv in "${U_ENV[@]}"; do
         kv="$(expand_specifiers "$kv" "$unit" "$scope")"
         if [[ "$kv" == *=* ]]; then
-            export "${kv%%=*}=${kv#*=}"
+            k="${kv%%=*}"
+            v="${kv#*=}"
+            k="${k%"${k##*[![:space:]]}"}"
+            [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+            export -- "$k=$v"
         fi
     done
     return 0
@@ -566,6 +666,54 @@ apply_working_dir() {
     return 0
 }
 
+# Safely expands systemd-style $VAR (word-split, dropped if empty), ${VAR}
+# (single-word), and $$ (literal $) in TOKENS without eval.
+expand_env_tokens() {
+    local -a out=()
+    local tok i len ch next vname val cur part
+    for tok in "${TOKENS[@]}"; do
+        if [[ "$tok" =~ ^\$([A-Za-z_][A-Za-z0-9_]*)$ ]]; then
+            vname="${BASH_REMATCH[1]}"
+            val="${!vname:-}"
+            if [ -n "$val" ]; then
+                for part in $val; do out+=("$part"); done
+            fi
+            continue
+        fi
+        cur=""
+        i=0
+        len=${#tok}
+        while [ "$i" -lt "$len" ]; do
+            ch="${tok:$i:1}"
+            if [ "$ch" = '$' ] && [ $((i + 1)) -lt "$len" ]; then
+                next="${tok:$((i + 1)):1}"
+                if [ "$next" = '$' ]; then
+                    cur+='$'
+                    i=$((i + 2))
+                    continue
+                elif [ "$next" = '{' ]; then
+                    local rest="${tok:$((i + 2))}"
+                    if [[ "$rest" =~ ^([A-Za-z_][A-Za-z0-9_]*)\} ]]; then
+                        vname="${BASH_REMATCH[1]}"
+                        cur+="${!vname:-}"
+                        i=$((i + 2 + ${#vname} + 1))
+                        continue
+                    fi
+                elif [[ "${tok:$((i + 1))}" =~ ^([A-Za-z_][A-Za-z0-9_]*) ]]; then
+                    vname="${BASH_REMATCH[1]}"
+                    cur+="${!vname:-}"
+                    i=$((i + 1 + ${#vname}))
+                    continue
+                fi
+            fi
+            cur+="$ch"
+            i=$((i + 1))
+        done
+        out+=("$cur")
+    done
+    TOKENS=("${out[@]}")
+}
+
 # Prepares CMD_ARGV and CMD_IGNORE_ERR from a raw systemd Exec* string.
 CMD_IGNORE_ERR=0
 declare -a CMD_ARGV=()
@@ -588,31 +736,66 @@ prepare_exec_cmd() {
         esac
     done
     TOKENS[0]="$cmd"
+    expand_env_tokens
+    [ "${#TOKENS[@]}" -gt 0 ] || return 1
     CMD_ARGV=("${TOKENS[@]}")
     [ -n "${CMD_ARGV[0]}" ]
 }
 
-run_exec_sync() {
-    local raw="$1" scope="$2" unit="$3" logf="$4"
-    prepare_exec_cmd "$raw" "$scope" "$unit" || return 0
-    (
-        apply_unit_environment "$scope" "$unit" || exit 1
-        apply_working_dir "$scope" "$unit" || exit 1
-        if [ "$scope" = "system" ] && [ -n "$U_USER" ] && [ "$(current_uid)" -eq 0 ] && [ "$U_USER" != "root" ]; then
-            if command -v setpriv >/dev/null 2>&1; then
-                local u_uid u_gid
-                u_uid="$(id -u "$U_USER" 2>/dev/null || echo 0)"
-                u_gid="$(id -g "${U_GROUP:-$U_USER}" 2>/dev/null || echo 0)"
-                exec setpriv --reuid="$u_uid" --regid="$u_gid" --init-groups "${CMD_ARGV[@]}"
+exec_with_identity() {
+    local with_setsid="$1"
+    shift
+    if [ -n "$RESOLVED_UID" ] && [ "$(current_uid)" -eq 0 ] && { [ "$RESOLVED_UID" != "0" ] || [ "${RESOLVED_GID:-0}" != "0" ]; }; then
+        if command -v setpriv >/dev/null 2>&1; then
+            local -a sp_args=(--reuid="$RESOLVED_UID" --regid="$RESOLVED_GID")
+            if [ -n "$RESOLVED_USER" ] && [ "$RESOLVED_USER" != "root" ]; then
+                sp_args+=(--init-groups)
             else
-                exec su -s /bin/sh "$U_USER" -c 'exec "$@"' -- debianrunner-svc "${CMD_ARGV[@]}"
+                sp_args+=(--clear-groups)
+            fi
+            if [ "$with_setsid" -eq 1 ] && command -v setsid >/dev/null 2>&1; then
+                exec setsid -w setpriv "${sp_args[@]}" "$@"
+            else
+                exec setpriv "${sp_args[@]}" "$@"
+            fi
+        elif [ -n "$RESOLVED_USER" ]; then
+            if [ "$with_setsid" -eq 1 ] && command -v setsid >/dev/null 2>&1; then
+                exec setsid -w su -s /bin/sh "$RESOLVED_USER" -c 'exec "$@"' -- debianrunner-svc "$@"
+            else
+                exec su -s /bin/sh "$RESOLVED_USER" -c 'exec "$@"' -- debianrunner-svc "$@"
             fi
         else
-            exec "${CMD_ARGV[@]}"
+            return 1
         fi
+    else
+        if [ "$with_setsid" -eq 1 ] && command -v setsid >/dev/null 2>&1; then
+            exec setsid -w "$@"
+        else
+            exec "$@"
+        fi
+    fi
+}
+
+run_exec_sync() {
+    local raw="$1" scope="$2" unit="$3" logf="$4"
+    local ignore_err=0
+    local trimmed="${raw#"${raw%%[![:space:]]*}"}"
+    while [ -n "$trimmed" ]; do
+        case "${trimmed:0:1}" in
+            -) ignore_err=1; trimmed="${trimmed:1}" ;;
+            @|+|!|:) trimmed="${trimmed:1}" ;;
+            *) break ;;
+        esac
+    done
+    (
+        resolve_unit_identity "$scope" || exit 1
+        apply_unit_environment "$scope" "$unit" || exit 1
+        apply_working_dir "$scope" "$unit" || exit 1
+        prepare_exec_cmd "$raw" "$scope" "$unit" || exit 0
+        exec_with_identity 0 "${CMD_ARGV[@]}"
     ) >> "$logf" 2>&1
     local rc=$?
-    if [ "$rc" -ne 0 ] && [ "$CMD_IGNORE_ERR" -eq 1 ]; then
+    if [ "$rc" -ne 0 ] && [ "$ignore_err" -eq 1 ]; then
         return 0
     fi
     return "$rc"
@@ -662,59 +845,48 @@ run_supervisor() {
     local scope="$1" unit="$2"
     load_unit "$scope" "$unit" || exit 1
 
-    local sdir logd logf
+    local sdir logd logf boot_id sup_start
     sdir="$(unit_state_dir "$scope" "$unit")"
     logd="$(log_dir_for_scope "$scope")"
     logf="$(unit_log_file "$scope" "$unit")"
     mkdir -p "$sdir" "$logd"
+    boot_id="$(current_boot_id)"
+    sup_start="$(pid_starttime "$$" || true)"
+    [ -n "$boot_id" ] && echo "$boot_id" > "$sdir/boot_id"
     echo "$$" > "$sdir/supervisor.pid"
+    [ -n "$sup_start" ] && echo "$sup_start" > "$sdir/supervisor.start"
 
     # Forward termination to stop gracefully
     trap 'touch "$sdir/stop_requested"' TERM INT
 
-    local exec_cmd="${U_EXEC_START[${#U_EXEC_START[@]}-1]}"
-    prepare_exec_cmd "$exec_cmd" "$scope" "$unit" || {
+    if [ "${#U_EXEC_START[@]}" -eq 0 ]; then
         echo "failed" > "$sdir/sub_state"
-        rm -f "$sdir/supervisor.pid"
+        if [ "$(cat "$sdir/supervisor.pid" 2>/dev/null || true)" = "$$" ]; then
+            rm -f "$sdir/supervisor.pid" "$sdir/supervisor.start"
+        fi
         exit 1
-    }
+    fi
+    local exec_cmd="${U_EXEC_START[${#U_EXEC_START[@]}-1]}"
 
     while :; do
         [ -f "$sdir/stop_requested" ] && break
         trim_log_if_large "$logf"
-        printf '%s [%s] Starting: %s\n' "$(log_ts)" "$unit" "${CMD_ARGV[*]}" >> "$logf"
+        printf '%s [%s] Starting: %s\n' "$(log_ts)" "$unit" "$exec_cmd" >> "$logf"
 
         # Spawn service in its own session/process-group so stop kills cleanly
         (
+            resolve_unit_identity "$scope" || exit 1
             apply_unit_environment "$scope" "$unit" || exit 1
             apply_working_dir "$scope" "$unit" || exit 1
-            if [ "$scope" = "system" ] && [ -n "$U_USER" ] && [ "$(current_uid)" -eq 0 ] && [ "$U_USER" != "root" ]; then
-                if command -v setpriv >/dev/null 2>&1; then
-                    u_uid="$(id -u "$U_USER" 2>/dev/null || echo 0)"
-                    u_gid="$(id -g "${U_GROUP:-$U_USER}" 2>/dev/null || echo 0)"
-                    if command -v setsid >/dev/null 2>&1; then
-                        exec setsid -w setpriv --reuid="$u_uid" --regid="$u_gid" --init-groups "${CMD_ARGV[@]}"
-                    else
-                        exec setpriv --reuid="$u_uid" --regid="$u_gid" --init-groups "${CMD_ARGV[@]}"
-                    fi
-                else
-                    if command -v setsid >/dev/null 2>&1; then
-                        exec setsid -w su -s /bin/sh "$U_USER" -c 'exec "$@"' -- debianrunner-svc "${CMD_ARGV[@]}"
-                    else
-                        exec su -s /bin/sh "$U_USER" -c 'exec "$@"' -- debianrunner-svc "${CMD_ARGV[@]}"
-                    fi
-                fi
-            else
-                if command -v setsid >/dev/null 2>&1; then
-                    exec setsid -w "${CMD_ARGV[@]}"
-                else
-                    exec "${CMD_ARGV[@]}"
-                fi
-            fi
+            prepare_exec_cmd "$exec_cmd" "$scope" "$unit" || exit 1
+            exec_with_identity 1 "${CMD_ARGV[@]}"
         ) </dev/null >> "$logf" 2>&1 &
         local child_pid=$!
+        local child_start
+        child_start="$(pid_starttime "$child_pid" || true)"
 
         echo "$child_pid" > "$sdir/main.pid"
+        [ -n "$child_start" ] && echo "$child_start" > "$sdir/main.start" || rm -f "$sdir/main.start"
         utc_systemd_now > "$sdir/active_since"
         date +%s > "$sdir/active_since_mono"
         echo "running" > "$sdir/sub_state"
@@ -722,7 +894,7 @@ run_supervisor() {
         wait "$child_pid"
         local rc=$?
         echo "$rc" > "$sdir/exit_code"
-        rm -f "$sdir/main.pid"
+        rm -f "$sdir/main.pid" "$sdir/main.start"
 
         # Handle Type=forking with PIDFile: wait while forked daemon lives
         if [ "$U_TYPE" = "forking" ] && [ "$rc" -eq 0 ] && [ -n "$U_PIDFILE" ]; then
@@ -730,21 +902,30 @@ run_supervisor() {
             pf="$(expand_specifiers "$U_PIDFILE" "$unit" "$scope")"
             sleep 0.2 2>/dev/null || true
             if [ -s "$pf" ]; then
-                local fpid
-                fpid="$(cat "$pf" 2>/dev/null || true)"
+                local fpid fstart
+                fpid="$(tr -d '[:space:]' < "$pf" 2>/dev/null || true)"
                 if pid_alive "$fpid"; then
+                    fstart="$(pid_starttime "$fpid" || true)"
                     echo "$fpid" > "$sdir/main.pid"
-                    while pid_alive "$fpid" && [ ! -f "$sdir/stop_requested" ]; do
-                        sleep 1
+                    [ -n "$fstart" ] && echo "$fstart" > "$sdir/main.start" || rm -f "$sdir/main.start"
+                    while pid_alive "$fpid" "$boot_id" "$fstart" && [ ! -f "$sdir/stop_requested" ]; do
+                        sleep 1 &
+                        wait $! 2>/dev/null || true
                     done
-                    rm -f "$sdir/main.pid"
+                    rm -f "$sdir/main.pid" "$sdir/main.start"
+                    if [ ! -f "$sdir/stop_requested" ]; then
+                        rc=1
+                        echo "$rc" > "$sdir/exit_code"
+                    fi
                 fi
             fi
         fi
 
         if [ -f "$sdir/stop_requested" ]; then
             printf '%s [%s] Stopped (exit code %d)\n' "$(log_ts)" "$unit" "$rc" >> "$logf"
-            echo "dead" > "$sdir/sub_state"
+            if [ "$(cat "$sdir/supervisor.pid" 2>/dev/null || true)" = "$$" ]; then
+                echo "dead" > "$sdir/sub_state"
+            fi
             break
         fi
 
@@ -753,32 +934,43 @@ run_supervisor() {
         if should_restart_exit "$rc"; then
             echo "auto-restart" > "$sdir/sub_state"
             printf '%s [%s] Scheduling restart in %ss\n' "$(log_ts)" "$unit" "$U_RESTART_SEC" >> "$logf"
-            # Interruptible sleep so systemctl stop exits immediately
+            # Interruptible sleep so systemctl stop/start wakes immediately on SIGTERM
             local secs_int="${U_RESTART_SEC%%.*}"
-            [ -n "$secs_int" ] || secs_int=1
+            case "$secs_int" in ''|*[!0-9]*) secs_int=1 ;; esac
             if [ "$secs_int" -lt 1 ]; then
-                sleep "$U_RESTART_SEC" 2>/dev/null || sleep 1
+                sleep "$U_RESTART_SEC" 2>/dev/null &
+                wait $! 2>/dev/null || true
             else
                 local i=0
                 while [ "$i" -lt "$secs_int" ]; do
                     [ -f "$sdir/stop_requested" ] && break
-                    sleep 1
+                    sleep 1 &
+                    wait $! 2>/dev/null || true
                     i=$((i + 1))
                 done
             fi
-            [ -f "$sdir/stop_requested" ] && { echo "dead" > "$sdir/sub_state"; break; }
+            if [ -f "$sdir/stop_requested" ]; then
+                if [ "$(cat "$sdir/supervisor.pid" 2>/dev/null || true)" = "$$" ]; then
+                    echo "dead" > "$sdir/sub_state"
+                fi
+                break
+            fi
             continue
         fi
 
-        if [ "$rc" -eq 0 ] || code_in_list "$rc" "$U_SUCCESS_EXIT"; then
-            echo "dead" > "$sdir/sub_state"
-        else
-            echo "failed" > "$sdir/sub_state"
+        if [ "$(cat "$sdir/supervisor.pid" 2>/dev/null || true)" = "$$" ]; then
+            if [ "$rc" -eq 0 ] || code_in_list "$rc" "$U_SUCCESS_EXIT"; then
+                echo "dead" > "$sdir/sub_state"
+            else
+                echo "failed" > "$sdir/sub_state"
+            fi
         fi
         break
     done
 
-    rm -f "$sdir/supervisor.pid" "$sdir/main.pid" "$sdir/stop_requested"
+    if [ "$(cat "$sdir/supervisor.pid" 2>/dev/null || true)" = "$$" ]; then
+        rm -f "$sdir/supervisor.pid" "$sdir/supervisor.start" "$sdir/main.pid" "$sdir/main.start" "$sdir/stop_requested"
+    fi
     exit 0
 }
 
@@ -803,7 +995,26 @@ start_unit() {
     logd="$(log_dir_for_scope "$scope")"
     logf="$(unit_log_file "$scope" "$unit")"
     mkdir -p "$sdir" "$logd"
+
+    # Wait for any previous supervisor (e.g. in RestartSec backoff) to exit
+    # completely before clearing stop_requested and launching a replacement.
+    if pid_alive "$ST_SUP_PID" "$ST_BOOT_ID" "$ST_SUP_START"; then
+        touch "$sdir/stop_requested"
+        kill -TERM "$ST_SUP_PID" 2>/dev/null || true
+        local w=0
+        while [ "$w" -lt 25 ] && pid_alive "$ST_SUP_PID" "$ST_BOOT_ID" "$ST_SUP_START"; do
+            sleep 0.1 2>/dev/null || sleep 1
+            w=$((w + 1))
+        done
+        if pid_alive "$ST_SUP_PID" "$ST_BOOT_ID" "$ST_SUP_START"; then
+            kill -KILL "$ST_SUP_PID" 2>/dev/null || true
+        fi
+        rm -f "$sdir/supervisor.pid" "$sdir/supervisor.start" "$sdir/main.pid" "$sdir/main.start"
+    fi
     rm -f "$sdir/stop_requested"
+    local boot_id
+    boot_id="$(current_boot_id)"
+    [ -n "$boot_id" ] && echo "$boot_id" > "$sdir/boot_id"
 
     local cmd
     for cmd in "${U_EXEC_PRE[@]}"; do
@@ -846,13 +1057,8 @@ start_unit() {
         return 0
     fi
 
-    # Stop any leftover stale supervisor before starting fresh
-    if pid_alive "$ST_SUP_PID"; then
-        kill -TERM "$ST_SUP_PID" 2>/dev/null || true
-    fi
-
     echo "start" > "$sdir/sub_state"
-    rm -f "$sdir/main.pid"
+    rm -f "$sdir/main.pid" "$sdir/main.start" "$sdir/exit_code"
 
     # Launch completely detached so caller's stdout/stderr pipes close immediately
     if command -v setsid >/dev/null 2>&1; then
@@ -875,12 +1081,19 @@ start_unit() {
             echo "Job for $unit failed. Check logs with: journalctl $([ "$scope" = "user" ] && echo "--user ")-u $unit -n 50" >&2
             return 1
         fi
+        if [ "$ST_SUB" = "dead" ] && [ -f "$sdir/exit_code" ] && [ "$ST_EXIT" = "0" ]; then
+            for cmd in "${U_EXEC_POST[@]}"; do
+                run_exec_sync "$cmd" "$scope" "$unit" "$logf" || true
+            done
+            return 0
+        fi
         sleep 0.1 2>/dev/null || sleep 1
         i=$((i + 1))
     done
 
     read_unit_status "$scope" "$unit"
-    if [ "$ST_ACTIVE" = "active" ] || [ "$ST_ACTIVE" = "activating" ]; then
+    if [ "$ST_ACTIVE" = "active" ] || [ "$ST_ACTIVE" = "activating" ] ||
+       { [ "$ST_SUB" = "dead" ] && [ -f "$sdir/exit_code" ] && [ "$ST_EXIT" = "0" ]; }; then
         return 0
     fi
     echo "Job for $unit failed to start." >&2
@@ -897,49 +1110,53 @@ stop_unit() {
     mkdir -p "$sdir"
     touch "$sdir/stop_requested"
 
+    read_unit_status "$scope" "$unit"
+    local mpid="$ST_MAIN_PID" spid="$ST_SUP_PID"
+    local b_id="$ST_BOOT_ID" mstart="$ST_MAIN_START" sstart="$ST_SUP_START"
+
     local timeout_sec=15
     if load_unit "$scope" "$unit" 2>/dev/null; then
         timeout_sec="${U_TIMEOUT_STOP%%.*}"
-        [ -n "$timeout_sec" ] && [ "$timeout_sec" -gt 0 ] || timeout_sec=15
+        case "$timeout_sec" in ''|*[!0-9]*) timeout_sec=15 ;; esac
+        [ "$timeout_sec" -gt 0 ] || timeout_sec=15
         [ "$timeout_sec" -gt 30 ] && timeout_sec=30
         local cmd
         for cmd in "${U_EXEC_STOP[@]}"; do
-            run_exec_sync "$cmd" "$scope" "$unit" "$logf" || true
+            MAINPID="${mpid}" run_exec_sync "$cmd" "$scope" "$unit" "$logf" || true
         done
     fi
 
-    read_unit_status "$scope" "$unit"
-    local mpid="$ST_MAIN_PID" spid="$ST_SUP_PID"
-
-    if pid_alive "$mpid"; then
+    if pid_alive "$mpid" "$b_id" "$mstart"; then
         if [ "$U_KILL_MODE" != "process" ]; then
             kill -TERM -- "-$mpid" 2>/dev/null || true
         fi
         kill -TERM "$mpid" 2>/dev/null || true
     fi
-    if pid_alive "$spid"; then
+    if pid_alive "$spid" "$b_id" "$sstart"; then
         kill -TERM "$spid" 2>/dev/null || true
     fi
 
     local loops=$(( timeout_sec * 5 ))
     local i=0
     while [ "$i" -lt "$loops" ]; do
-        if ! pid_alive "$mpid" && ! pid_alive "$spid"; then
+        if ! pid_alive "$mpid" "$b_id" "$mstart" && ! pid_alive "$spid" "$b_id" "$sstart"; then
             break
         fi
         sleep 0.2 2>/dev/null || sleep 1
         i=$((i + 1))
     done
 
-    if pid_alive "$mpid"; then
-        kill -KILL -- "-$mpid" 2>/dev/null || true
+    if pid_alive "$mpid" "$b_id" "$mstart"; then
+        if [ "$U_KILL_MODE" != "process" ]; then
+            kill -KILL -- "-$mpid" 2>/dev/null || true
+        fi
         kill -KILL "$mpid" 2>/dev/null || true
     fi
-    if pid_alive "$spid"; then
+    if pid_alive "$spid" "$b_id" "$sstart"; then
         kill -KILL "$spid" 2>/dev/null || true
     fi
 
-    rm -f "$sdir/main.pid" "$sdir/supervisor.pid" "$sdir/stop_requested"
+    rm -f "$sdir/main.pid" "$sdir/main.start" "$sdir/supervisor.pid" "$sdir/supervisor.start" "$sdir/stop_requested"
     echo "dead" > "$sdir/sub_state"
     return 0
 }
@@ -951,17 +1168,17 @@ reload_unit() {
         echo "Unit $unit could not be found." >&2
         return 5
     fi
+    read_unit_status "$scope" "$unit"
     local logf
     logf="$(unit_log_file "$scope" "$unit")"
     if [ "${#U_EXEC_RELOAD[@]}" -gt 0 ]; then
         local cmd
         for cmd in "${U_EXEC_RELOAD[@]}"; do
-            run_exec_sync "$cmd" "$scope" "$unit" "$logf" || return 1
+            MAINPID="${ST_MAIN_PID}" run_exec_sync "$cmd" "$scope" "$unit" "$logf" || return 1
         done
         return 0
     fi
-    read_unit_status "$scope" "$unit"
-    if pid_alive "$ST_MAIN_PID"; then
+    if pid_alive "$ST_MAIN_PID" "$ST_BOOT_ID" "$ST_MAIN_START"; then
         kill -HUP "$ST_MAIN_PID" 2>/dev/null || true
     fi
     return 0
@@ -1036,6 +1253,7 @@ show_unit_props() {
         props_csv="Id,Description,LoadState,ActiveState,SubState,MainPID,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic,UnitFileState,FragmentPath,ExecMainStatus,Result"
     fi
 
+    case "$ST_SINCE_MONO" in ''|*[!0-9]*) ST_SINCE_MONO="0" ;; esac
     local IFS=',' prop val
     for prop in $props_csv; do
         case "$prop" in
@@ -1095,9 +1313,17 @@ status_unit() {
 
     local logf
     logf="$(unit_log_file "$scope" "$unit")"
-    if [ "$lines" -gt 0 ] && [ -s "$logf" ]; then
-        printf '\n'
-        tail -n "$lines" "$logf"
+    if [ -s "$logf" ]; then
+        if [ "$lines" = "all" ]; then
+            printf '\n'
+            cat "$logf"
+        else
+            case "$lines" in ''|*[!0-9]*) lines=10 ;; esac
+            if [ "$lines" -gt 0 ]; then
+                printf '\n'
+                tail -n "$lines" "$logf"
+            fi
+        fi
     fi
 
     [ "$ST_ACTIVE" = "active" ] && return 0
@@ -1151,16 +1377,35 @@ boot_autostart() {
     mkdir -p /run/debianrunner-systemd/system /var/log/debianrunner-systemd /var/lib/systemd/linger 2>/dev/null || true
     chmod 1777 /run/debianrunner-systemd 2>/dev/null || true
 
-    # 1. Start enabled system services
-    local link u
+    # fakefs /run persists across app launches while guest PIDs restart from 1.
+    # Purge stale PID files whenever /proc/sys/kernel/random/boot_id changes.
+    local cur_boot prev_boot=""
+    cur_boot="$(current_boot_id)"
+    if [ -n "$cur_boot" ]; then
+        prev_boot="$(cat /run/debianrunner-systemd/boot_id 2>/dev/null || true)"
+        if [ "$prev_boot" != "$cur_boot" ]; then
+            local udir
+            for udir in /run/debianrunner-systemd/system/units/* /run/debianrunner-systemd/user-*/units/*; do
+                [ -d "$udir" ] || continue
+                rm -f "$udir/main.pid" "$udir/main.start" "$udir/supervisor.pid" "$udir/supervisor.start" "$udir/stop_requested" 2>/dev/null || true
+                echo "dead" > "$udir/sub_state" 2>/dev/null || true
+            done
+            echo "$cur_boot" > /run/debianrunner-systemd/boot_id 2>/dev/null || true
+        fi
+    fi
+
+    # 1. Start enabled system services (deduplicated across wants directories)
+    local link u seen_sys=" "
     for link in /etc/systemd/system/multi-user.target.wants/*.service /etc/systemd/system/default.target.wants/*.service; do
         [ -e "$link" ] || continue
         u="$(basename "$link")"
+        case "$seen_sys" in *" $u "*) continue ;; esac
+        seen_sys+="$u "
         start_unit "system" "$u" >/dev/null 2>&1 || true
     done
 
     # 2. Start enabled user services for root and regular users
-    local uname _ uid gid _gecos home shell
+    local uname _ uid gid _gecos home shell seen_usr
     while IFS=: read -r uname _ uid gid _gecos home shell; do
         [ -n "$uname" ] || continue
         case "$uid" in *[!0-9]*) continue ;; esac
@@ -1168,9 +1413,12 @@ boot_autostart() {
             continue
         fi
         [ -d "$home/.config/systemd/user" ] || continue
+        seen_usr=" "
         for link in "$home/.config/systemd/user"/default.target.wants/*.service "$home/.config/systemd/user"/multi-user.target.wants/*.service; do
             [ -e "$link" ] || continue
             u="$(basename "$link")"
+            case "$seen_usr" in *" $u "*) continue ;; esac
+            seen_usr+="$u "
             if [ "$uid" -eq 0 ]; then
                 HOME="$home" USER="root" LOGNAME="root" "$SELF_PATH" _systemctl --user start "$u" >/dev/null 2>&1 || true
             else
@@ -1218,8 +1466,10 @@ cmd_systemctl() {
                 ;;
             --no-pager|--no-legend|--no-ask-password|--no-block|--full|-l|--plain|--all|-a|--runtime|--force|-f|--wait|--global)
                 ;;
-            --type=*|--state=*|-t)
-                [ "$1" = "-t" ] && shift
+            --type|--state|-t|-o|--output)
+                [ "$#" -gt 1 ] && shift
+                ;;
+            --type=*|--state=*|--output=*)
                 ;;
             --version)
                 echo "systemd 256 (debianrunner service-manager)"
@@ -1274,14 +1524,17 @@ cmd_systemctl() {
             return 0
             ;;
         start)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             for u in "${units[@]}"; do start_unit "$scope" "$u" || rc=$?; done
             return "$rc"
             ;;
         stop)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             for u in "${units[@]}"; do stop_unit "$scope" "$u" || rc=$?; done
             return "$rc"
             ;;
         restart|reload-or-restart)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             for u in "${units[@]}"; do
                 stop_unit "$scope" "$u" || true
                 start_unit "$scope" "$u" || rc=$?
@@ -1289,6 +1542,7 @@ cmd_systemctl() {
             return "$rc"
             ;;
         try-restart|condrestart|try-reload-or-restart)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             for u in "${units[@]}"; do
                 u="$(normalize_unit "$u")"
                 read_unit_status "$scope" "$u"
@@ -1300,18 +1554,22 @@ cmd_systemctl() {
             return "$rc"
             ;;
         reload)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             for u in "${units[@]}"; do reload_unit "$scope" "$u" || rc=$?; done
             return "$rc"
             ;;
         enable)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             for u in "${units[@]}"; do enable_unit "$scope" "$u" "$now" "$quiet" || rc=$?; done
             return "$rc"
             ;;
         disable)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             for u in "${units[@]}"; do disable_unit "$scope" "$u" "$now" "$quiet" || rc=$?; done
             return "$rc"
             ;;
         is-active)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             rc=0
             for u in "${units[@]}"; do
                 u="$(normalize_unit "$u")"
@@ -1322,6 +1580,7 @@ cmd_systemctl() {
             return "$rc"
             ;;
         is-failed)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             rc=1
             for u in "${units[@]}"; do
                 u="$(normalize_unit "$u")"
@@ -1332,6 +1591,7 @@ cmd_systemctl() {
             return "$rc"
             ;;
         is-enabled)
+            [ "${#units[@]}" -gt 0 ] || { echo "Too few arguments." >&2; return 1; }
             rc=0
             for u in "${units[@]}"; do
                 u="$(normalize_unit "$u")"
@@ -1381,40 +1641,76 @@ cmd_journalctl() {
         case "$1" in
             --user) scope="user" ;;
             --system) scope="system" ;;
+            --user-unit)
+                scope="user"
+                [ "$#" -gt 1 ] && { shift; unit="$1"; }
+                ;;
+            --user-unit=*)
+                scope="user"
+                unit="${1#--user-unit=}"
+                ;;
             -u|--unit)
-                shift
-                [ "$#" -gt 0 ] && unit="$1"
+                [ "$#" -gt 1 ] && { shift; unit="$1"; }
                 ;;
             --unit=*)
                 unit="${1#--unit=}"
                 ;;
-            -u*)
-                unit="${1#-u}"
-                ;;
             -n|--lines)
-                shift
-                [ "$#" -gt 0 ] && lines="$1"
+                [ "$#" -gt 1 ] && { shift; lines="$1"; }
                 ;;
             --lines=*)
                 lines="${1#--lines=}"
-                ;;
-            -n*)
-                lines="${1#-n}"
                 ;;
             -f|--follow) follow=1 ;;
             -r|--reverse) reverse=1 ;;
             --no-pager|-e|-q|--quiet|-a|--all|-x|--catalog|-b|--boot|--utc) ;;
             -o|--output|-S|--since|-U|--until|-p|--priority|-t|--identifier)
-                shift
+                [ "$#" -gt 1 ] && shift
                 ;;
             --output=*|--since=*|--until=*|--priority=*|--identifier=*) ;;
             -h|--help)
                 echo "Usage: journalctl [--user|--system] [-u UNIT] [-n LINES] [-f] [-r]"
                 return 0
                 ;;
+            -[!-]*)
+                # Unpack bundled short flags such as -fu, -xeu, -fn 50
+                local flags="${1#-}" idx=0 flen=${#flags} fc rest
+                while [ "$idx" -lt "$flen" ]; do
+                    fc="${flags:$idx:1}"
+                    rest="${flags:$((idx + 1))}"
+                    case "$fc" in
+                        f) follow=1 ;;
+                        r) reverse=1 ;;
+                        e|q|a|x|b) ;;
+                        u)
+                            if [ -n "$rest" ]; then unit="$rest"; break
+                            elif [ "$#" -gt 1 ]; then shift; unit="$1"; break
+                            fi
+                            ;;
+                        n)
+                            if [ -n "$rest" ]; then lines="$rest"; break
+                            elif [ "$#" -gt 1 ]; then shift; lines="$1"; break
+                            fi
+                            ;;
+                        o|S|U|p|t)
+                            if [ -z "$rest" ] && [ "$#" -gt 1 ]; then shift; fi
+                            break
+                            ;;
+                    esac
+                    idx=$((idx + 1))
+                done
+                ;;
         esac
         shift
     done
+
+    local tail_arg
+    if [ "$lines" = "all" ]; then
+        tail_arg="+1"
+    else
+        case "$lines" in ''|*[!0-9]*) lines=100 ;; esac
+        tail_arg="$lines"
+    fi
 
     local logd
     logd="$(log_dir_for_scope "$scope")"
@@ -1425,16 +1721,16 @@ cmd_journalctl() {
         local logf="$logd/$unit.log"
         if [ "$follow" -eq 1 ]; then
             touch "$logf" 2>/dev/null || true
-            exec tail -n "$lines" -F "$logf"
+            exec tail -n "$tail_arg" -F "$logf"
         fi
         if [ ! -f "$logf" ]; then
             echo "-- No entries --"
             return 0
         fi
         if [ "$reverse" -eq 1 ] && command -v tac >/dev/null 2>&1; then
-            tail -n "$lines" "$logf" | tac
+            tail -n "$tail_arg" "$logf" | tac
         else
-            tail -n "$lines" "$logf"
+            tail -n "$tail_arg" "$logf"
         fi
         return 0
     fi
@@ -1448,13 +1744,32 @@ cmd_journalctl() {
         return 0
     fi
     if [ "$follow" -eq 1 ]; then
-        exec tail -n "$lines" -F "$logd"/*.log
+        exec tail -n "$tail_arg" -F "$logd"/*.log
     fi
-    tail -n "$lines" "$logd"/*.log
+    tail -n "$tail_arg" "$logd"/*.log
+}
+
+resolve_linger_username() {
+    local target="$1"
+    if [ -r /etc/passwd ]; then
+        case "$target" in
+            *[!0-9]*)
+                printf '%s' "$target"
+                ;;
+            *)
+                local resolved
+                resolved="$(awk -F: -v u="$target" '$3==u {print $1; exit}' /etc/passwd 2>/dev/null || true)"
+                printf '%s' "${resolved:-$target}"
+                ;;
+        esac
+    else
+        printf '%s' "$target"
+    fi
 }
 
 linger_dir_for_user() {
-    local target="$1"
+    local target
+    target="$(resolve_linger_username "$1")"
     if [ "$target" = "$(current_user)" ] && [ -n "${XDG_STATE_HOME:-}" ]; then
         printf '%s/debianrunner-systemd' "$XDG_STATE_HOME"
     else
@@ -1466,7 +1781,8 @@ linger_dir_for_user() {
 }
 
 linger_state_for_user() {
-    local target="$1"
+    local target
+    target="$(resolve_linger_username "$1")"
     local ldir
     ldir="$(linger_dir_for_user "$target")"
     if [ -f "$ldir/linger" ] || [ -f "/var/lib/systemd/linger/$target" ]; then
@@ -1501,20 +1817,31 @@ cmd_loginctl() {
     done
 
     local sub="${pos[0]:-list-users}"
-    local target="${pos[1]:-$(current_user)}"
+    local target
+    target="$(resolve_linger_username "${pos[1]:-$(current_user)}")"
     local ldir
     ldir="$(linger_dir_for_user "$target")"
 
     case "$sub" in
         enable-linger)
-            mkdir -p "$ldir" 2>/dev/null || true
-            touch "$ldir/linger" 2>/dev/null || true
-            mkdir -p /var/lib/systemd/linger 2>/dev/null || true
-            touch "/var/lib/systemd/linger/$target" 2>/dev/null || true
-            return 0
+            if [ "$(current_uid)" -eq 0 ] && [ "$target" != "root" ]; then
+                mkdir -p /var/lib/systemd/linger 2>/dev/null || true
+                touch "/var/lib/systemd/linger/$target" || return 1
+            else
+                mkdir -p "$ldir" 2>/dev/null || true
+                touch "$ldir/linger" 2>/dev/null || true
+                mkdir -p /var/lib/systemd/linger 2>/dev/null || true
+                touch "/var/lib/systemd/linger/$target" 2>/dev/null || true
+            fi
+            [ "$(linger_state_for_user "$target")" = "yes" ]
+            return $?
             ;;
         disable-linger)
             rm -f "$ldir/linger" "/var/lib/systemd/linger/$target" 2>/dev/null || true
+            if [ "$(linger_state_for_user "$target")" = "yes" ]; then
+                echo "Failed to disable linger for $target: permission denied" >&2
+                return 1
+            fi
             return 0
             ;;
         show-user)

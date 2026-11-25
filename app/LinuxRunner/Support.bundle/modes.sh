@@ -10,11 +10,36 @@ state=/run/linuxrunner-modes
 mkdir -p "$state" && chmod 700 "$state"
 ssh_port=2222
 
+current_boot_id() {
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
+}
+
+boot_id_matches() {
+    cur=$(current_boot_id)
+    [ -n "$cur" ] || return 0
+    saved=$(cat "$state/$1.boot_id" 2>/dev/null || true)
+    [ -n "$saved" ] && [ "$saved" = "$cur" ]
+}
+
 alive_pid() {
-    [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null
+    p=${1:-}
+    [ -n "$p" ] || return 1
+    case "$p" in *[!0-9]*) return 1 ;; esac
+    [ "$p" -gt 1 ] 2>/dev/null || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    if [ -r /proc/self/stat ]; then
+        st=$(awk '{sub(/^.*\) /, ""); print $1}' "/proc/$p/stat" 2>/dev/null || true)
+        [ -n "$st" ] && [ "$st" != "Z" ] && [ "$st" != "X" ] || return 1
+        if [ -r "/proc/$p/comm" ]; then
+            comm=$(cat "/proc/$p/comm" 2>/dev/null || true)
+            [ "$comm" = "sshd" ] || return 1
+        fi
+    fi
+    return 0
 }
 
 alive() {
+    boot_id_matches "$1" || return 1
     [ -s "$state/$1.pid" ] && alive_pid "$(cat "$state/$1.pid" 2>/dev/null)"
 }
 
@@ -36,16 +61,18 @@ wait_pid_exit() {
 }
 
 stop_ssh() {
-    for pf in "$state/ssh.pid" "$state/sshd.pid"; do
-        if [ -s "$pf" ]; then
-            pid=$(cat "$pf" 2>/dev/null || true)
-            if alive_pid "$pid"; then
-                kill -TERM "$pid" 2>/dev/null || true
-                wait_pid_exit "$pid"
+    if boot_id_matches ssh; then
+        for pf in "$state/ssh.pid" "$state/sshd.pid"; do
+            if [ -s "$pf" ]; then
+                pid=$(cat "$pf" 2>/dev/null || true)
+                if alive_pid "$pid"; then
+                    kill -TERM "$pid" 2>/dev/null || true
+                    wait_pid_exit "$pid"
+                fi
             fi
-        fi
-        rm -f "$pf"
-    done
+        done
+    fi
+    rm -f "$state/ssh.pid" "$state/sshd.pid" "$state/ssh.boot_id"
     echo "MODES: ssh=stopped"
 }
 
@@ -90,10 +117,11 @@ start_ssh() {
         -o PidFile="$state/sshd.pid" \
         > "$state/ssh.log" 2>&1 < /dev/null &
     echo $! > "$state/ssh.pid"
+    current_boot_id > "$state/ssh.boot_id"
     i=0
     while [ "$i" -lt 4 ]; do
         sleep 0.5 2>/dev/null || sleep 1
-        alive ssh || { echo 'MODES: ssh=FAIL reason=sshd-exited'; tail -n 10 "$state/ssh.log" 2>/dev/null; rm -f "$state/ssh.pid"; return 1; }
+        alive ssh || { echo 'MODES: ssh=FAIL reason=sshd-exited'; tail -n 10 "$state/ssh.log" 2>/dev/null; rm -f "$state/ssh.pid" "$state/ssh.boot_id"; return 1; }
         i=$((i + 1))
     done
     echo "MODES: ssh=PASS port=$ssh_port permit_root=$permit_root"

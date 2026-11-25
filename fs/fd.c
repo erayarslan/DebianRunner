@@ -153,7 +153,7 @@ const char *host_nofile_describe(char *buf, size_t size) {
 // read the file (JIT build IDs, crash symbolization) reopen it on demand and
 // verify dev/ino. memfd mappings keep the original description (their
 // reopen/seal semantics live on it).
-struct mapping_identity { struct mount *mount; char *relpath; char *path; dev_t dev; ino_t ino; bool have_stat; };
+struct mapping_identity { struct mount *mount; char *relpath; char *path; dev_t dev; ino_t ino; off_t size; int64_t mtime_ns; bool have_stat; };
 static int mapping_identity_close(struct fd *fd) {
     struct mapping_identity *identity = fd->data;
     if (identity) {
@@ -203,7 +203,17 @@ struct fd *fd_mapping_identity(struct fd *source) {
         }
     }
     struct stat st;
-    if (fstat(source->real_fd, &st) == 0) { identity->dev = st.st_dev; identity->ino = st.st_ino; identity->have_stat = true; }
+    if (fstat(source->real_fd, &st) == 0) {
+        identity->dev = st.st_dev;
+        identity->ino = st.st_ino;
+        identity->size = st.st_size;
+#ifdef __APPLE__
+        identity->mtime_ns = (int64_t) st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+#else
+        identity->mtime_ns = (int64_t) st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+        identity->have_stat = true;
+    }
     struct fd *fd = fd_create_at(&mapping_identity_fdops, "mapping_identity");
     if (fd == NULL) { free(identity->relpath); free(identity->path); free(identity); return fd_retain(source); }
     mount_retain(source->mount);
@@ -222,10 +232,13 @@ int fd_mapping_identity_path(struct fd *fd, char *buf) {
     strcpy(buf, identity->path);
     return 0;
 }
-bool fd_mapping_identity_stat(struct fd *fd, dev_t *dev, ino_t *ino) {
+bool fd_mapping_identity_stat(struct fd *fd, dev_t *dev, ino_t *ino, off_t *size, int64_t *mtime_ns) {
     struct mapping_identity *identity = fd->data;
     if (!identity || !identity->have_stat) return false;
-    *dev = identity->dev; *ino = identity->ino;
+    *dev = identity->dev;
+    *ino = identity->ino;
+    if (size) *size = identity->size;
+    if (mtime_ns) *mtime_ns = identity->mtime_ns;
     return true;
 }
 

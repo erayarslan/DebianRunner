@@ -292,6 +292,17 @@ static NSString *LRTerminalBackground(NSString *hex) {
         if (_terminal.loaded) {
             [self installTerminalView];
             [self _updateStyle];
+        } else {
+            [self stopSelectionAutoScroll];
+            [self stopAltScrollMomentum];
+            self.selectionActive = NO;
+            self.draggingSelection = NO;
+            self.draggingHandle = NO;
+            self.selectedText = nil;
+            self.selectedLinkURL = nil;
+            self.startSelectionHandle.hidden = YES;
+            self.endSelectionHandle.hidden = YES;
+            [self dismissSelectionMenu];
         }
     }
 }
@@ -525,6 +536,10 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         CGFloat newOffset = [state[@"scrollTop"] doubleValue];
         if (isfinite(cellHeight) && cellHeight > 1.0) self.terminalCellHeight = cellHeight;
         if (isfinite(cellWidth) && cellWidth > 1.0) self.terminalCellWidth = cellWidth;
+        if (isfinite(cellWidth) && cellWidth > 1.0 && isfinite(cellHeight) && cellHeight > 1.0) {
+            double sensitivity = 0.5;
+            self.floatingCursorSensitivity = CGSizeMake(cellWidth / sensitivity, cellHeight / sensitivity);
+        }
         self.terminalCols = [state[@"cols"] integerValue];
         self.terminalRows = [state[@"rows"] integerValue];
         NSInteger baseY = MAX(0, [state[@"baseY"] integerValue]);
@@ -550,6 +565,8 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         if (!userScrolling && !altScreen) {
             CGFloat maxOffset = MAX(0, self.scrollbarView.contentSize.height - viewH);
             BOOL jsAtBottom = (viewportY >= baseY);
+            if (self.draggingSelection)
+                self.pinnedToBottom = jsAtBottom;
             CGFloat desired = jsAtBottom || self.pinnedToBottom
                 ? maxOffset
                 : (self.terminalCellHeight > 1.0 ? MIN(viewportY * self.terminalCellHeight, maxOffset) : MIN(MAX(0, newOffset), maxOffset));
@@ -809,15 +826,22 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
     [self.terminal sendInput:data];
 }
 
-- (void)insertControlChar:(char)ch {
-    if (strchr(controlKeys, ch) != NULL) {
-        if (ch == ' ') ch = '\0';
-        if (ch == '2') ch = '@';
-        if (ch == '6') ch = '^';
-        if (ch != '\0')
-            ch = toupper(ch) ^ 0x40;
+- (void)insertControlChar:(unichar)ch {
+    if (ch == 0 || ch > 0x7f)
+        return;
+    char c = (char) ch;
+    if (c >= 'A' && c <= 'Z')
+        c = (char) tolower((unsigned char) c);
+    if (c == '-')
+        c = '_';
+    if (strchr(controlKeys, c) != NULL) {
+        if (c == ' ') c = '\0';
+        if (c == '2') c = '@';
+        if (c == '6') c = '^';
+        if (c != '\0')
+            c = (char)(toupper((unsigned char) c) ^ 0x40);
         [self scrollToBottomForUserInput];
-        [self.terminal sendInput:[NSData dataWithBytes:&ch length:1]];
+        [self.terminal sendInput:[NSData dataWithBytes:&c length:1]];
     }
 }
 
@@ -832,14 +856,20 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         self.controlKey.selected = NO;
         self.controlKey.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
     }
-    if (self.altKey.selected) {
+    BOOL hadAlt = self.altKey.selected;
+    if (hadAlt) {
         self.altKey.selected = NO;
         self.altKey.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
         [self.altKey sendActionsForControlEvents:UIControlEventValueChanged];
     }
     [self scrollToBottomForUserInput];
-    static const uint8_t del = 0x7f;
-    [self.terminal sendInput:[NSData dataWithBytes:&del length:1]];
+    if (hadAlt) {
+        static const uint8_t altDel[2] = {0x1b, 0x7f};
+        [self.terminal sendInput:[NSData dataWithBytes:altDel length:sizeof(altDel)]];
+    } else {
+        static const uint8_t del = 0x7f;
+        [self.terminal sendInput:[NSData dataWithBytes:&del length:1]];
+    }
 }
 
 - (BOOL)hasText {
@@ -897,11 +927,16 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
     if (self.selectionActive) {
         [self clearTerminalSelection];
     }
+#endif
+    NSString *normalized = [[string stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\r"]
+        stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
+#if USE_XTERM_RENDERER
     if (self.terminal.bracketedPaste) {
-        // Strip embedded bracketed-paste end marker to prevent escape injection.
-        NSString *safe = [string stringByReplacingOccurrencesOfString:@"\x1b[201~" withString:@""];
-        safe = [safe stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\r"];
-        safe = [safe stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
+        // Strip embedded bracketed-paste end markers iteratively to prevent escape injection.
+        NSString *safe = normalized;
+        while ([safe containsString:@"\x1b[201~"]) {
+            safe = [safe stringByReplacingOccurrencesOfString:@"\x1b[201~" withString:@""];
+        }
         NSString *wrapped = [NSString stringWithFormat:@"\x1b[200~%@\x1b[201~", safe];
         NSData *data = [wrapped dataUsingEncoding:NSUTF8StringEncoding];
         [self scrollToBottomForUserInput];
@@ -910,7 +945,10 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
         return;
     }
 #endif
-    [self insertText:string];
+    NSData *data = [normalized dataUsingEncoding:NSUTF8StringEncoding];
+    [self scrollToBottomForUserInput];
+    if (data)
+        [self.terminal sendInput:data];
 }
 
 - (void)copy:(id)sender {
@@ -1452,7 +1490,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
 }
 
 static const char *alphabet = "abcdefghijklmnopqrstuvwxyz";
-static const char *controlKeys = "abcdefghijklmnopqrstuvwxyz@^26-=[]\\ ";
+static const char *controlKeys = "abcdefghijklmnopqrstuvwxyz@^26-_[]\\ ";
 static const char *metaKeys = "abcdefghijklmnopqrstuvwxyz0123456789-=[]\\;',./";
 
 - (NSArray<UIKeyCommand *> *)keyCommands {

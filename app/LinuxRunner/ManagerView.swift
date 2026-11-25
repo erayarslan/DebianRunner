@@ -756,7 +756,7 @@ private struct SnapshotsView: View {
     @State private var runningRestoreTarget: EnvironmentSnapshot?
     @State private var wipeScheduledAlert = false
 
-    private var busy: Bool { creating || restoring != nil || manager.busy }
+    private var busy: Bool { creating || restoring != nil || manager.busy || LRRuntimeBridge.isSnapshotOperationActive() }
     private var hasEnvironment: Bool { !manager.environments.isEmpty }
     private var canRestoreNow: Bool { !LRRuntimeBridge.isRunning() && LRRuntimeBridge.canStartRuntime() }
 
@@ -1023,8 +1023,12 @@ private struct SnapshotsView: View {
             manager.environments = [env]
             try? manager.persist()
             LRRuntimeBridge.setNextRootName(rootName)
-            _ = LRRuntimeBridge.startRuntime()
+            let startResult = LRRuntimeBridge.startRuntime()
             manager.refresh()
+            if startResult < 0 {
+                error = "Snapshot restored, but Debian failed to start (code \(startResult)). Reopen DebianRunner to try again."
+                return
+            }
             onRestored?()
         })
     }

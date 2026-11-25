@@ -113,11 +113,10 @@ void arm64_eager_prechain_set_enabled_from_env(const char *env) {
 }
 
 void arm64_eager_prechain_incoming_set_enabled_from_env(const char *env) {
-    // Incoming prechain is default-on again after hardening: only still-fake
-    // slots are patched, and older-block incoming patching is skipped while
-    // multiple guest threads are active. Keep ISH_ARM64_EAGER_PRECHAIN_INCOMING=0
-    // as an explicit diagnostic/safety opt-out.
-    arm64_eager_prechain_incoming_enabled = env_enabled_default(env, true);
+    // Incoming prechain stays default-off because mutating published source
+    // blocks races with sibling threads re-entering via per-thread block_cache.
+    // Keep ISH_ARM64_EAGER_PRECHAIN_INCOMING=1 as an explicit opt-in.
+    arm64_eager_prechain_incoming_enabled = env_enabled_default(env, false);
 }
 
 void arm64_block_stats_dump_if_enabled(void) {
@@ -1534,7 +1533,9 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         // return so task_run_current releases it and yields to the writer.
         if (interrupt == INT_NONE) {
             struct mem *mem = (struct mem *)((char *)tlb->mmu - offsetof(struct mem, mmu));
-            if (atomic_load_explicit(&mem->lock.writers_waiting, memory_order_relaxed) > 0)
+            if (atomic_load_explicit(&mem->lock.writers_waiting, memory_order_relaxed) > 0 ||
+                    atomic_load_explicit(&asbestos->collecting, memory_order_acquire) ||
+                    atomic_load_explicit(&asbestos->jetsam_lock.writers_waiting, memory_order_relaxed) > 0)
                 interrupt = INT_TIMER;
         }
     }

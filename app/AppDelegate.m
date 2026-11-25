@@ -43,7 +43,7 @@
 #include "DebugServer.h"
 #endif
 #include "kernel/native_offload.h"
-#ifdef ISH_AOT_BOOTSTRAP
+#if defined(ISH_AOT_BOOTSTRAP) || defined(ISH_JIT)
 #include "asbestos/guest-arm64/jit.h"
 #include "platform/native_fault.h"
 #endif
@@ -114,6 +114,10 @@ static int bootError;
 
 - (int)boot {
 #if !ISH_LINUX
+#if defined(ISH_JIT) && !defined(ISH_AOT_BOOTSTRAP)
+    if (ish_app_native_fault_install() != 0)
+        NSLog(@"WARNING: failed to install native JIT fault recovery handler");
+#endif
 #ifdef ISH_AOT_BOOTSTRAP
 #if !defined(ISH_JIT) || !defined(ISH_JIT_NO_EMIT)
 #error AOT bootstrap requires matching native/no-emitter definitions

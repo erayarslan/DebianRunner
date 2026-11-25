@@ -14,7 +14,7 @@
     },
     {
       "name": "debian-support.sh",
-      "sha256": "efded5fb3b9c6e8b47e278711803f1f7a8f9acbf732799e393c7862b5a4c36a4",
+      "sha256": "7f919b79a0587e2a46980fb10ca536d379eb2f8998055a57ef71ee9a8dfb08e3",
       "mode": "0755"
     },
     {
@@ -24,22 +24,22 @@
     },
     {
       "name": "modes.sh",
-      "sha256": "36e696f87ae6cd5a98f9c9410aabaf082b36bacb7d08b388d39cf949908b21a9",
+      "sha256": "ae512baba608f28de8e64bc69400a48ffbac80e5bee7c6e381c77a4296de256e",
       "mode": "0755"
     },
     {
       "name": "package-lock.sh",
-      "sha256": "6650f484c57c1b3b56921956ded2fa9157ab32091dc3aebee65a059d88f6ef2e",
+      "sha256": "b781c5e8f2c3588538107f8dec14861e531071c9253efa79d8cbf57895f36f0a",
       "mode": "0755"
     },
     {
       "name": "package-manager.sh",
-      "sha256": "9d32271865fad74e8eef833a47f637a45a81f21f8386136674dd49828c4039c6",
+      "sha256": "ca22a70f8371c23849609ac59bb96af962e92dcae1bac288d07a2f020968a741",
       "mode": "0755"
     },
     {
       "name": "service-manager.sh",
-      "sha256": "513b1b6c3c387a16bf179b33c93ef6c8cef391ca09bde2257f3af0de5ea0cff3",
+      "sha256": "8ff945dd16bef4aeb9a5a98bb03c45a5272069946fcd6fbd446f52c82987527f",
       "mode": "0755"
     },
     {

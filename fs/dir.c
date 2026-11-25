@@ -64,19 +64,23 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
 #if DENTS_DEBUG
     fprintf(stderr, "getdents: fd=%d dirents=%#x count=%d\n", f, dirents, count);
 #endif
-    struct fd *fd = f_get(f);
+    struct fd *fd = f_get_retain(f);
     if (fd == NULL) {
 #if DENTS_DEBUG
         fprintf(stderr, "getdents: fd %d -> EBADF\n", f);
 #endif
         return _EBADF;
     }
-    if (fd_is_path_only(fd)) return _EBADF;
+    if (fd_is_path_only(fd)) {
+        fd_close(fd);
+        return _EBADF;
+    }
     if (!S_ISDIR(fd->type) || fd->ops->readdir == NULL) {
 #if DENTS_DEBUG
         fprintf(stderr, "getdents: fd %d type=%#x readdir=%p -> ENOTDIR\n", f, fd->type,
                 fd->ops ? (void *)fd->ops->readdir : NULL);
 #endif
+        fd_close(fd);
         return _ENOTDIR;
     }
 
@@ -86,16 +90,25 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
     // user_write (and mem->lock / TLB lookup) per directory entry.
     char chunk[4096];
     size_t chunk_len = 0;
+    size_t written_total = 0;
+    long chunk_start_ptr = 0;
 
-    long ptr;
+    long ptr = fd_telldir(fd);
     int err;
     int printed = 0;
     while (true) {
         ptr = fd_telldir(fd);
         struct dir_entry entry = {0};
         err = fd->ops->readdir(fd, &entry);
-        if (err < 0)
+        if (err < 0) {
+            if (written_total > 0) {
+                fd_seekdir(fd, chunk_len > 0 ? chunk_start_ptr : ptr);
+                fd_close(fd);
+                return (int_t)written_total;
+            }
+            fd_close(fd);
             return err;
+        }
         if (err == 0)
             break;
 
@@ -114,11 +127,17 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
         if (reclen > count)
             break;
         if (chunk_len + reclen > sizeof(chunk)) {
-            if (user_write(dirents, chunk, chunk_len))
-                return _EFAULT;
+            if (user_write(dirents, chunk, chunk_len)) {
+                fd_seekdir(fd, chunk_start_ptr);
+                fd_close(fd);
+                return written_total > 0 ? (int_t)written_total : _EFAULT;
+            }
             dirents += chunk_len;
+            written_total += chunk_len;
             chunk_len = 0;
         }
+        if (chunk_len == 0)
+            chunk_start_ptr = ptr;
 #if DENTS_DEBUG
         fprintf(stderr, "getdents: returning entry: name='%s' inode=%lu off=%lu reclen=%zu at addr=%#llx\n",
                 name, (unsigned long)inode, (unsigned long)offset, reclen, (unsigned long long)(dirents + chunk_len));
@@ -129,11 +148,16 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
     }
 
     if (chunk_len > 0) {
-        if (user_write(dirents, chunk, chunk_len))
-            return _EFAULT;
+        if (user_write(dirents, chunk, chunk_len)) {
+            fd_seekdir(fd, chunk_start_ptr);
+            fd_close(fd);
+            return written_total > 0 ? (int_t)written_total : _EFAULT;
+        }
+        written_total += chunk_len;
     }
 
     fd_seekdir(fd, ptr);
+    fd_close(fd);
 #if DENTS_DEBUG
     fprintf(stderr, "getdents: returning %d bytes\n", orig_count - count);
 #endif

@@ -3038,7 +3038,6 @@
 				GCC_PREPROCESSOR_DEFINITIONS = "$(inherited) ISH_FILE_PROVIDER=1";
 				INFOPLIST_FILE = app/FileProvider/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 1.1.2;
 				OTHER_LDFLAGS = "-lsqlite3 -framework FileProvider -framework MobileCoreServices";
 				PRODUCT_APP_GROUP_IDENTIFIER = "group.$(ROOT_BUNDLE_IDENTIFIER)";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(ROOT_BUNDLE_IDENTIFIER).FileProvider";
@@ -3123,7 +3122,6 @@
 				GCC_PREPROCESSOR_DEFINITIONS = "$(inherited) ISH_FILE_PROVIDER=1";
 				INFOPLIST_FILE = app/FileProvider/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 1.1.2;
 				OTHER_LDFLAGS = "-lsqlite3 -framework FileProvider -framework MobileCoreServices";
 				PRODUCT_APP_GROUP_IDENTIFIER = "group.$(ROOT_BUNDLE_IDENTIFIER)";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(ROOT_BUNDLE_IDENTIFIER).FileProvider";
@@ -3143,7 +3141,6 @@
 				GCC_PREPROCESSOR_DEFINITIONS = "$(inherited) ISH_FILE_PROVIDER=1";
 				INFOPLIST_FILE = app/FileProvider/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 1.1.2;
 				OTHER_LDFLAGS = "-lsqlite3 -framework FileProvider -framework MobileCoreServices";
 				PRODUCT_APP_GROUP_IDENTIFIER = "group.$(ROOT_BUNDLE_IDENTIFIER)";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(ROOT_BUNDLE_IDENTIFIER).FileProvider";
@@ -3309,7 +3306,6 @@
 				GCC_PREPROCESSOR_DEFINITIONS = "$(inherited) ISH_FILE_PROVIDER=1";
 				INFOPLIST_FILE = app/FileProvider/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 1.1.2;
 				OTHER_LDFLAGS = "-lsqlite3 -framework FileProvider -framework MobileCoreServices";
 				PRODUCT_APP_GROUP_IDENTIFIER = "group.$(ROOT_BUNDLE_IDENTIFIER)";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(ROOT_BUNDLE_IDENTIFIER).FileProvider";

@@ -72,6 +72,18 @@ void inode_check_orphaned(struct mount *mount, ino_t ino) {
     }
 }
 
+bool inode_check_alive_and_mark_orphan(struct mount *mount, ino_t ino) {
+    lock(&inodes_lock);
+    struct inode_data *inode = inode_get_data(mount, ino);
+    if (inode != NULL) {
+        inode->orphan_pending = true;
+        unlock(&inodes_lock);
+        return true;
+    }
+    unlock(&inodes_lock);
+    return false;
+}
+
 void inode_retain(struct inode_data *inode) {
     lock(&inode->lock);
     inode->refcount++;

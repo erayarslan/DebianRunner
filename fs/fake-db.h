@@ -28,6 +28,8 @@ struct fakefs_db {
     // Read transactions open lazily (only when a query misses the caches),
     // and metadata lookups are cached until any write statement runs.
     bool read_pending, in_txn;
+    bool last_exec_ok;
+    int write_pre_changes;
     uint64_t generation;
     struct fakefs_path_cache_entry *path_cache;
     struct fakefs_inode_cache_entry *inode_cache;
@@ -35,7 +37,7 @@ struct fakefs_db {
     // Other processes (the FileProvider extension) may write the same
     // database: any change of meta.db or its WAL invalidates the caches.
     char *db_path;
-    int db_fd, wal_fd;
+    int db_fd;
     struct { int64_t db_size, db_mtime, wal_size, wal_mtime; } file_token;
     // WAL-index (-shm) header, mapped read-only: its change counter, last
     // frame and salts move with every commit by any connection.

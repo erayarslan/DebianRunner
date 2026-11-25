@@ -2,9 +2,11 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <archive.h>
 #include <archive_entry.h>
 #include "platform/guest_file_caps.h"
@@ -22,10 +24,11 @@
 
 // I have a weird way of error handling
 #define FILL_ERR(_type, _code, _message) do { \
+    const char *_msg = (_message); \
     err_out->line = __LINE__; \
     err_out->type = _type; \
     err_out->code = _code; \
-    err_out->message = strdup(_message); \
+    err_out->message = strdup(_msg ? _msg : "unknown error"); \
     return false; \
 } while (0)
 #define ARCHIVE_ERR(archive) FILL_ERR(ERR_ARCHIVE, archive_errno(archive), archive_error_string(archive))
@@ -220,6 +223,28 @@ static bool fakefs_import_contents(const char *archive_path, int archive_fd, con
         if (strcmp(entry_path, "") == 0)
             archive_has_root = true;
 
+        // mkdir -p parent directories before hardlink or node creation
+        char parent_buf[MAX_PATH];
+        snprintf(parent_buf, sizeof(parent_buf), "%s", entry_path);
+        char *slash = parent_buf;
+        while ((slash = strchr(*slash ? slash + 1 : slash, '/')) != NULL) {
+            *slash = '\0';
+            int merr = mkdirat(root_fd, fix_path(parent_buf), 0777);
+            if (merr == 0) {
+                struct ish_stat dir_stat = {.mode = S_IFDIR | 0755};
+                sqlite3_bind_blob64(insert_stat, 1, &dir_stat, sizeof(dir_stat), SQLITE_TRANSIENT);
+                STEP_RESET(insert_stat);
+                sqlite3_bind_blob64(insert_path, 1, parent_buf, strlen(parent_buf), SQLITE_TRANSIENT);
+                sqlite3_bind_int64(insert_path, 2, sqlite3_last_insert_rowid(db));
+                STEP_RESET(insert_path);
+                *slash = '/';
+                continue;
+            }
+            *slash = '/';
+            if (errno == EEXIST) continue;
+            POSIX_ERR();
+        }
+
         const char *hardlink = archive_entry_hardlink(entry);
         if (hardlink) {
             char hardlink_path[MAX_PATH];
@@ -237,28 +262,6 @@ static bool fakefs_import_contents(const char *archive_path, int archive_fd, con
             STEP_RESET(insert_hardlink);
             continue;
         }
-
-        // mkdir -p
-        char *entry_path_copy = strdup(entry_path);
-        char *slash = entry_path_copy;
-        while ((slash = strchr(*slash ? slash + 1 : slash, '/')) != NULL) {
-            *slash = '\0';
-            int merr = mkdirat(root_fd, fix_path(entry_path_copy), 0777);
-            if (merr == 0) {
-                struct ish_stat dir_stat = {.mode = S_IFDIR | 0755};
-                sqlite3_bind_blob64(insert_stat, 1, &dir_stat, sizeof(dir_stat), SQLITE_TRANSIENT);
-                STEP_RESET(insert_stat);
-                sqlite3_bind_blob64(insert_path, 1, entry_path_copy, strlen(entry_path_copy), SQLITE_TRANSIENT);
-                sqlite3_bind_int64(insert_path, 2, sqlite3_last_insert_rowid(db));
-                STEP_RESET(insert_path);
-                *slash = '/';
-                continue;
-            }
-            *slash = '/';
-            if (errno == EEXIST) continue;
-            POSIX_ERR();
-        }
-        free(entry_path_copy);
 
         int fd = -1;
         // first, create node
@@ -372,6 +375,10 @@ static bool fakefs_import_contents(const char *archive_path, int archive_fd, con
         STEP_RESET(insert_path);
     }
 
+    // Clean up any orphaned stats rows left by implicit parent dirs that were
+    // subsequently replaced by explicit archive directory entries.
+    EXEC("delete from stats where not exists (select 1 from paths where inode = stats.inode)");
+
     FINALIZE(insert_stat);
     FINALIZE(insert_path);
     FINALIZE(insert_hardlink);
@@ -408,13 +415,27 @@ bool fakefs_import(const char *archive_path, const char *fs, struct fakefsify_er
 }
 
 
-bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_error *err_out, struct progress p) {
+struct export_resources {
+    struct archive *archive;
+    struct archive_entry_linkresolver *linkresolver;
+    struct archive_entry *entry;
+    struct archive_entry *sparse;
+    char *path;
+    sqlite3 *db;
+    int root_fd;
+    int entry_fd;
+};
+
+static bool fakefs_export_contents(const char *fs, const char *archive_path, struct fakefsify_error *err_out, struct progress p, struct export_resources *res) {
     // open the archive
     struct archive *archive = archive_write_new();
     if (archive == NULL)
+        FILL_ERR(ERR_POSIX, ENOMEM, "failed to allocate archive writer");
+    res->archive = archive;
+    if (archive_write_add_filter_gzip(archive) != ARCHIVE_OK)
         ARCHIVE_ERR(archive);
-    archive_write_add_filter_gzip(archive);
-    archive_write_set_format_pax(archive);
+    if (archive_write_set_format_pax(archive) != ARCHIVE_OK)
+        ARCHIVE_ERR(archive);
     if (archive_write_open_filename(archive, archive_path) != ARCHIVE_OK)
         ARCHIVE_ERR(archive);
 
@@ -424,11 +445,13 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
     int root_fd = open(path_tmp, O_RDONLY);
     if (root_fd < 0)
         POSIX_ERR();
+    res->root_fd = root_fd;
 
     // open the database
     snprintf(path_tmp, sizeof(path_tmp), "%s/meta.db", fs);
-    sqlite3 *db;
+    sqlite3 *db = NULL;
     int err = sqlite3_open_v2(path_tmp, &db, SQLITE_OPEN_READONLY, NULL);
+    res->db = db;
     CHECK_ERR();
     sqlite3_busy_timeout(db, 5000);
     EXEC("begin");
@@ -440,15 +463,24 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
     int64_t paths_done = 0;
 
     struct archive_entry_linkresolver *linkresolver = archive_entry_linkresolver_new();
+    if (linkresolver == NULL)
+        FILL_ERR(ERR_POSIX, ENOMEM, "failed to allocate archive linkresolver");
+    res->linkresolver = linkresolver;
     archive_entry_linkresolver_set_strategy(linkresolver, ARCHIVE_FORMAT_TAR_PAX_INTERCHANGE);
 
     sqlite3_stmt *query = PREPARE("select path, inode, stat from paths, stats using (inode)");
     while (STEP(query)) {
         struct archive_entry *entry = archive_entry_new();
+        if (entry == NULL)
+            FILL_ERR(ERR_POSIX, ENOMEM, "failed to allocate archive entry");
+        res->entry = entry;
 
         const char *path_in_db = sqlite3_column_blob(query, 0);
         size_t path_len = sqlite3_column_bytes(query, 0);
         char *path = malloc(path_len + 2);
+        if (path == NULL)
+            FILL_ERR(ERR_POSIX, ENOMEM, "out of memory");
+        res->path = path;
         path[0] = '.';
         memcpy(path + 1, path_in_db, path_len);
         path[path_len + 1] = '\0';
@@ -467,26 +499,29 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
         int fd = -1;
         struct stat real_stat;
         if (S_ISREG(stat.mode) || S_ISLNK(stat.mode)) {
-            fd = openat(root_fd, path, O_RDONLY);
+            fd = openat(root_fd, path, O_RDONLY | O_NOFOLLOW);
             if (fd < 0) {
-                if (errno == ENOENT) {
+                if (errno == ENOENT || errno == ELOOP) {
                     printf("skipping %s\n", path);
                     goto skip;
                 }
                 POSIX_ERR();
             }
-            if (fstat(fd, &real_stat) < 0) {
-                close(fd);
+            res->entry_fd = fd;
+            if (fstat(fd, &real_stat) < 0)
                 POSIX_ERR();
-            }
-        } else if (fstatat(root_fd, path, &real_stat, 0) < 0) {
+        } else if (fstatat(root_fd, path, &real_stat, AT_SYMLINK_NOFOLLOW) < 0) {
             if (errno == ENOENT) {
                 printf("skipping %s\n", path);
                 goto skip;
             }
             POSIX_ERR();
+        } else if (S_ISLNK(real_stat.st_mode)) {
+            // Host bind-mount symlink (e.g. Downloads/Shared): keep as an empty
+            // directory entry in the snapshot without following host symlinks.
+            real_stat.st_size = 0;
         }
-        archive_entry_set_size(entry, real_stat.st_size);
+        archive_entry_set_size(entry, S_ISREG(stat.mode) ? real_stat.st_size : 0);
 #if __APPLE__
 #define TIMESPEC(x) st_##x##timespec
 #elif __linux__
@@ -499,10 +534,8 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
         if (S_ISLNK(stat.mode)) {
             char buf[MAX_PATH+1];
             ssize_t len = read(fd, buf, sizeof(buf)-1);
-            if (len < 0) {
-                close(fd);
+            if (len < 0)
                 POSIX_ERR();
-            }
             buf[len] = '\0';
             archive_entry_set_symlink(entry, buf);
         }
@@ -511,23 +544,25 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
             uint8_t caps[LR_GUEST_CAPS_MAX];
             ssize_t length = lr_guest_caps_get(fd, caps, sizeof caps);
             if (length >= 0) {
-                if (lr_guest_caps_validate(caps, length)) { close(fd); errno = EINVAL; POSIX_ERR(); }
+                if (lr_guest_caps_validate(caps, length)) { errno = EINVAL; POSIX_ERR(); }
                 archive_entry_xattr_add_entry(entry, "security.capability", caps, length);
             } else {
                 bool absent = errno == ENODATA || errno == ENOTSUP || errno == EOPNOTSUPP;
 #ifdef ENOATTR
                 absent |= errno == ENOATTR;
 #endif
-                if (!absent) { close(fd); POSIX_ERR(); }
+                if (!absent) POSIX_ERR();
             }
         }
 
-        struct archive_entry *sparse;
+        struct archive_entry *sparse = NULL;
         archive_entry_linkify(linkresolver, &entry, &sparse);
-        if (entry != NULL)
-            archive_write_header(archive, entry);
-        if (sparse != NULL)
-            archive_write_header(archive, sparse);
+        res->entry = entry;
+        res->sparse = sparse;
+        if (entry != NULL && archive_write_header(archive, entry) != ARCHIVE_OK)
+            ARCHIVE_ERR(archive);
+        if (sparse != NULL && archive_write_header(archive, sparse) != ARCHIVE_OK)
+            ARCHIVE_ERR(archive);
 
         if (entry != NULL && S_ISREG(stat.mode) && archive_entry_size(entry) != 0) {
             char buf[8192];
@@ -537,7 +572,6 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
                 ssize_t len = read(fd, buf, want);
                 if (len < 0) {
                     if (errno == EINTR) continue;
-                    close(fd);
                     POSIX_ERR();
                 }
                 if (len == 0) {
@@ -546,28 +580,46 @@ bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_er
                     len = (ssize_t)want;
                 }
                 ssize_t written = archive_write_data(archive, buf, len);
-                if (written < 0) {
-                    close(fd);
+                if (written < 0)
                     ARCHIVE_ERR(archive);
-                }
                 remaining -= len;
             }
         }
-        if (fd != -1)
+        if (fd != -1) {
             close(fd);
+            res->entry_fd = -1;
+        }
 
     skip:
         paths_done++;
         free(path);
+        res->path = NULL;
         archive_entry_free(entry);
+        res->entry = NULL;
+        archive_entry_free(sparse);
+        res->sparse = NULL;
     }
 
     FINALIZE(query);
-    archive_entry_linkresolver_free(linkresolver);
-    sqlite3_close(db);
-    close(root_fd);
     if (archive_write_close(archive) != ARCHIVE_OK)
         ARCHIVE_ERR(archive);
-    archive_write_free(archive);
     return true;
+}
+
+bool fakefs_export(const char *fs, const char *archive_path, struct fakefsify_error *err_out, struct progress p) {
+    struct export_resources res = {.root_fd = -1, .entry_fd = -1};
+    bool ok = fakefs_export_contents(fs, archive_path, err_out, p, &res);
+    if (res.entry_fd >= 0) close(res.entry_fd);
+    free(res.path);
+    if (res.entry) archive_entry_free(res.entry);
+    if (res.sparse) archive_entry_free(res.sparse);
+    if (res.linkresolver) archive_entry_linkresolver_free(res.linkresolver);
+    if (res.db) {
+        sqlite3_stmt *stmt;
+        while ((stmt = sqlite3_next_stmt(res.db, NULL))) sqlite3_finalize(stmt);
+        sqlite3_close(res.db);
+    }
+    if (res.root_fd >= 0) close(res.root_fd);
+    if (res.archive) archive_write_free(res.archive);
+    return ok;
 }

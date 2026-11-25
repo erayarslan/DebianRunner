@@ -190,13 +190,29 @@ int path_normalize_target(struct fd *at, const char *path, char *out, int flags,
 
     // start with root or cwd, depending on whether it starts with a slash
     bool is_global_root = false;
+    bool retained_at = false;
     lock(&current->fs->lock);
-    if (path[0] == '/')
+    if (path[0] == '/') {
         at = current->fs->root;
-    else if (at == AT_PWD)
+        if (at != NULL && !IS_ERR(at)) {
+            is_global_root = at->is_global_root;
+            if (!is_global_root) {
+                fd_retain(at);
+                retained_at = true;
+            }
+        }
+    } else if (at == AT_PWD) {
         at = current->fs->pwd;
-    if (at != NULL && !IS_ERR(at))
+        if (at != NULL && !IS_ERR(at)) {
+            is_global_root = at->is_global_root;
+            if (!is_global_root) {
+                fd_retain(at);
+                retained_at = true;
+            }
+        }
+    } else if (at != NULL && !IS_ERR(at)) {
         is_global_root = at->is_global_root;
+    }
     unlock(&current->fs->lock);
     if (at == NULL && path[0] != '/')
         return _EBADF;
@@ -207,10 +223,14 @@ int path_normalize_target(struct fd *at, const char *path, char *out, int flags,
     const char *at_path_ptr = NULL;
     if (at != NULL && !is_global_root) {
         int err = directory_getpath(at, at_path);
+        if (retained_at)
+            fd_close(at);
         if (err < 0)
             return err;
         assert(path_is_normalized(at_path));
         at_path_ptr = at_path;
+    } else if (retained_at) {
+        fd_close(at);
     }
 
     return __path_normalize(at_path_ptr, path, out, flags, 0, NULL, target);

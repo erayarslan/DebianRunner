@@ -162,6 +162,9 @@ static void LRObserveMemory(const char *operation, uint64_t address, uint64_t le
 extern void (*runtime_syscall_observer)(int, uint64_t, uint64_t, unsigned);
 extern void (*runtime_guest_fault)(int, int, const char *, uint64_t, uint64_t, int, uint64_t, uint32_t);
 extern void (*runtime_fault_context)(const char *);
+static BOOL LRJITActive;
+static NSString *LRJITDetail=@"Interpreter";
+static NSString *LRJITLastFailure;
 static void LRGuestFault(int pid,int ppid,const char *comm,uint64_t pc,uint64_t sp,int signal,uint64_t address,uint32_t instruction) {
     char line[300];snprintf(line,sizeof line,"guest fault pid=%d ppid=%d comm=%.16s signal=%d pc=%#llx sp=%#llx address=%#llx instruction=%#x",pid,ppid,comm,signal,(unsigned long long)pc,(unsigned long long)sp,(unsigned long long)address,instruction);LRBootEvent(line);
     LRBootLogSync();
@@ -171,7 +174,7 @@ static void LRGuestFault(int pid,int ppid,const char *comm,uint64_t pc,uint64_t 
         uint64_t lr = current ? current->cpu.regs[30] : 0;
         NSString *root = LRRuntimeBridge.activeRootName.length ? LRRuntimeBridge.activeRootName : @"unknown";
         NSString *decoded = (instruction & 0xffe0001f) == 0xd4200000 ? [NSString stringWithFormat:@"BRK #%u",(instruction>>5)&65535] : instruction == 0x2ea07842 ? @"SQNEG v2.2s, v2.2s" : @"raw instruction; full disassembly unavailable";
-        [LRGuestCrashCenter begin:@{@"application":[NSString stringWithUTF8String:comm]?:@"unknown",@"executable":[NSString stringWithUTF8String:executable]?:@"unknown",@"pid":@(current?current->tgid:pid).stringValue,@"tid":@(pid).stringValue,@"ppid":@(ppid).stringValue,@"signal":@(signal).stringValue,@"signal_name":signal==4?@"SIGILL":signal==5?@"SIGTRAP":signal==6?@"SIGABRT":signal==7?@"SIGBUS":signal==11?@"SIGSEGV":@"none",@"pc":[NSString stringWithFormat:@"%#llx",(unsigned long long)pc],@"lr":[NSString stringWithFormat:@"%#llx",(unsigned long long)lr],@"sp":[NSString stringWithFormat:@"%#llx",(unsigned long long)sp],@"address":[NSString stringWithFormat:@"%#llx",(unsigned long long)address],@"instruction":[NSString stringWithFormat:@"%#x",instruction],@"disassembly":decoded,@"rootfs":root,@"version":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]?:@"unknown",@"build":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]?:@"unknown",@"source_commit":[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"unknown",@"environment":@"iOS ARM64 interpreter; 4 KB guest pages"}];
+        [LRGuestCrashCenter begin:@{@"application":[NSString stringWithUTF8String:comm]?:@"unknown",@"executable":[NSString stringWithUTF8String:executable]?:@"unknown",@"pid":@(current?current->tgid:pid).stringValue,@"tid":@(pid).stringValue,@"ppid":@(ppid).stringValue,@"signal":@(signal).stringValue,@"signal_name":signal==4?@"SIGILL":signal==5?@"SIGTRAP":signal==6?@"SIGABRT":signal==7?@"SIGBUS":signal==11?@"SIGSEGV":@"none",@"pc":[NSString stringWithFormat:@"%#llx",(unsigned long long)pc],@"lr":[NSString stringWithFormat:@"%#llx",(unsigned long long)lr],@"sp":[NSString stringWithFormat:@"%#llx",(unsigned long long)sp],@"address":[NSString stringWithFormat:@"%#llx",(unsigned long long)address],@"instruction":[NSString stringWithFormat:@"%#x",instruction],@"disassembly":decoded,@"rootfs":root,@"version":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]?:@"unknown",@"build":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]?:@"unknown",@"source_commit":[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"unknown",@"environment":LRJITActive?@"iOS ARM64 JIT; 4 KB guest pages":@"iOS ARM64 interpreter; 4 KB guest pages"}];
     }
 }
 extern void (*runtime_guest_output)(int,int,int,const char *);
@@ -220,6 +223,7 @@ extern int fakefs_bind_mount(const char *, const char *, bool);
 extern int fakefs_bind_mount_set_owner(const char *, uint32_t, uint32_t);
 static BOOL bootAttempted;
 static atomic_bool environmentDeletionActive; // also read by background importers
+static BOOL snapshotOperationActive = NO;
 static NSString *bootedRoot;
 static int bootResult;
 static NSMutableArray<NSString *> *events;
@@ -568,14 +572,14 @@ static NSString *LRThermalState(void) {
     unlock(&pids_lock);
     mach_task_basic_info_data_t info={0};mach_msg_type_number_t count=MACH_TASK_BASIC_INFO_COUNT;
     BOOL haveMemory=task_info(mach_task_self(),MACH_TASK_BASIC_INFO,(task_info_t)&info,&count)==KERN_SUCCESS;
-    return @{@"runtime":self.runtimeStatus,@"source_commit":[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"unavailable",@"distribution_root":self.activeRootName.length?self.activeRootName:@"none",@"distribution":@"debian",@"architecture":@"aarch64",@"backend":@"ARM64 interpreter",@"jit_backend_active":@NO,@"host_page_size":@(getpagesize()),@"guest_page_size":@4096,@"host_resident_bytes":haveMemory?@(info.resident_size):@0,@"memory_measured":@(haveMemory),@"host_thermal_state":LRThermalState(),@"low_power_mode":@(NSProcessInfo.processInfo.lowPowerModeEnabled),@"guest_processes":@(processes),@"guest_threads":@(threads),@"runtime_uptime_seconds":@(runtimeStartedAt?NSProcessInfo.processInfo.systemUptime-runtimeStartedAt:0),@"thread_state_limit":@"Counts are live tasks; no claim of precise sleeping/blocked state"};
+    return @{@"runtime":self.runtimeStatus,@"source_commit":[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"unavailable",@"distribution_root":self.activeRootName.length?self.activeRootName:@"none",@"distribution":@"debian",@"architecture":@"aarch64",@"backend":LRJITActive?@"ARM64 JIT":@"ARM64 interpreter",@"jit_backend_active":@(LRJITActive),@"host_page_size":@(getpagesize()),@"guest_page_size":@4096,@"host_resident_bytes":haveMemory?@(info.resident_size):@0,@"memory_measured":@(haveMemory),@"host_thermal_state":LRThermalState(),@"low_power_mode":@(NSProcessInfo.processInfo.lowPowerModeEnabled),@"guest_processes":@(processes),@"guest_threads":@(threads),@"runtime_uptime_seconds":@(runtimeStartedAt?NSProcessInfo.processInfo.systemUptime-runtimeStartedAt:0),@"thread_state_limit":@"Counts are live tasks; no claim of precise sleeping/blocked state"};
 }
 + (NSURL *)catalogURL { return [ContainerURL() URLByAppendingPathComponent:@"environments.json"]; }
 + (NSArray<NSString *> *)rootNames { return Roots.instance.roots.array; }
 + (NSString *)activeRootName { return bootedRoot ?: Roots.instance.defaultRoot ?: @""; }
 + (NSString *)nextRootName { return Roots.instance.defaultRoot ?: @""; }
 + (void)setNextRootName:(NSString *)name {
-    if (environmentDeletionActive) return;
+    if (environmentDeletionActive || snapshotOperationActive) return;
     if (validRoot(name) && [Roots.instance.roots containsObject:name]) Roots.instance.defaultRoot = name;
 }
 + (NSURL *)rootURL:(NSString *)name {
@@ -607,7 +611,7 @@ static NSString *LRThermalState(void) {
         // snapshotWriter contention and MAP_SHARED writes on every guest syscall.
         __atomic_store_n(&runtime_syscall_observer, NULL, __ATOMIC_RELEASE);
     }
-    [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"boot result=%d backend=asbestos jit=false", error]];
+    [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"boot result=%d backend=asbestos jit=%s", error, LRJITActive ? "true" : "false"]];
     if (error != 0) {
         LRBootLogSync();
     }
@@ -617,21 +621,47 @@ static NSString *LRThermalState(void) {
         });
     }
 }
+static BOOL LRServiceManagerSyncInFlight;
+static BOOL LRServiceManagerSyncPending;
+static NSUInteger LRServiceManagerInitRetries;
 + (void)syncServiceManagerAndAutostart {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self syncServiceManagerAndAutostart]; });
+        return;
+    }
     if (!self.isRunning) return;
+    NSString *root = self.activeRootName;
+    if (validRoot(root)) {
+        NSURL *initMarker = [[Roots.instance rootUrl:root] URLByAppendingPathComponent:@"data/var/lib/linuxrunner/initialized"];
+        if (![NSFileManager.defaultManager fileExistsAtPath:initMarker.path]) {
+            if (LRServiceManagerInitRetries < 30) {
+                LRServiceManagerInitRetries++;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self syncServiceManagerAndAutostart];
+                });
+            }
+            return;
+        }
+    }
+    if (LRServiceManagerSyncInFlight) {
+        LRServiceManagerSyncPending = YES;
+        return;
+    }
     NSError *error = nil;
     if (!LRPrepareSupport(&error)) {
         [self logCategory:@"SERVICE" event:[NSString stringWithFormat:@"prepare support failed: %@", error.localizedDescription ?: @"unknown"]];
         return;
     }
+    LRServiceManagerSyncInFlight = YES;
+    LRServiceManagerSyncPending = NO;
     NSString *script =
         @"src=/home/mobile/Downloads/.linuxrunner/support/service-manager.sh\n"
         "[ -f \"$src\" ] || exit 1\n"
         "mkdir -p /usr/lib/linuxrunner /usr/local/bin /run/debianrunner-systemd/system /var/log/debianrunner-systemd /var/lib/systemd/linger\n"
         "chmod 1777 /run/debianrunner-systemd 2>/dev/null || true\n"
         "if ! cmp -s \"$src\" /usr/lib/linuxrunner/service-manager.sh 2>/dev/null; then\n"
-        "  cp -f \"$src\" /usr/lib/linuxrunner/service-manager.sh\n"
-        "  chmod 755 /usr/lib/linuxrunner/service-manager.sh\n"
+        "  tmp=/usr/lib/linuxrunner/.service-manager.sh.tmp.$$\n"
+        "  cp \"$src\" \"$tmp\" && chmod 755 \"$tmp\" && mv -f \"$tmp\" /usr/lib/linuxrunner/service-manager.sh\n"
         "fi\n"
         "ln -sf /usr/lib/linuxrunner/service-manager.sh /usr/local/bin/systemctl\n"
         "ln -sf /usr/lib/linuxrunner/service-manager.sh /usr/local/bin/journalctl\n"
@@ -639,6 +669,13 @@ static NSString *LRThermalState(void) {
         "/usr/lib/linuxrunner/service-manager.sh boot-autostart\n";
     [self runHeadlessCommand:@[@"/bin/sh", @"-c", script] directory:@"/" completion:^(int exitCode) {
         [self logCategory:@"SERVICE" event:[NSString stringWithFormat:@"sync service-manager exit=%d", exitCode]];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LRServiceManagerSyncInFlight = NO;
+            if (LRServiceManagerSyncPending) {
+                LRServiceManagerSyncPending = NO;
+                [self syncServiceManagerAndAutostart];
+            }
+        });
     }];
 }
 + (int)prepareExchange:(NSString *)root {
@@ -658,17 +695,19 @@ static NSString *LRThermalState(void) {
     size_t size=getpagesize();void *page=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
     int allocationError=page==MAP_FAILED?errno:0,protectionError=0;
     BOOL permitted=NO;if(page!=MAP_FAILED){permitted=mprotect(page,size,PROT_READ|PROT_EXEC)==0;if(!permitted)protectionError=errno;munmap(page,size);}
-    NSDictionary *result=@{@"backend_available":@NO,@"backend_active":@NO,@"executable_protection_change":@(permitted),@"allocation_errno":@(allocationError),@"protection_errno":@(protectionError),@"generated_code_executed":@NO,@"capability_verified":@NO,@"reason":@"Interpreter-only build. Public VM permission probe does not establish generated-code execution or translator activation."};
-    [self logCategory:@"JIT" event:[NSString stringWithFormat:@"permission_probe=%d allocation_errno=%d protection_errno=%d backend_available=0 capability_verified=0",permitted,allocationError,protectionError]];return result;
+    BOOL available = self.jitCompiledIn;
+    BOOL active = LRJITActive;
+    NSString *reason = active ? (LRJITDetail ?: @"JIT backend active.")
+        : (available ? @"JIT-capable build; translator stays inactive until iOS authorizes executable memory."
+                     : @"Interpreter-only build. Public VM permission probe does not establish generated-code execution or translator activation.");
+    NSDictionary *result=@{@"backend_available":@(available),@"backend_active":@(active),@"executable_protection_change":@(permitted),@"allocation_errno":@(allocationError),@"protection_errno":@(protectionError),@"generated_code_executed":@(active),@"capability_verified":@(active),@"reason":reason};
+    [self logCategory:@"JIT" event:[NSString stringWithFormat:@"permission_probe=%d allocation_errno=%d protection_errno=%d backend_available=%d capability_verified=%d",permitted,allocationError,protectionError,available,active]];return result;
 }
 
 // ---- Execution backend -----------------------------------------------------
 static NSString *const LRExecutionModeKey=@"LinuxRunnerExecutionMode";
 static NSString *const LRJITAttemptKey=@"LinuxRunnerJITAttemptInProgress";
 static NSString *const LRJITCrashedPathsKey=@"LinuxRunnerJITCrashedPaths";
-static BOOL LRJITActive;
-static NSString *LRJITDetail=@"Interpreter";
-static NSString *LRJITLastFailure;
 + (BOOL)jitCompiledIn {
 #ifdef LINUXRUNNER_JIT_BUILD
     return YES;
@@ -701,9 +740,7 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
     NSScanner *scanner=[NSScanner scannerWithString:[hardware substringFromIndex:pad?4:6]];
     NSInteger majorModel=0,minorModel=0;
     if(![scanner scanInteger:&majorModel]||![scanner scanString:@"," intoString:nil]||![scanner scanInteger:&minorModel])return YES;
-    double divisor=pow(10,(double)[NSString stringWithFormat:@"%ld",(long)minorModel].length);
-    double version=majorModel+minorModel/divisor;
-    return version>=(pad?14.5:14.2);
+    return majorModel > 14 || (majorModel == 14 && minorModel >= (pad ? 5 : 2));
 }
 + (NSURL *)stikDebugRequestURL {
     return LRStikDebugRequest(NSBundle.mainBundle.bundleIdentifier,getpid(),self.requiresPreparedJITRegion);
@@ -867,8 +904,6 @@ static void LRClearAllEnvironmentUserDefaults(void) {
 
 // ---- Environment Snapshots (preserved across Wipe) --------------------------
 
-static BOOL snapshotOperationActive = NO;
-
 static NSURL *LRSnapshotsDirectoryURL(void) {
     NSURL *dir = [ContainerURL() URLByAppendingPathComponent:@"snapshots" isDirectory:YES];
     [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -957,7 +992,15 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
     return [NSFileManager.defaultManager fileExistsAtPath:archive.path] ? archive : nil;
 }
 
++ (BOOL)isSnapshotOperationActive {
+    return snapshotOperationActive;
+}
+
 + (BOOL)deleteSnapshotWithID:(NSString *)snapshotID error:(NSError **)error {
+    if (snapshotOperationActive || environmentDeletionActive) {
+        if (error) *error = lrError(EBUSY, @"Wait for the current environment operation to finish.");
+        return NO;
+    }
     if (!LRValidSnapshotID(snapshotID)) {
         if (error) *error = lrError(EINVAL, @"Invalid snapshot identifier.");
         return NO;
@@ -984,7 +1027,7 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
                      cancel:(BOOL (^)(void))cancel
                  completion:(void (^)(NSDictionary<NSString *, id> * _Nullable snapshot, NSError * _Nullable error))completion {
     NSAssert(NSThread.isMainThread, @"Snapshot creation starts on the main thread");
-    if (snapshotOperationActive || environmentDeletionActive) {
+    if (snapshotOperationActive || environmentDeletionActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"]) {
         completion(nil, lrError(EBUSY, @"Wait for the current environment operation to finish."));
         return;
     }
@@ -1102,7 +1145,7 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
                        cancel:(BOOL (^)(void))cancel
                    completion:(void (^)(NSString * _Nullable rootName, NSError * _Nullable error))completion {
     NSAssert(NSThread.isMainThread, @"Snapshot restore starts on the main thread");
-    if (snapshotOperationActive || environmentDeletionActive) {
+    if (snapshotOperationActive || environmentDeletionActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"]) {
         completion(nil, lrError(EBUSY, @"Wait for the current environment operation to finish."));
         return;
     }
@@ -1127,15 +1170,13 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
     NSString *defaultUser = [meta[@"default_user"] isKindOfClass:NSString.class] ? meta[@"default_user"] : @"root";
     NSString *dist = [meta[@"distribution"] isKindOfClass:NSString.class] ? meta[@"distribution"] : @"Debian GNU/Linux";
     NSString *ver = [meta[@"version"] isKindOfClass:NSString.class] ? meta[@"version"] : @"13.7";
-    NSString *rootName = [NSString stringWithFormat:@"debian-%lld", (long long)NSDate.date.timeIntervalSince1970];
+    NSArray<NSString *> *previousRoots = Roots.instance.roots.array.copy;
+    NSString *shortSuffix = [[NSUUID.UUID.UUIDString substringToIndex:6] lowercaseString];
+    NSString *rootName = [NSString stringWithFormat:@"debian-%lld-%@", (long long)NSDate.date.timeIntervalSince1970, shortSuffix];
 
     snapshotOperationActive = YES;
     [self beginAwake:@"snapshot-restore"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        if (Roots.instance.roots.count > 0) {
-            NSError *destroyErr = nil;
-            [Roots.instance forceDestroyAllRoots:&destroyErr];
-        }
         LRInstallProgress *reporter = [LRInstallProgress new];
         reporter.progress = ^(double value, NSString *message) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -1144,6 +1185,9 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
         };
         reporter.cancel = cancel;
 
+        // Verify and import the snapshot into a fresh unique root BEFORE touching
+        // any existing installation, so cancel/checksum/disk failure leaves the
+        // user's existing environment intact.
         NSError *err = nil;
         NSDictionary *rootMeta = @{
             @"distributionID": @"debian",
@@ -1154,14 +1198,32 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
             @"restoredFromSnapshot": snapshotID,
         };
         BOOL ok = [Roots.instance importVerifiedRootFromArchive:archiveURL name:rootName sha256:sha256 metadata:rootMeta error:&err progressReporter:reporter];
+        if (!ok) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                snapshotOperationActive = NO;
+                [self endAwake:@"snapshot-restore"];
+                completion(nil, err ?: lrError(EIO, @"Failed to restore snapshot."));
+            });
+            return;
+        }
+        // Switch defaultRoot to the newly verified root on main thread, then remove
+        // replaced roots and their orphaned exchange/Shared directories.
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            Roots.instance.defaultRoot = rootName;
+        });
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSURL *exchangesDir = [ContainerURL() URLByAppendingPathComponent:@"exchanges" isDirectory:YES];
+        NSURL *docs = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+        NSURL *sharedDir = docs ? [docs URLByAppendingPathComponent:@"Shared" isDirectory:YES] : nil;
+        for (NSString *oldRoot in previousRoots) {
+            if ([oldRoot isEqualToString:rootName]) continue;
+            [Roots.instance destroyRootNamed:oldRoot error:nil];
+            [fm removeItemAtURL:[exchangesDir URLByAppendingPathComponent:oldRoot] error:nil];
+            if (sharedDir) [fm removeItemAtURL:[sharedDir URLByAppendingPathComponent:oldRoot] error:nil];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             snapshotOperationActive = NO;
             [self endAwake:@"snapshot-restore"];
-            if (!ok) {
-                completion(nil, err ?: lrError(EIO, @"Failed to restore snapshot."));
-                return;
-            }
-            Roots.instance.defaultRoot = rootName;
             if (defaultUser.length > 0 && ![defaultUser isEqualToString:@"root"]) {
                 [NSUserDefaults.standardUserDefaults setObject:defaultUser forKey:[@"LinuxRunnerDefaultUser." stringByAppendingString:rootName]];
             }
@@ -1175,7 +1237,7 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
 
 + (void)wipeEnvironmentWithCompletion:(void (^)(BOOL needsRestart, NSError * _Nullable error))completion {
     NSAssert(NSThread.isMainThread, @"Environment wipe starts on the main thread");
-    if (environmentDeletionActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"]) {
+    if (environmentDeletionActive || snapshotOperationActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"]) {
         completion(NO, lrError(EBUSY, @"Wait for the current environment operation to finish."));
         return;
     }
@@ -1261,7 +1323,7 @@ static NSString *LRSHA256ForFileURL(NSURL *fileURL, uint64_t *sizeOut, BOOL (^ca
 
 + (NSString *)environmentDeletionUnavailableReason:(NSString *)root {
     if (!validRoot(root) || ![Roots.instance.roots containsObject:root]) return @"This environment is no longer installed.";
-    if (environmentDeletionActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"])
+    if (environmentDeletionActive || snapshotOperationActive || [NSUserDefaults.standardUserDefaults boolForKey:@"InstallerActive"])
         return @"Wait for the current environment operation to finish.";
     if ([root isEqual:bootedRoot] || (bootAttempted && [root isEqual:self.activeRootName]))
         return @"This environment is mounted. Choose another environment for the next launch, fully close LinuxRunner, then reopen it before deleting this one.";
@@ -2136,8 +2198,8 @@ static NSCountedSet<NSString *> *LRAwakeSet;
             NSString *text=[[NSString alloc]initWithData:data encoding:NSUTF8StringEncoding]?:@"non-UTF8 package output omitted";
             entries[[NSString stringWithFormat:@"packages/%@/%@",root,name]]=[[self redactDiagnosticText:text application:NO] dataUsingEncoding:NSUTF8StringEncoding];
         }
-        NSString *modesLog=[NSString stringWithContentsOfURL:[base URLByAppendingPathComponent:@"modes.log"] encoding:NSUTF8StringEncoding error:nil];
-        if(modesLog.length)entries[[NSString stringWithFormat:@"support/%@/modes.log",root]]=[[self redactDiagnosticText:(modesLog.length>262144?[modesLog substringFromIndex:modesLog.length-262144]:modesLog) application:YES] dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *modesLog=[self boundedDiagnosticTail:[base URLByAppendingPathComponent:@"modes.log"] maxBytes:262144];
+        if(modesLog.length)entries[[NSString stringWithFormat:@"support/%@/modes.log",root]]=[[self redactDiagnosticText:modesLog application:YES] dataUsingEncoding:NSUTF8StringEncoding];
     }
     NSURL *url=[NSFileManager.defaultManager.temporaryDirectory URLByAppendingPathComponent:[NSString stringWithFormat:@"LinuxRunner-Diagnostics-%@.zip",NSUUID.UUID.UUIDString]];
     struct archive *archive=archive_write_new();archive_write_set_format_zip(archive);

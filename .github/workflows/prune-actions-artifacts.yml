@@ -49,16 +49,22 @@ jobs:
               return false;
             }
 
-            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+            const allRuns = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
               owner,
               repo,
               per_page: 100,
-              status: 'completed',
             });
-            runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            allRuns.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            const runs = allRuns.filter(run => run.status === 'completed');
+            const activeRunIds = new Set(
+              allRuns
+                .filter(run => run.status !== 'completed')
+                .map(run => String(run.id))
+            );
 
             const keptPerWorkflow = new Map();
-            const keepRunIds = new Set();
+            const keepRunIds = new Set(activeRunIds);
             for (const run of runs) {
               const workflowId = String(run.workflow_id || run.name || 'unknown');
               const count = keptPerWorkflow.get(workflowId) || 0;
@@ -82,6 +88,7 @@ jobs:
             for (const artifact of artifacts) {
               const created = new Date(artifact.created_at).getTime();
               const runId = artifact.workflow_run?.id;
+              if (runId && activeRunIds.has(String(runId))) continue;
               const outsideRunWindow = runId
                 ? !keepRunIds.has(String(runId))
                 : !keepOrphanArtifactIds.has(artifact.id);
@@ -116,6 +123,7 @@ jobs:
             let runCount = 0;
             for (const run of runs) {
               if (Number(run.id) === Number(context.runId)) continue;
+              if (keepRunIds.has(String(run.id))) continue;
               const created = new Date(run.created_at).getTime();
               if (created < cutoff && await tryDelete(`delete workflow run ${run.id}`, () => github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id }))) {
                 runCount++;

@@ -55,6 +55,7 @@ package_system_ready() {
     if [ -x /usr/lib/linuxrunner/initialize-debian.sh ] && [ "$(id -u)" = 0 ]; then
         if [ -d /etc/apt/apt.conf.d ] && [ ! -e /etc/apt/apt.conf.d/90linuxrunner-lock-wait ]; then
             printf 'DPkg::Lock::Timeout "900";\n' > /etc/apt/apt.conf.d/90linuxrunner-lock-wait.new &&
+                chmod 0644 /etc/apt/apt.conf.d/90linuxrunner-lock-wait.new &&
                 mv /etc/apt/apt.conf.d/90linuxrunner-lock-wait.new /etc/apt/apt.conf.d/90linuxrunner-lock-wait
         fi
         lr_init_log=/var/log/linuxrunner-initialize.log lr_last= lr_idle=0 lr_named=

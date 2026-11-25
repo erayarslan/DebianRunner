@@ -13,7 +13,9 @@
 #define CAPS_NAME "security.capability"
 #define CAPS_MAX 24
 
-_Atomic uint64_t g_file_caps_gen = 1;
+// Even generation = stable; odd = file_caps_host_set() in progress.
+_Atomic uint64_t g_file_caps_gen = 2;
+static lock_t file_caps_set_lock = LOCK_INITIALIZER;
 
 static int host_error(void) {
 #ifdef ENOATTR
@@ -27,10 +29,13 @@ ssize_t file_caps_host_get(int fd, void *value, size_t size) {
 }
 int file_caps_host_set(int fd, const void *value, size_t size, int flags) {
     int native = (flags & 1 ? XATTR_CREATE : 0) | (flags & 2 ? XATTR_REPLACE : 0);
-    if (lr_guest_caps_set(fd, value, size, native) < 0)
-        return host_error();
+    lock(&file_caps_set_lock);
+    atomic_fetch_add_explicit(&g_file_caps_gen, 1, memory_order_acq_rel);
+    int rc = lr_guest_caps_set(fd, value, size, native);
+    int err = rc < 0 ? host_error() : 0;
     atomic_fetch_add_explicit(&g_file_caps_gen, 1, memory_order_release);
-    return 0;
+    unlock(&file_caps_set_lock);
+    return err;
 }
 int file_caps_host_remove(int fd) {
     return lr_guest_caps_remove(fd) < 0 ? host_error() : 0;
@@ -38,11 +43,13 @@ int file_caps_host_remove(int fd) {
 int file_caps_strip(struct fd *fd) {
     if (!fd->mount || !fd->mount->fs->remove_file_caps || !S_ISREG(fd->type)) return 0;
     uint64_t gen = atomic_load_explicit(&g_file_caps_gen, memory_order_acquire);
-    if (__atomic_load_n(&fd->caps_stripped_gen, __ATOMIC_RELAXED) == gen)
+    if ((gen & 1) == 0 && __atomic_load_n(&fd->caps_stripped_gen, __ATOMIC_RELAXED) == gen)
         return 0;
     int err = fd->mount->fs->remove_file_caps(fd);
     if (err == 0 || err == _ENODATA || err == _EOPNOTSUPP) {
-        __atomic_store_n(&fd->caps_stripped_gen, gen, __ATOMIC_RELAXED);
+        uint64_t after = atomic_load_explicit(&g_file_caps_gen, memory_order_acquire);
+        if ((gen & 1) == 0 && after == gen)
+            __atomic_store_n(&fd->caps_stripped_gen, gen, __ATOMIC_RELAXED);
         return 0;
     }
     return err;

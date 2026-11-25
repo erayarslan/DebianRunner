@@ -1,6 +1,7 @@
 #ifndef TTY_H
 #define TTY_H
 
+#include <stdatomic.h>
 #include "kernel/fs.h"
 #include "fs/dev.h"
 
@@ -136,7 +137,7 @@ extern struct tty_driver *tty_drivers[256];
 extern struct tty_driver real_tty_driver;
 
 struct tty {
-    unsigned refcount;
+    atomic_uint refcount;
     struct tty_driver *driver;
     bool hung_up;
     bool ever_opened;
@@ -192,6 +193,7 @@ struct tty *tty_get(struct tty_driver *driver, int type, int num);
 struct tty *tty_alloc(struct tty_driver *driver, int type, int num);
 int tty_open(struct tty *tty, struct fd *fd);
 extern lock_t ttys_lock;
+bool tty_try_retain(struct tty *tty);
 void tty_release(struct tty *tty); // must be called with ttys_lock
 
 extern struct dev_ops tty_dev;

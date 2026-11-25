@@ -23,7 +23,7 @@ struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     if (tty == NULL)
         return NULL;
 
-    tty->refcount = 0;
+    atomic_init(&tty->refcount, 0);
     tty->driver = driver;
     tty->type = type;
     tty->num = num;
@@ -68,18 +68,27 @@ struct tty *tty_get(struct tty_driver *driver, int type, int num) {
             unlock(&ttys_lock);
             return ERR_PTR(_ENOMEM);
         }
+        // Hold the caller's initial reference before ops->init publishes tty
+        // (e.g. to iOS Terminal) so concurrent tty_try_retain sees refcount >= 1.
+        atomic_init(&tty->refcount, 1);
+        tty->ever_opened = true;
 
         if (driver->ops->init) {
             int err = driver->ops->init(tty);
             if (err < 0) {
+                cond_destroy(&tty->produced);
+                cond_destroy(&tty->consumed);
+                free(tty);
                 unlock(&ttys_lock);
                 return ERR_PTR(err);
             }
         }
         driver->ttys[num] = tty;
+        unlock(&ttys_lock);
+        return tty;
     }
     lock(&tty->lock);
-    tty->refcount++;
+    atomic_fetch_add_explicit(&tty->refcount, 1, memory_order_relaxed);
     tty->ever_opened = true;
     unlock(&tty->lock);
     unlock(&ttys_lock);
@@ -105,15 +114,28 @@ static void tty_poll_wakeup(struct tty *tty, int events) {
     lock(&tty->lock);
 }
 
+bool tty_try_retain(struct tty *tty) {
+    if (tty == NULL)
+        return false;
+    unsigned r = atomic_load_explicit(&tty->refcount, memory_order_acquire);
+    while (r > 0) {
+        if (atomic_compare_exchange_weak_explicit(&tty->refcount, &r, r + 1,
+                memory_order_acq_rel, memory_order_acquire))
+            return true;
+    }
+    return false;
+}
+
 void tty_release(struct tty *tty) {
     lock(&tty->lock);
-    if (--tty->refcount == 0) {
+    if (atomic_fetch_sub_explicit(&tty->refcount, 1, memory_order_acq_rel) == 1) {
         struct tty_driver *driver = tty->driver;
         if (driver->ops->cleanup)
             driver->ops->cleanup(tty);
         driver->ttys[tty->num] = NULL;
         unlock(&tty->lock);
         cond_destroy(&tty->produced);
+        cond_destroy(&tty->consumed);
         free(tty);
     } else {
         unlock(&tty->lock);

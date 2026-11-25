@@ -77,6 +77,7 @@ void LRSetDatalessMaterialization(void);
 + (void)deleteEnvironment:(NSString *)root completion:(void (^)(NSError * _Nullable))completion;
 + (void)performPendingWipeIfNeeded;
 + (BOOL)isWipePending;
++ (BOOL)isSnapshotOperationActive;
 + (void)wipeEnvironmentWithCompletion:(void (^)(BOOL needsRestart, NSError * _Nullable error))completion NS_SWIFT_NAME(wipeEnvironment(completion:));
 // Environment snapshots (tar.gz + JSON metadata in ContainerURL/snapshots, preserved across Wipe).
 + (NSArray<NSDictionary<NSString *, id> *> *)snapshots;

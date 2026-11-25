@@ -92,7 +92,7 @@ buildtype=debug
 optimization=0
 debug=true
 b_ndebug=false
-if [[ $CONFIGURATION == Release ]]; then
+if [[ $CONFIGURATION == Release* ]]; then
     # Compile at -O3 with assertions disabled (-DNDEBUG) while keeping DWARF
     # debug info (-g) so dSYM UUIDs match scripts/verify-ipa.py.
     buildtype=custom
@@ -101,7 +101,7 @@ if [[ $CONFIGURATION == Release ]]; then
     b_ndebug=true
 fi
 b_sanitize=none
-if [[ -n "$ENABLE_ADDRESS_SANITIZER" ]]; then
+if [[ ${ENABLE_ADDRESS_SANITIZER:-NO} == YES ]]; then
     b_sanitize=address
 fi
 log=$ISH_LOG

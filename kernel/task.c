@@ -344,7 +344,12 @@ static void task_run_tlb_cleanup(void *arg) {
 // blocks: a writer may already hold pids_lock.
 static void mem_writer_waiting(wrlock_t *lock) {
     struct task *self = current;
-    if (self == NULL || self->mem == NULL || self->group == NULL || lock != &self->mem->lock)
+    if (self == NULL || self->mem == NULL || self->group == NULL)
+        return;
+    bool is_mem_lock = lock == &self->mem->lock;
+    bool is_jetsam_lock = self->mem->mmu.asbestos != NULL &&
+        lock == &self->mem->mmu.asbestos->jetsam_lock;
+    if (!is_mem_lock && !is_jetsam_lock)
         return;
     if (trylock(&pids_lock) != 0)
         return;

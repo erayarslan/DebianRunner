@@ -95,6 +95,9 @@ import BackgroundTasks
     @objc(updateToken:detail:fraction:) func update(_ token: String, detail: String, fraction: NSNumber?) { update(token, detail: detail, fraction: fraction?.doubleValue) }
     func update(_ token: String, detail: String, fraction: Double?) {
         guard let index = entries.firstIndex(where: { $0.id == token }) else { return }
+        if entries[index].ended == nil && entries[index].state == .pausedByIOS && system[token] == nil {
+            entries[index].state = .running
+        }
         if !detail.isEmpty { entries[index].detail = detail }
         if let fraction { entries[index].fraction = min(1, max(0, fraction)) }
         #if canImport(BackgroundTasks) && compiler(>=6.2)
@@ -106,10 +109,8 @@ import BackgroundTasks
     }
 
     @objc func end(_ token: String, success: Bool, message: String) {
-        guard let index = entries.firstIndex(where: { $0.id == token }) else { return }
-        entries[index].state = success ? .completed : .failed
-        entries[index].ended = Date()
-        entries[index].detail = message
+        // Always release system background tasks and UIKit assertions even if the
+        // entry was pruned from the 20-item history list before completion.
         #if canImport(BackgroundTasks) && compiler(>=6.2)
         if #available(iOS 26.0, *), let task = system.removeValue(forKey: token) as? BGContinuedProcessingTask {
             task.progress.totalUnitCount = 1000; task.progress.completedUnitCount = 1000
@@ -117,19 +118,23 @@ import BackgroundTasks
         }
         #endif
         if let assertion = assertions.removeValue(forKey: token) { UIApplication.shared.endBackgroundTask(assertion) }
+        guard let index = entries.firstIndex(where: { $0.id == token }) else { return }
+        entries[index].state = success ? .completed : .failed
+        entries[index].ended = Date()
+        entries[index].detail = message
         if UIApplication.shared.applicationState != .active { notify(title: entries[index].title, body: message, success: success) }
         LRRuntimeBridge.logCategory("BACKGROUND", event: "task end title=\(entries[index].title) success=\(success)")
     }
 
     var running: [Entry] { entries.filter { $0.ended == nil } }
-    var hasClearableEntries: Bool { entries.contains { $0.ended != nil || $0.state == .pausedByIOS } }
+    var hasClearableEntries: Bool { entries.contains { $0.ended != nil } }
 
     func clearFinished() {
-        entries.removeAll { $0.ended != nil || $0.state == .pausedByIOS }
+        entries.removeAll { $0.ended != nil }
     }
 
     func removeEntry(_ id: String) {
-        entries.removeAll { $0.id == id && ($0.ended != nil || $0.state == .pausedByIOS) }
+        entries.removeAll { $0.id == id && $0.ended != nil }
     }
 
     // MARK: - System mechanisms
@@ -160,15 +165,17 @@ import BackgroundTasks
                 task.progress.completedUnitCount = Int64((self.entries[index].fraction ?? 0) * 1000)
                 task.expirationHandler = { [weak self] in
                     Task { @MainActor in
-                        guard let self else { return }
-                        self.system.removeValue(forKey: token)
-                        if let i = self.entries.firstIndex(where: { $0.id == token }), self.entries[i].ended == nil {
-                            self.entries[i].state = .pausedByIOS
-                            LRRuntimeBridge.logCategory("BACKGROUND", event: "iOS expired continued processing title=\(self.entries[i].title)")
-                            if UIApplication.shared.applicationState != .active {
-                                self.notify(title: self.entries[i].title, body: "iOS paused this task. Open DebianRunner to continue.", success: false)
+                        if let self {
+                            self.system.removeValue(forKey: token)
+                            if let i = self.entries.firstIndex(where: { $0.id == token }), self.entries[i].ended == nil {
+                                self.entries[i].state = .pausedByIOS
+                                LRRuntimeBridge.logCategory("BACKGROUND", event: "iOS expired continued processing title=\(self.entries[i].title)")
+                                if UIApplication.shared.applicationState != .active {
+                                    self.notify(title: self.entries[i].title, body: "iOS paused this task. Open DebianRunner to continue.", success: false)
+                                }
                             }
                         }
+                        task.setTaskCompleted(success: false)
                     }
                 }
             }
@@ -274,7 +281,9 @@ import BackgroundTasks
 
         let nc = NotificationCenter.default
         observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.reinforceForBackground() }
+            // Execute synchronously on the main thread before didEnterBackground returns
+            // so UIKit background-task and audio/location handoff occur prior to suspension.
+            MainActor.assumeIsolated { self?.reinforceForBackground() }
         })
         observers.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in

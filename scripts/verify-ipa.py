@@ -87,6 +87,8 @@ result['ipa_executable_matches_archive'] = executable_hash == hashlib.sha256(bin
 assert result['ipa_executable_matches_archive'], 'IPA/archive mismatch'
 
 options = pathlib.Path('build/release-derived/Build/Intermediates.noindex/ArchiveIntermediates/LinuxRunner/BuildProductsPath/Release-iphoneos/meson/meson-info/intro-buildoptions.json')
+if not options.exists() and 'LINUXRUNNER_JIT' in os.environ:
+    raise AssertionError(f'Missing Meson build options for LINUXRUNNER_JIT verification: {options}')
 if options.exists():
     values = {item['name']: item['value'] for item in json.loads(options.read_text())}
     result['execution_build_options'] = {k: values[k] for k in ('guest_arch', 'jit', 'jit_emit', 'cli_aot')}
@@ -123,5 +125,5 @@ with tempfile.TemporaryDirectory(prefix='linuxrunner-ipa-audit-') as directory:
             rpaths=rpaths,
         ))
 assert result['recursive_macho_audit'], 'No Mach-O found'
-(release / 'artifact-verification.json').write_text(json.dumps(result, indent=2) + '\n')
+(release / f'{name}.verification.json').write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result, indent=2))

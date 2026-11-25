@@ -896,13 +896,15 @@ static ssize_t user_read_string_array(addr_t addr, char *buf, size_t max) {
                 read_wrunlock(&mem->lock);
                 return _EFAULT;
             }
+            char raw[sizeof(str_addr64)];
+            // Copy from p1 before calling mem_ptr() on the next page, which may
+            // drop and reacquire mem->lock for a lazy fault or stack growth.
+            memcpy(raw, p1, ptr_rem);
             const char *p2 = mem_ptr(mem, ptr_addr + ptr_rem, MEM_READ);
             if (p2 == NULL) {
                 read_wrunlock(&mem->lock);
                 return _EFAULT;
             }
-            char raw[sizeof(str_addr64)];
-            memcpy(raw, p1, ptr_rem);
             memcpy(raw + ptr_rem, p2, sizeof(str_addr64) - ptr_rem);
             memcpy(&str_addr64, raw, sizeof(str_addr64));
         }

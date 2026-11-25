@@ -26,6 +26,7 @@
 - (void)sendSessionInput:(NSString *)text;
 - (void)reconnectSessionFromTerminalUUID:(NSUUID *)uuid;
 @property (readonly) NSUUID *sessionTerminalUUID; // 0 means invalid
+@property (readonly) int sessionPid;
 @property UISceneSession *sceneSession API_AVAILABLE(ios(13.0));
 
 @end

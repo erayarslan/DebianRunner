@@ -92,6 +92,7 @@ int user_read_string(addr_t addr, char *buf, size_t max) {
     // Translate once per guest page, not once per byte. Search only the mapped
     // page: a terminator at its end must not fault on the following guard page.
     size_t copied = 0;
+    bool found_nul = false;
     while (copied < max) {
         if (copied > UINT64_MAX - addr) {
             read_wrunlock(&mem->lock);
@@ -106,12 +107,20 @@ int user_read_string(addr_t addr, char *buf, size_t max) {
         size_t count = PAGE_SIZE - (p & (PAGE_SIZE - 1));
         if (count > max - copied) count = max - copied;
         const char *terminator = memchr(source, 0, count);
-        if (terminator) count = (size_t)(terminator - source) + 1;
+        if (terminator) {
+            count = (size_t)(terminator - source) + 1;
+            found_nul = true;
+        }
         memcpy(buf + copied, source, count);
         copied += count;
-        if (terminator) break;
+        if (found_nul) break;
     }
     read_wrunlock(&mem->lock);
+    if (!found_nul) {
+        if (max > 0)
+            buf[max - 1] = '\0';
+        return 1;
+    }
     return 0;
 }
 

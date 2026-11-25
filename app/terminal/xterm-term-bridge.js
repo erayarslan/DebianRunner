@@ -403,10 +403,22 @@
         return isHttpUrl(uri) ? uri : null;
     }
 
+    const SHELL_PROMPT_RE = /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:.*[$#]$/;
+
     function isUrlContinuationSegment(trimmed) {
         if (!trimmed || /^https?:\/\//i.test(trimmed))
             return false;
+        if (SHELL_PROMPT_RE.test(trimmed))
+            return false;
         return URL_CHARS_RE.test(trimmed);
+    }
+
+    function lineCanHardWrapUrl(rawText) {
+        if (!rawText)
+            return false;
+        const len = rawText.trimEnd().length;
+        const threshold = Math.max(16, Math.min(term.cols - 8, 56));
+        return len >= threshold;
     }
 
     function plaintextLinkAtCell(row, col) {
@@ -452,7 +464,8 @@
         const tappedRowLine = buffer.getLine(row)?.translateToString(true)?.trim() || '';
         const looksLikeHardWrappedUrl =
             !(/https?:\/\//i.test(built.joined)) && isUrlContinuationSegment(tappedRowLine) ||
-            (/https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(built.joined.trim()));
+            (/https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(built.joined.trim()) &&
+             lineCanHardWrapUrl(buffer.getLine(botRow)?.translateToString(true) || ''));
 
         if (looksLikeHardWrappedUrl) {
             let hardTop = topRow;
@@ -462,8 +475,9 @@
                 let probe = hardTop - 1;
                 let foundStart = -1;
                 while (probe >= Math.max(0, hardTop - 8)) {
-                    const t = (buffer.getLine(probe)?.translateToString(true) || '').trim();
-                    if (!t) break;
+                    const raw = buffer.getLine(probe)?.translateToString(true) || '';
+                    const t = raw.trim();
+                    if (!t || !lineCanHardWrapUrl(raw)) break;
                     if (/https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(t)) {
                         foundStart = probe;
                         break;
@@ -477,13 +491,15 @@
                         hardTop--;
                 }
             }
-            // Extend downward up to 8 rows while lines are pure URL continuation segments.
+            // Extend downward up to 8 rows while the preceding line filled the wrap width
+            // and the next line is a pure URL continuation segment.
             let probe = hardBot + 1;
             while (probe <= Math.min(maxRow, hardBot + 8)) {
+                const prevRaw = buffer.getLine(hardBot)?.translateToString(true) || '';
                 const line = buffer.getLine(probe);
                 const t = (line?.translateToString(true) || '').trim();
                 if (!t) break;
-                if (line?.isWrapped || isUrlContinuationSegment(t)) {
+                if (line?.isWrapped || (lineCanHardWrapUrl(prevRaw) && isUrlContinuationSegment(t))) {
                     hardBot = probe;
                     probe++;
                 } else {
@@ -569,7 +585,8 @@
             return unwrappedUrl;
 
         // Also stitch hard-wrapped URL continuations when a selection includes
-        // leading label text (e.g. "Open: https://...\n&client_id=...").
+        // leading label text (e.g. "Open: https://...\n&client_id=..."), only
+        // when the preceding line filled near the wrap margin.
         const stitched = [];
         for (let i = 0; i < logicalLines.length; i++) {
             const line = logicalLines[i];
@@ -580,7 +597,8 @@
                 if (stitched[prevIdx] === '' && prevIdx > 0)
                     prevIdx--;
                 const prev = stitched[prevIdx];
-                if (/https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(prev.trimEnd())) {
+                if (lineCanHardWrapUrl(prev) &&
+                    /https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/i.test(prev.trimEnd())) {
                     if (prevIdx < stitched.length - 1)
                         stitched.pop(); // remove spurious blank separator inside wrapped URL
                     stitched[prevIdx] = prev.trimEnd() + trimmed;

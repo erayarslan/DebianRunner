@@ -9,7 +9,7 @@
 
 @interface DelayedUITask ()
 
-@property id target;
+@property (weak) id target;
 @property SEL action;
 @property BOOL scheduled;
 
@@ -35,7 +35,10 @@
         @synchronized (self) {
             self.scheduled = NO;
         }
-        ((void (*)(id, SEL)) [self.target methodForSelector:self.action])(self.target, self.action);
+        id target = self.target;
+        if (target == nil)
+            return;
+        ((void (*)(id, SEL)) [target methodForSelector:self.action])(target, self.action);
     });
 }
 

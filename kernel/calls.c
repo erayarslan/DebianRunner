@@ -425,9 +425,9 @@ void dump_stack(int lines);
 void dump_maps(void);
 
 // Fast path syscall handlers (forward declarations)
-static inline int fast_fstat64(struct cpu_state *cpu);
-static inline int fast_read(struct cpu_state *cpu);
-static inline int fast_write(struct cpu_state *cpu);
+static inline int fast_fstat64(struct cpu_state *cpu, bool *handled);
+static inline int fast_read(struct cpu_state *cpu, bool *handled);
+static inline int fast_write(struct cpu_state *cpu, bool *handled);
 
 // Diagnostic: JIT crash info from signal handler
 __thread volatile uint64_t jit_last_host_fault = 0;
@@ -546,7 +546,7 @@ void handle_interrupt(int interrupt) {
         current->syscall_restart_always = false;
 
         // === FAST PATH: Hot syscalls ===
-        int fast_result = -1;  // -1 means fast path not taken
+        int fast_result = 0;
         bool fast_path_taken = false;
 
         if (ptrace_skip) {
@@ -555,21 +555,15 @@ void handle_interrupt(int interrupt) {
         }
         // Fast path 1: fstat64 (syscall 80) - most common during Python import
         else if (syscall_num == 80) {
-            fast_result = fast_fstat64(cpu);
-            if (fast_result != -1)
-                fast_path_taken = true;
+            fast_result = fast_fstat64(cpu, &fast_path_taken);
         }
         // Fast path 2: read (syscall 63) - small buffer reads
         else if (syscall_num == 63) {
-            fast_result = fast_read(cpu);
-            if (fast_result != -1)
-                fast_path_taken = true;
+            fast_result = fast_read(cpu, &fast_path_taken);
         }
         // Fast path 3: write (syscall 64) - small buffer writes
         else if (syscall_num == 64) {
-            fast_result = fast_write(cpu);
-            if (fast_result != -1)
-                fast_path_taken = true;
+            fast_result = fast_write(cpu, &fast_path_taken);
         }
 
         if (fast_path_taken) {
@@ -577,6 +571,8 @@ void handle_interrupt(int interrupt) {
             // Fast paths return int (small values), safe to use directly
             STRACE("%d call %-3d (fast) = 0x%x\n", current->pid, syscall_num, fast_result);
             int32_t signed_result = (int32_t)fast_result;
+            if (signed_result == _EINTR && (syscall_num == 63 || syscall_num == 64))
+                current->syscall_restartable = true;
             if (signed_result >= -4095 && signed_result < 0) {
                 cpu->regs[0] = (uint64_t)(int64_t)signed_result;
             } else {
@@ -913,18 +909,19 @@ void dump_stack(int lines) {
 
 // Fast path for fstat64 (syscall 80)
 // Bypasses generic_statat path normalization when fd is already validated realfs
-static inline int fast_fstat64(struct cpu_state *cpu) {
+static inline int fast_fstat64(struct cpu_state *cpu, bool *handled) {
     fd_t fd_no = (fd_t)cpu->regs[0];
     addr_t statbuf_addr = (addr_t)cpu->regs[1];
 
     // Quick validation: fd must be valid
     struct fd *fd = f_get_retain(fd_no);
     if (fd == NULL)
-        return -1;  // Fall back to slow path
+        return 0;  // Fall back to slow path
 
     // Fast path condition: fd is realfs (not adhoc, not procfs, etc.)
-    if (fd->ops != &realfs_fdops || is_adhoc_fd(fd)) { fd_close(fd); return -1; }  // Fall back to slow path
+    if (fd->ops != &realfs_fdops || is_adhoc_fd(fd)) { fd_close(fd); return 0; }  // Fall back to slow path
 
+    *handled = true;
     // Direct host fstat call (bypass generic layers)
     struct stat real_stat;
     if (fstat(fd->real_fd, &real_stat) < 0) {
@@ -991,23 +988,24 @@ static inline bool syscall_should_surface_eintr(void) {
 }
 
 // Fast path for read (syscall 63) - small buffers only
-static inline int fast_read(struct cpu_state *cpu) {
+static inline int fast_read(struct cpu_state *cpu, bool *handled) {
     fd_t fd_no = (fd_t)cpu->regs[0];
     addr_t buf_addr = (addr_t)cpu->regs[1];
     if (cpu->regs[2] > 4096)
-        return -1;
+        return 0;
     dword_t size = (dword_t)cpu->regs[2];
 
     struct fd *fd = f_get_retain(fd_no);
-    if (fd == NULL) return -1;
+    if (fd == NULL) return 0;
     // Accept realfs and fakefs regular/stream fds; memfd requires seal locking
     // and directories must return EISDIR via sys_read.
     if ((fd->ops != &realfs_fdops && fd->ops != &fakefs_fdops) ||
             fd->memfd || S_ISDIR(fd->type)) {
         fd_close(fd);
-        return -1;
+        return 0;
     }
 
+    *handled = true;
     // Direct host read. Retry spurious host EINTR, but surface guest signals
     // (especially exit_group SIGKILL) so helper threads blocked in pipes can
     // leave cleanly instead of being detached by the exit safety valve.
@@ -1033,27 +1031,29 @@ static inline int fast_read(struct cpu_state *cpu) {
 }
 
 // Fast path for write (syscall 64) - small buffers only
-static inline int fast_write(struct cpu_state *cpu) {
+static inline int fast_write(struct cpu_state *cpu, bool *handled) {
     fd_t fd_no = (fd_t)cpu->regs[0];
     addr_t buf_addr = (addr_t)cpu->regs[1];
     if (cpu->regs[2] > 4096)
-        return -1;
+        return 0;
     dword_t size = (dword_t)cpu->regs[2];
 
     struct fd *fd = f_get_retain(fd_no);
-    if (fd == NULL) return -1;
+    if (fd == NULL) return 0;
     // Accept realfs and fakefs fds when writable and already stripped of file
-    // capabilities for the current global generation; otherwise fall back to
-    // sys_write (which handles EBADF, memfd seals, and first-write cap strip).
+    // capabilities for the current stable (even) global generation; otherwise
+    // fall back to sys_write (which handles EBADF, memfd seals, and cap strip).
+    uint64_t caps_gen = atomic_load_explicit(&g_file_caps_gen, memory_order_acquire);
     if ((fd->ops != &realfs_fdops && fd->ops != &fakefs_fdops) ||
             fd->memfd ||
             (__atomic_load_n(&fd->flags, __ATOMIC_RELAXED) & O_ACCMODE_) == O_RDONLY_ ||
-            __atomic_load_n(&fd->caps_stripped_gen, __ATOMIC_RELAXED) !=
-                atomic_load_explicit(&g_file_caps_gen, memory_order_acquire)) {
+            (caps_gen & 1) != 0 ||
+            __atomic_load_n(&fd->caps_stripped_gen, __ATOMIC_RELAXED) != caps_gen) {
         fd_close(fd);
-        return -1;
+        return 0;
     }
 
+    *handled = true;
     // Copy from guest memory
     char buf[4096];
     if (user_read(buf_addr, buf, size)) { fd_close(fd); return _EFAULT; }

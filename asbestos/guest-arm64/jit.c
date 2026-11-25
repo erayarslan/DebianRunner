@@ -176,13 +176,23 @@ void jit_counters(uint64_t *blocks, uint64_t *segments, uint64_t *code_bytes) {
     if (code_bytes) *code_bytes = atomic_load_explicit(&st_bytes, memory_order_relaxed);
 }
 
+#if !TARGET_OS_OSX && !defined(__linux__) && !defined(ISH_JIT_NO_EMIT)
+static _Atomic bool ios_region_ready;
+static pthread_mutex_t ios_acquire_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 void jit_region_stats(uint64_t *used_bytes, uint64_t *capacity_bytes,
                       uint64_t *reused_blocks, bool *pic_enabled, bool *exhausted) {
-    size_t reserved = region ? atomic_load_explicit(&region_used, memory_order_relaxed) : 0;
+#if !TARGET_OS_OSX && !defined(__linux__) && !defined(ISH_JIT_NO_EMIT)
+    bool active_region = atomic_load_explicit(&ios_region_ready, memory_order_acquire) && region != NULL;
+#else
+    bool active_region = region != NULL;
+#endif
+    size_t reserved = active_region ? atomic_load_explicit(&region_used, memory_order_relaxed) : 0;
     if (reserved > REGION_SIZE)
         reserved = REGION_SIZE;
     if (used_bytes) *used_bytes = (uint64_t) reserved;
-    if (capacity_bytes) *capacity_bytes = region ? (uint64_t) REGION_SIZE : 0;
+    if (capacity_bytes) *capacity_bytes = active_region ? (uint64_t) REGION_SIZE : 0;
     if (reused_blocks) *reused_blocks = atomic_load_explicit(&st_shared, memory_order_relaxed);
     if (pic_enabled) *pic_enabled = pic_on;
     if (exhausted) *exhausted = atomic_load_explicit(&region_exhausted, memory_order_relaxed);
@@ -192,7 +202,6 @@ void jit_region_stats(uint64_t *used_bytes, uint64_t *capacity_bytes,
 // jit_ios_acquire() once iOS has authorised it (an external debugger such as
 // StikDebug attached; see docs/engine/IOS_JIT.md), and translation starts with
 // the next block compiled after that. Without it the gadgets run as always.
-static _Atomic bool ios_region_ready;
 
 // StikDebug's documented breakpoint protocol for devices with TXM (iOS 26+):
 // the attached script prepares an RX mapping (x16 = 1) and detaches (x16 = 0).
@@ -252,34 +261,67 @@ static bool ios_region_verify(void) {
 }
 
 int jit_ios_acquire(bool txm, char *detail, size_t size) {
-    if (atomic_load(&ios_region_ready)) { snprintf(detail, size, "already active"); return 0; }
-    if (region) { snprintf(detail, size, "a previous attempt left an unverified region"); return -1; }
+    pthread_mutex_lock(&ios_acquire_lock);
+    if (atomic_load_explicit(&ios_region_ready, memory_order_acquire)) {
+        pthread_mutex_unlock(&ios_acquire_lock);
+        snprintf(detail, size, "already active");
+        return 0;
+    }
+    if (region) {
+        pthread_mutex_unlock(&ios_acquire_lock);
+        snprintf(detail, size, "a previous attempt left an unverified region");
+        return -1;
+    }
     if (!txm) {
         // Without TXM, a debugged process may map an executable alias: the
         // mprotect below is iOS's own permission check.
-        if (!map_dual()) { snprintf(detail, size, "Classic memory acquisition failed: %s", dual_map_error[0] ? dual_map_error : "mapping unavailable"); return -1; }
+        if (!map_dual()) {
+            pthread_mutex_unlock(&ios_acquire_lock);
+            snprintf(detail, size, "Classic memory acquisition failed: %s", dual_map_error[0] ? dual_map_error : "mapping unavailable");
+            return -1;
+        }
     } else {
         jit26_guard(true);
         uint8_t *rx = jit26_prepare_region(NULL, REGION_SIZE);
         if (jit26_unanswered) {
             jit26_guard(false);
+            if (rx) munmap(rx, REGION_SIZE);
+            pthread_mutex_unlock(&ios_acquire_lock);
             snprintf(detail, size, "no debugger answered (StikDebug must stay attached with its universal.js script while LinuxRunner activates the JIT)");
             return -1;
         }
         vm_address_t rw = 0;
         vm_prot_t cur, max;
-        bool ok = rx && vm_remap(mach_task_self(), &rw, REGION_SIZE, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
-                                 (vm_address_t) rx, false, &cur, &max, VM_INHERIT_NONE) == KERN_SUCCESS &&
-                  mprotect((void *) rw, REGION_SIZE, PROT_READ | PROT_WRITE) == 0;
+        bool remapped = rx && vm_remap(mach_task_self(), &rw, REGION_SIZE, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+                                       (vm_address_t) rx, false, &cur, &max, VM_INHERIT_NONE) == KERN_SUCCESS;
+        bool ok = remapped && mprotect((void *) rw, REGION_SIZE, PROT_READ | PROT_WRITE) == 0;
         jit26_detach();
         jit26_guard(false);
-        if (!ok) { snprintf(detail, size, rx ? "the prepared region could not get a writable alias" : "the debugger did not prepare a region"); return -1; }
+        if (!ok) {
+            if (remapped) munmap((void *) rw, REGION_SIZE);
+            if (rx) munmap(rx, REGION_SIZE);
+            pthread_mutex_unlock(&ios_acquire_lock);
+            snprintf(detail, size, rx ? "the prepared region could not get a writable alias" : "the debugger did not prepare a region");
+            return -1;
+        }
         region = rx;
         rw_delta = (intptr_t) rw - (intptr_t) rx;
         dual_map = true;
     }
-    if (!ios_region_verify()) { snprintf(detail, size, "generated code did not run correctly"); return -1; }
-    atomic_store(&ios_region_ready, true);
+    if (!ios_region_verify()) {
+        if (dual_map && region) munmap(region + rw_delta, REGION_SIZE);
+        if (region) munmap(region, REGION_SIZE);
+        region = NULL;
+        rw_delta = 0;
+        dual_map = false;
+        atomic_store_explicit(&region_used, 0, memory_order_relaxed);
+        atomic_store_explicit(&region_exhausted, false, memory_order_relaxed);
+        pthread_mutex_unlock(&ios_acquire_lock);
+        snprintf(detail, size, "generated code did not run correctly");
+        return -1;
+    }
+    atomic_store_explicit(&ios_region_ready, true, memory_order_release);
+    pthread_mutex_unlock(&ios_acquire_lock);
     snprintf(detail, size, "%s, %u MB code region", txm ? "TXM prepared region" : "dual mapping", REGION_SIZE >> 20);
     return 0;
 }
@@ -383,7 +425,8 @@ static const int8_t pin_guest[] = {0, G_SP, 1, 2, 19, 3, 4, 21, 20, 22, 23, 30, 
 static const int8_t pin_host[]  = {19, 20, 21, 22, 23, 24, 25, 26, 27, 3, 4, 5, 6, 7, 13, 14};
 static const uint8_t lazy_pool[] = {16, 17, 0};
 #define H_CYC 15   // pinned mode: cpu->cycle lives in w15 between cold entry and exit
-static const uint8_t pool_nopin[] = {0, 3, 4, 5, 6, 7, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27};
+// Exclude x27 (_cycle_w in entry.S) from pool_nopin so unpinned exits preserve it.
+static const uint8_t pool_nopin[] = {0, 3, 4, 5, 6, 7, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26};
 static int n_pinned;               // 0 when pinning is off
 static int prologue_words;          // cold-entry prologue length (hot entry offset)
 static uintptr_t exit_stub;         // shared: store pinned registers; br x8
@@ -516,10 +559,12 @@ static void writeback(struct em *e, int g) {
 }
 
 static void load_pinned(struct em *e) {
+    // Capture live gadget cycle counter from w27 (_cycle_w) before pin_host[8]
+    // loads guest x20 into x27.
+    if (n_pinned)
+        put(e, 0x2A1B03EFu);   // mov w15, w27
     for (int i = 0; i < n_pinned; i++)
         put(e, 0xF9400000u | ((greg_off(pin_guest[i]) / 8) << 10) | (1u << 5) | (uint32_t) pin_host[i]);
-    if (n_pinned)
-        put(e, 0xB9400000u | ((CPU_cycle / 4) << 10) | (1u << 5) | H_CYC);   // ldr w15, [x1, #cycle]
 }
 
 // loop block: promoted registers <-> canonical pinned state
@@ -751,14 +796,19 @@ static void enter_native(struct em *e) {
     put(e, 0xD61F0100u);                                                     // 1: br x8
 }
 
-// Shared exit stub: store the pinned guest registers, then br x8.
+// Shared exit stub: store the pinned guest registers, restore _cycle_w (w27)
+// for gadget/fiber_exit convention, then br x8.
 static void make_exit_stub(void) {
     uint32_t stub[40];
     unsigned n = 0;
     for (int i = 0; i < n_pinned; i++)
         stub[n++] = 0xF9000000u | ((greg_off(pin_guest[i]) / 8) << 10) | (1u << 5) | (uint32_t) pin_host[i];
-    if (n_pinned)
+    if (n_pinned) {
         stub[n++] = 0xB9000000u | ((CPU_cycle / 4) << 10) | (1u << 5) | H_CYC;   // str w15, [x1, #cycle]
+        stub[n++] = 0x2A0F03FBu;   // mov w27, w15 (restore _cycle_w after guest x20 spilled)
+    } else {
+        stub[n++] = 0xB9400000u | ((CPU_cycle / 4) << 10) | (1u << 5) | 27u;     // ldr w27, [x1, #cycle]
+    }
     stub[n++] = 0xD61F0100u;   // br x8
     uint8_t *dst = region_alloc(n * 4);
     install_code(dst, stub, n);
@@ -1451,7 +1501,7 @@ bool jit_chain_ok(struct fiber_block *from, int i, struct fiber_block *to) {
     if (!pic_on || !from->native_link[i])
         return true;
     uint32_t *site = from->native_link[i];
-    bool writable = (uintptr_t) site >= (uintptr_t) region && (uintptr_t) site < (uintptr_t) region + REGION_SIZE;
+    bool writable = region && (uintptr_t) site >= (uintptr_t) region && (uintptr_t) site < (uintptr_t) region + REGION_SIZE;
     uint64_t lit = __atomic_load_n((uint64_t *) (site + 1), __ATOMIC_ACQUIRE);
     if (lit == LINK_UNSET && (!writable || link_off))
         return true;   // never linked (read-only AOT code, or links off): the branch falls through
@@ -2306,32 +2356,35 @@ void jit_block_free(struct fiber_block *b) {
 }
 
 // Point a slot at block b, whose translation's constants are relative to base.
-// The slot must be free or b's (slot_claim()).
+// The slot must be free, b's, or owned by a retired jetsam block with matching bases.
 static void slot_set(struct jit_ctx *ctx, unsigned idx, struct fiber_block *b, uint64_t base, uint64_t dbase) {
     b->jit_idx = idx;
-    ctx_far(ctx, idx)->alt[0] = ctx_far(ctx, idx)->alt[1] = 0;
+    __atomic_store_n(&ctx_far(ctx, idx)->alt[0], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&ctx_far(ctx, idx)->alt[1], 0, __ATOMIC_RELEASE);
     ctx_far(ctx, idx)->dbase = dbase;
     ctx->slot[idx].base = base;
     __atomic_store_n(&ctx->slot[idx].blk, b, __ATOMIC_RELEASE);
 }
 
-// Take slot idx for b if it is free (or b's already): a slot has one owner,
-// whose native code its translation's direct links were made to reach.
+// Take slot idx for b if it is free, b's already, or still held only by a
+// retired (is_jetsam) block with identical base/dbase awaiting jetsam drain
+// (safe under caller's read_wrlock(&jetsam_lock) + lock(&asbestos->lock): no
+// block in this asbestos can be freed concurrently, and jit_block_free uses CAS).
 static bool slot_claim(struct jit_ctx *ctx, unsigned idx, struct fiber_block *b, uint64_t base, uint64_t dbase) {
     pthread_mutex_lock(&ctx_lock);
     struct fiber_block *owner = ctx->slot[idx].blk;
-    bool ok = !owner || owner == b;
+    bool ok = !owner || owner == b ||
+              (owner->is_jetsam && ctx->slot[idx].base == base && ctx_far(ctx, idx)->dbase == dbase);
     if (ok)
         slot_set(ctx, idx, b, base, dbase);
     pthread_mutex_unlock(&ctx_lock);
     return ok;
 }
 
-static void reg_install(struct fiber_block *b, struct jit_ctx *ctx, const struct reg_entry *r) {
-    // Another block of this address space holds the translation (the same
-    // code at the same place, still in the cache): b keeps its gadgets.
+static bool reg_install(struct fiber_block *b, struct jit_ctx *ctx, const struct reg_entry *r) {
+    // Another live block of this address space holds the translation: b keeps its gadgets.
     if (!slot_claim(ctx, r->idx, b, ctx->base, ctx->base))
-        return;
+        return false;
     b->jit_ctx = ctx;
     b->native_link[0] = r->link[0];
     b->native_link[1] = r->link[1];
@@ -2340,6 +2393,7 @@ static void reg_install(struct fiber_block *b, struct jit_ctx *ctx, const struct
         if (r->seg[i].pos == 0 && n_pinned)
             __atomic_store_n(&b->native_entry, (uintptr_t) r->seg[i].code + entry_off(), __ATOMIC_RELEASE);
     }
+    return true;
 }
 
 // ISH_JIT_RECORD=<file>: at exit, write every translation of the modules whose
@@ -2390,7 +2444,7 @@ void ish_aot_register(const struct aot_module *m) {
 
 // Bump whenever the code emitted for some guest instruction, stub or exit
 // changes: images made before would still pass every other check.
-#define JIT_CODE_VERSION 14   // 13: dirty-only checkpoint stores; 14: ARMv8 crypto instructions translated
+#define JIT_CODE_VERSION 15   // 14: ARMv8 crypto; 15: load_pinned captures w27 (_cycle_w) before pinning guest x20
 
 // Everything the emitted code bakes in besides the gadgets it names: the
 // conventions, the struct layouts it loads from and the TLB / block cache
@@ -2955,14 +3009,14 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
     for (; r; r = r->next)
         if (r->hash == h && r->nkey == nkey && !memcmp(r->key, key, nkey * 4))
             break;
-    unsigned idx = 0;
+    unsigned idx = max_idx;
     bool exhausted = atomic_load_explicit(&region_exhausted, memory_order_relaxed);
-    if (!r && reg_table && !exhausted)
-        idx = mod_tables_fit(mod) ? mod_next_idx[mod]++ : max_idx;
+    if (!r && reg_table && !exhausted && mod_tables_fit(mod) && mod_next_idx[mod] < max_idx)
+        idx = mod_next_idx[mod]++;
     pthread_mutex_unlock(&reg_lock);
     if (r) {
-        reg_install(b, ctx, r);
-        atomic_fetch_add_explicit(&st_shared, 1, memory_order_relaxed);
+        if (reg_install(b, ctx, r))
+            atomic_fetch_add_explicit(&st_shared, 1, memory_order_relaxed);
         return;
     }
     if (!reg_table || exhausted || idx >= max_idx)
@@ -2974,9 +3028,11 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
     b->jit_ctx = ctx;
     slot_set(ctx, idx, b, base, base);
     jit_native(b, U, e);
-    if (e->ninst > sizeof(e->inst) / sizeof(e->inst[0]) ||
-        (e->ninst == 0 && atomic_load_explicit(&region_exhausted, memory_order_relaxed)))
+    if (e->ninst == 0 || e->ninst > sizeof(e->inst) / sizeof(e->inst[0])) {
+        jit_block_free(b);
+        b->jit_ctx = NULL;
         return;
+    }
     r = malloc(sizeof(*r) + nkey * 4);
     if (!r)
         return;
@@ -2998,6 +3054,16 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
         r->seg[i].rec = e->inst[i].rec;
     }
     pthread_mutex_lock(&reg_lock);
+    struct reg_entry *dup = reg_table[h & (REG_BUCKETS - 1)];
+    for (; dup; dup = dup->next)
+        if (dup->hash == h && dup->nkey == nkey && !memcmp(dup->key, key, nkey * 4))
+            break;
+    if (dup) {
+        pthread_mutex_unlock(&reg_lock);
+        free(r->seg);
+        free(r);
+        return;
+    }
     r->next = reg_table[h & (REG_BUCKETS - 1)];
     reg_table[h & (REG_BUCKETS - 1)] = r;
     pthread_mutex_unlock(&reg_lock);
@@ -3043,6 +3109,8 @@ struct cm_module {
     uint8_t id[20], id_len;      // NT_GNU_BUILD_ID, id_len 0 if none
     dev_t dev;
     ino_t ino;
+    off_t size;
+    int64_t mtime_ns;
     bool have_stat;
     unsigned max_idx;            // per-module PIC context slot capacity (<= CTX_MAX)
     uint64_t blocks, units, segments, bytes;
@@ -3130,13 +3198,15 @@ static unsigned calc_mod_max_idx(const char *path, uint64_t exec_bytes) {
 }
 
 static int cm_module_of(const char *path, const uint8_t *id, unsigned id_len, uint64_t exec_bytes,
-                        dev_t dev, ino_t ino, bool have_stat) {
+                        dev_t dev, ino_t ino, off_t size, int64_t mtime_ns, bool have_stat) {
     for (unsigned i = 0; i < cm_nmods; i++)
         if (id_len ? cm_mods[i].id_len == id_len && !memcmp(cm_mods[i].id, id, id_len)
                    : !cm_mods[i].id_len && !strcmp(cm_mods[i].path, path)) {
             if (have_stat && !cm_mods[i].have_stat) {
                 cm_mods[i].dev = dev;
                 cm_mods[i].ino = ino;
+                cm_mods[i].size = size;
+                cm_mods[i].mtime_ns = mtime_ns;
                 cm_mods[i].have_stat = true;
             }
             return (int) i;
@@ -3156,6 +3226,8 @@ static int cm_module_of(const char *path, const uint8_t *id, unsigned id_len, ui
     m->id_len = (uint8_t) id_len;
     m->dev = dev;
     m->ino = ino;
+    m->size = size;
+    m->mtime_ns = mtime_ns;
     m->have_stat = have_stat;
     m->max_idx = calc_mod_max_idx(path, exec_bytes);
     return (int) cm_nmods++;
@@ -3175,21 +3247,27 @@ static int cm_locate(addr_t pc, uint64_t *off, struct data **datap) {
     struct data *data = pt->data;
     if (datap)
         *datap = data;
-    // realfs maps the file from file_offset rounded down to a host page, and
-    // pt->offset counts from there.
+    // File mappings record mapping_offset (0 on 4 KiB CoW copies, file_offset %
+    // real_page_size on original host-page-aligned mmaps); subtracting it yields
+    // the exact file offset for both regular and CoW-copied executable pages.
     if (data->fd)
-        *off = data->file_offset - data->file_offset % real_page_size + pt->offset + PGOFFSET(pc);
+        *off = data->file_offset + pt->offset - data->mapping_offset + PGOFFSET(pc);
+    else if (data->name && !strcmp(data->name, "[vdso]"))
+        *off = pt->offset + PGOFFSET(pc);
     // Looked up once per mapping (shared by forked address spaces).
     if (data->jit_mod)
         return data->jit_mod - 1;
     dev_t dev = 0;
     ino_t ino = 0;
+    off_t fsize = 0;
+    int64_t fmtime_ns = 0;
     bool have_stat = false;
     if (!data->name && data->fd && fd_is_mapping_identity(data->fd) &&
-        fd_mapping_identity_stat(data->fd, &dev, &ino)) {
+        fd_mapping_identity_stat(data->fd, &dev, &ino, &fsize, &fmtime_ns)) {
         have_stat = true;
         for (unsigned i = 0; i < cm_nmods; i++) {
-            if (cm_mods[i].have_stat && cm_mods[i].dev == dev && cm_mods[i].ino == ino) {
+            if (cm_mods[i].have_stat && cm_mods[i].dev == dev && cm_mods[i].ino == ino &&
+                cm_mods[i].size == fsize && cm_mods[i].mtime_ns == fmtime_ns) {
                 data->jit_mod = (int) i + 1;
                 return (int) i;
             }
@@ -3206,7 +3284,7 @@ static int cm_locate(addr_t pc, uint64_t *off, struct data **datap) {
             snprintf(path, sizeof(path), "[unnamed file]");
         id_len = elf_build_id(data->fd, id, &exec_bytes);
     }
-    int mod = cm_module_of(path, id, id_len, exec_bytes, dev, ino, have_stat);
+    int mod = cm_module_of(path, id, id_len, exec_bytes, dev, ino, fsize, fmtime_ns, have_stat);
     if (mod >= 0)
         data->jit_mod = mod + 1;
     return mod;
@@ -3216,7 +3294,8 @@ static int jit_locate(addr_t pc, uint64_t *off, uint64_t *base, unsigned *max_id
     pthread_mutex_lock(&cm_lock);
     struct data *data;
     int mod = cm_locate(pc, off, &data);
-    bool anon = mod >= 0 && !data->fd;
+    bool is_vdso = data && data->name && !strcmp(data->name, "[vdso]");
+    bool anon = mod >= 0 && !data->fd && !is_vdso;
     unsigned max_idx = (mod >= 0 && (unsigned) mod < cm_nmods && cm_mods[mod].max_idx) ? cm_mods[mod].max_idx : CTX_MAX;
     pthread_mutex_unlock(&cm_lock);
     if (mod < 0)
@@ -3584,10 +3663,11 @@ size_t jit_describe(char *buf, size_t size) {
     for (unsigned m = 0; m < mod_next_cap; m++) {
         if (!mod_aot[m])
             continue;
+        char path_buf[256];
         pthread_mutex_lock(&cm_lock);
-        const char *path = (unsigned) m < cm_nmods ? cm_mods[m].path : mod_aot[m]->path;
+        snprintf(path_buf, sizeof(path_buf), "%s", (unsigned) m < cm_nmods ? cm_mods[m].path : mod_aot[m]->path);
         pthread_mutex_unlock(&cm_lock);
-        OUT("  %-40s %8llu / %-8llu / %-8llu %s\n", path, (unsigned long long) mod_blocks[m],
+        OUT("  %-40s %8llu / %-8llu / %-8llu %s\n", path_buf, (unsigned long long) mod_blocks[m],
             (unsigned long long) mod_hits[m], (unsigned long long) mod_moved[m],
             mod_hits[m] ? "" : mod_blocks[m] ? "<- no match: module file differs from the recorded one" : "");
     }

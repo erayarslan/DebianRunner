@@ -2292,8 +2292,10 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                         // Fuse: emit single gadget, consume the LDR
                         // Param 1: ldr_rt[0:4] | rd[5:9] | ldr_offset[16:31]
                         // Param 2: adrp_target (32-bit, zero-extended)
+                        addr_t ldr_pc = state->ip;
                         state->ip += 4;
                         ARM64_FUSION_STAT_INC(arm64_fusion_adrp_ldr64_count);
+                        gen_save_fault_pc(state, ldr_pc);
                         gen(state, (unsigned long) gadget_fused_adrp_ldr64);
                         gen(state, ldr_rt | ((uint64_t)rd << 5) | ((uint64_t)ldr_offset << 16));
                         gen(state, target & 0xffffffffffffULL);

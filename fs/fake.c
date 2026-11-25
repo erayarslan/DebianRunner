@@ -271,10 +271,12 @@ static inline bool is_under_readonly_bind_mount(const char *path) {
 
 /* Auto-create a meta.db entry for a path under a bind mount.
  * Probes the host filesystem to determine if it's a file or directory. */
-static inode_t bind_mount_ensure_inode(struct fakefs_db *fs, struct mount *mount,
-                                       const char *path) {
+static inode_t bind_mount_ensure_inode_retain(struct fakefs_db *fs, struct mount *mount,
+                                              const char *path, struct inode_data **inode_out) {
     db_begin_read(fs);
     inode_t ino = path_get_inode(fs, path);
+    if (ino != 0 && inode_out)
+        *inode_out = inode_get(mount, ino);
     db_commit(fs);
     if (ino != 0)
         return ino;
@@ -308,9 +310,18 @@ static inode_t bind_mount_ensure_inode(struct fakefs_db *fs, struct mount *mount
         ishstat.gid = bind->owner_gid;
     }
     db_begin_write(fs);
-    ino = path_create(fs, path, &ishstat);
+    ino = path_get_inode(fs, path);
+    if (ino == 0)
+        ino = path_create(fs, path, &ishstat);
+    if (ino != 0 && inode_out)
+        *inode_out = inode_get(mount, ino);
     db_commit(fs);
     return ino;
+}
+
+static inode_t bind_mount_ensure_inode(struct fakefs_db *fs, struct mount *mount,
+                                       const char *path) {
+    return bind_mount_ensure_inode_retain(fs, mount, path, NULL);
 }
 
 // Declared extern const in fs/fd.h; defined below after fakefs_readdir.
@@ -396,6 +407,9 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
         if (IS_ERR(fd))
             return fd;
     }
+    // Pin fd->inode via inode_get() while holding fs->lock (lock order: fs->lock
+    // -> inodes_lock) so concurrent unlink + fakefs_inode_orphaned cannot delete
+    // the stats row between resolving fd->fake_inode and pinning the inode.
     if ((flags & (O_CREAT_ | O_EXCL_)) == (O_CREAT_ | O_EXCL_)) {
         db_begin_write(fs);
         fd->fake_inode = path_get_inode(fs, path);
@@ -408,12 +422,16 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
             };
             fd->fake_inode = path_create(fs, path, &ishstat);
         }
+        if (fd->fake_inode != 0)
+            fd->inode = inode_get(mount, fd->fake_inode);
         db_commit(fs);
     } else {
         // Plain opens and O_CREAT on an already-existing file only read metadata;
         // avoid acquiring SQLite's writer lock unless we actually need to create.
         db_begin_read(fs);
         fd->fake_inode = path_get_inode(fs, path);
+        if (fd->fake_inode != 0)
+            fd->inode = inode_get(mount, fd->fake_inode);
         db_commit(fs);
         if (fd->fake_inode == 0 && (flags & O_CREAT_)) {
             db_begin_write(fs);
@@ -427,22 +445,21 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
                 };
                 fd->fake_inode = path_create(fs, path, &ishstat);
             }
+            if (fd->fake_inode != 0)
+                fd->inode = inode_get(mount, fd->fake_inode);
             db_commit(fs);
         }
     }
     if (fd->fake_inode == 0) {
         /* Auto-create for bind-mounted paths */
         if (is_under_bind_mount(path)) {
-            fd->fake_inode = bind_mount_ensure_inode(fs, mount, path);
+            fd->fake_inode = bind_mount_ensure_inode_retain(fs, mount, path, &fd->inode);
         }
         if (fd->fake_inode == 0) {
             fd_close(fd);
             return ERR_PTR(_ENOENT);
         }
     }
-    // Retain the inode before generic_openat's fstat, keeping its expensive
-    // metadata read outside the global inode lock (OpenMinis a1e8b1e2).
-    fd->inode = inode_get(mount, fd->fake_inode);
     if (fd->inode == NULL) {
         fd_close(fd);
         return ERR_PTR(_ENOMEM);
@@ -582,6 +599,24 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
     return 0;
 }
 
+static bool fakefs_host_basename_exact(int root_fd, const char *path, int extra_flags) {
+    const char *want = strrchr(path, '/');
+    want = want ? want + 1 : path;
+    if (*want == '\0')
+        return true;
+    int fd = openat(root_fd, fix_path(path), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | extra_flags);
+    if (fd < 0)
+        return false;
+    char host_path[PATH_MAX];
+    int ok = platform_fd_get_path(fd, host_path, sizeof(host_path)) == 0;
+    close(fd);
+    if (!ok)
+        return false;
+    const char *actual = strrchr(host_path, '/');
+    actual = actual ? actual + 1 : host_path;
+    return strcmp(actual, want) == 0;
+}
+
 static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ dev) {
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(path))
@@ -596,6 +631,20 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
         return err;
     }
     db_begin_write(fs);
+    ino_t inode = path_get_inode(fs, path);
+    if (err == _EEXIST) {
+        if (inode != 0 || is_under_bind_mount(path)) {
+            db_rollback(fs);
+            return _EEXIST;
+        }
+        struct stat st;
+        if (fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW) < 0 ||
+                S_ISDIR(st.st_mode) ||
+                !fakefs_host_basename_exact(mount->root_fd, path, 0)) {
+            db_rollback(fs);
+            return _EEXIST;
+        }
+    }
     struct ish_stat stat;
     stat.mode = mode;
     stat.uid = current->euid;
@@ -603,7 +652,6 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
     stat.rdev = 0;
     if (S_ISBLK(mode) || S_ISCHR(mode))
         stat.rdev = dev;
-    ino_t inode = path_get_inode(fs, path);
     if (inode == 0) {
         path_create(fs, path, &stat);
     } else {
@@ -784,10 +832,13 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
         // Recover "ghost" directories that exist on host disk (e.g., parent
         // directories created implicitly during archive import) without a
         // meta.db row so mkdir doesn't fail EEXIST while stat returns ENOENT.
+        // Require exact on-disk basename so case-insensitive APFS never aliases
+        // distinct-case paths, and skip bind mounts.
         struct stat st;
-        if (err == _EEXIST && path_get_inode(fs, path) == 0 &&
+        if (err == _EEXIST && !is_under_bind_mount(path) && path_get_inode(fs, path) == 0 &&
                 fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
-                S_ISDIR(st.st_mode)) {
+                S_ISDIR(st.st_mode) &&
+                fakefs_host_basename_exact(mount->root_fd, path, O_DIRECTORY)) {
             err = 0;
         } else {
             db_rollback(fs);
@@ -1225,8 +1276,13 @@ static int fakefs_mount(struct mount *mount) {
         return err;
 
     err = fake_db_init(&mount->fakefs, db_path, mount->root_fd);
-    if (err < 0)
+    if (err < 0) {
+        if (mount->root_fd >= 0) {
+            close(mount->root_fd);
+            mount->root_fd = -1;
+        }
         return err;
+    }
 
     /* Store global reference for bind mount API */
     g_fakefs_mount = mount;
@@ -1248,7 +1304,10 @@ static int fakefs_umount(struct mount *mount) {
 static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
     struct fakefs_db *fs = &mount->fakefs;
     db_begin_write(fs);
-    inode_try_cleanup(fs, inode);
+    // Lock order: fs->lock -> inodes_lock. Re-check whether the inode was opened
+    // or re-opened after inodes_lock was dropped by inode_check_orphaned/inode_release.
+    if (!inode_check_alive_and_mark_orphan(mount, inode))
+        inode_try_cleanup(fs, inode);
     db_commit(fs);
 }
 

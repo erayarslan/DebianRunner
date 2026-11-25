@@ -46,6 +46,23 @@ typedef struct linux_tty *tty_t;
 
 @end
 
+@interface TerminalScriptMessageProxy : NSObject <WKScriptMessageHandler>
+@property (weak) id<WKScriptMessageHandler> target;
+@end
+@implementation TerminalScriptMessageProxy
+- (instancetype)initWithTarget:(id<WKScriptMessageHandler>)target {
+    if (self = [super init]) {
+        _target = target;
+    }
+    return self;
+}
+- (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
+    [self.target userContentController:userContentController didReceiveScriptMessage:message];
+}
+@end
+
+static NSString *const TERMINAL_SCRIPT_HANDLERS[] = {@"load", @"log", @"sendInput", @"resize", @"propUpdate"};
+
 @interface CustomWebView : WKWebView
 @end
 @implementation CustomWebView
@@ -123,11 +140,10 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
                                                                         injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                                                      forMainFrameOnly:YES];
         [config.userContentController addUserScript:bootstrapStyleUserScript];
-        [config.userContentController addScriptMessageHandler:self name:@"load"];
-        [config.userContentController addScriptMessageHandler:self name:@"log"];
-        [config.userContentController addScriptMessageHandler:self name:@"sendInput"];
-        [config.userContentController addScriptMessageHandler:self name:@"resize"];
-        [config.userContentController addScriptMessageHandler:self name:@"propUpdate"];
+        TerminalScriptMessageProxy *proxy = [[TerminalScriptMessageProxy alloc] initWithTarget:self];
+        for (size_t i = 0; i < sizeof(TERMINAL_SCRIPT_HANDLERS) / sizeof(TERMINAL_SCRIPT_HANDLERS[0]); i++) {
+            [config.userContentController addScriptMessageHandler:proxy name:TERMINAL_SCRIPT_HANDLERS[i]];
+        }
         // Make the web view really big so that if a program tries to write to the terminal before it's displayed, the text probably won't wrap too badly.
         CGRect webviewSize = CGRectMake(0, 0, 10000, 10000);
         _webView = [[CustomWebView alloc] initWithFrame:webviewSize configuration:config];
@@ -228,6 +244,11 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
     NSLog(@"terminal web content process terminated; reloading frontend");
     self.loaded = NO;
+    @synchronized (self) {
+        _lastWindowCols = 0;
+        _lastWindowRows = 0;
+        _windowSizeRequestID++;
+    }
 #if !ISH_LINUX
     lock(&_dataLock);
     _outputInProgress = NO;
@@ -253,13 +274,16 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     @synchronized (self) {
         requestID = ++_windowSizeRequestID;
     }
-    [self.webView evaluateJavaScript:@"exports.getSize()" completionHandler:^(NSArray<NSNumber *> *dimensions, NSError *error) {
+    WKWebView *webView = _webView;
+    if (webView == nil)
+        return;
+    [webView evaluateJavaScript:@"exports.getSize()" completionHandler:^(NSArray<NSNumber *> *dimensions, NSError *error) {
         if (error != nil || ![dimensions isKindOfClass:NSArray.class] || dimensions.count < 2 ||
             ![dimensions[0] isKindOfClass:NSNumber.class] || ![dimensions[1] isKindOfClass:NSNumber.class])
             return;
         int cols = dimensions[0].intValue;
         int rows = dimensions[1].intValue;
-        tty_t tty;
+        tty_t tty = NULL;
         @synchronized (self) {
             if (requestID != self->_windowSizeRequestID)
                 return;
@@ -268,6 +292,10 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
                 return;
             if (cols == self->_lastWindowCols && rows == self->_lastWindowRows)
                 return;
+#if !ISH_LINUX
+            if (!tty_try_retain(tty))
+                return;
+#endif
             self->_lastWindowCols = cols;
             self->_lastWindowRows = rows;
         }
@@ -275,6 +303,9 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         lock(&tty->lock);
         tty_set_winsize(tty, (struct winsize_) {.col = cols, .row = rows});
         unlock(&tty->lock);
+        lock(&ttys_lock);
+        tty_release(tty);
+        unlock(&ttys_lock);
 #else
         async_do_in_workqueue(^{
             @synchronized (self) {
@@ -331,14 +362,23 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 #endif
 
 - (void)sendInput:(NSData *)input {
-    tty_t tty;
+    if (input == nil)
+        return;
+    tty_t tty = NULL;
     @synchronized (self) {
         tty = self->_tty;
+#if !ISH_LINUX
+        if (tty != NULL && !tty_try_retain(tty))
+            tty = NULL;
+#endif
     }
-    if (tty == NULL || input == nil)
+    if (tty == NULL)
         return;
 #if !ISH_LINUX
     tty_input(tty, input.bytes, input.length, 0);
+    lock(&ttys_lock);
+    tty_release(tty);
+    unlock(&ttys_lock);
 #else
     async_do_in_workqueue(^{
         NSData *inputRef = input;
@@ -462,21 +502,49 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 }
 
 - (void)destroy {
-    tty_t tty = self.tty;
+    tty_t tty = NULL;
+    @synchronized (self) {
+        tty = self->_tty;
+#if !ISH_LINUX
+        if (tty != NULL && !tty_try_retain(tty))
+            tty = NULL;
+#endif
+    }
     if (tty != NULL) {
 #if !ISH_LINUX
-        if (tty != NULL) {
-            lock(&tty->lock);
-            tty_hangup(tty);
-            unlock(&tty->lock);
-        }
+        lock(&tty->lock);
+        tty_hangup(tty);
+        unlock(&tty->lock);
+        lock(&ttys_lock);
+        tty_release(tty);
+        unlock(&ttys_lock);
 #else
         tty->ops->hangup(tty);
 #endif
     }
     @synchronized (Terminal.class) {
         [terminals removeObjectForKey:self.terminalsKey];
+        if (self.uuid != nil)
+            [terminalsByUUID removeObjectForKey:self.uuid];
     }
+    self.refreshTask = nil;
+    void (^teardownWebView)(void) = ^{
+        WKWebView *wv = self->_webView;
+        self->_webView = nil;
+        if (wv != nil) {
+            wv.navigationDelegate = nil;
+            WKUserContentController *ucc = wv.configuration.userContentController;
+            for (size_t i = 0; i < sizeof(TERMINAL_SCRIPT_HANDLERS) / sizeof(TERMINAL_SCRIPT_HANDLERS[0]); i++) {
+                [ucc removeScriptMessageHandlerForName:TERMINAL_SCRIPT_HANDLERS[i]];
+            }
+            [wv removeFromSuperview];
+        }
+        self.loaded = NO;
+    };
+    if (NSThread.isMainThread)
+        teardownWebView();
+    else
+        dispatch_async(dispatch_get_main_queue(), teardownWebView);
 }
 
 + (void)initialize {

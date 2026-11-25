@@ -35,6 +35,7 @@ struct PlanChange: Identifiable, Hashable {
 enum StoreOperationState: Equatable { case idle, running(String), failed(String), succeeded(String) }
 
 @MainActor final class AppStoreModel: ObservableObject {
+    static let shared = AppStoreModel()
     @Published var catalog: [StoreItem] = []
     @Published var installed: [LinuxPackageRecord] = []
     @Published var searchResults: [StoreItem] = []
@@ -128,6 +129,7 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
             state = .running(label); stage = label; log = ""
             LRRuntimeBridge.logCategory("PACKAGE", event: "packages operation=\(operation) root=\(root)")
             let started = Date()
+            var exitedAt: Date? = nil
             timer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] t in
                 Task { @MainActor in
                     guard let self else { t.invalidate(); return }
@@ -135,13 +137,30 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
                     let tail = self.read("package-output.tmp", 6144)
                     if !tail.isEmpty { self.log = tail }
                     if let line = tail.components(separatedBy: .newlines).last(where: { $0.hasPrefix("PACKAGE_STAGE: ") }) { self.stage = String(line.dropFirst(15)) }
-                    // No result within 30 minutes and no live output: report, never guess.
-                    let stalled = Date().timeIntervalSince(started) > 1800 && code.isEmpty
-                    guard (!code.isEmpty && code != "running") || stalled else { return }
-                    t.invalidate(); self.timer = nil; self.runner = nil
+                    let incomplete = code.isEmpty || code == "running"
+                    if session.sessionPid <= 0 {
+                        if exitedAt == nil { exitedAt = Date() }
+                    } else {
+                        exitedAt = nil
+                    }
+                    let processDied = incomplete && exitedAt.map { Date().timeIntervalSince($0) > 2.0 } == true
+                    // No result within 30 minutes (or process exited without writing final status): report, never guess.
+                    let stalled = (Date().timeIntervalSince(started) > 1800 && incomplete) || processDied
+                    guard !incomplete || stalled else { return }
+                    t.invalidate(); self.timer = nil
+                    self.runner?.terminal?.destroy()
+                    self.runner = nil
                     self.log = self.read("package-operation.log", 16384)
                     let ok = code == "0"
-                    self.state = ok ? .succeeded(label) : .failed(stalled ? "\(label): no result after 30 minutes. Check the package log." : Self.failure(code, self.log))
+                    let failMsg: String
+                    if processDied {
+                        failMsg = "\(label): package process exited before reporting a result. Check the package log."
+                    } else if stalled {
+                        failMsg = "\(label): no result after 30 minutes. Check the package log."
+                    } else {
+                        failMsg = Self.failure(code, self.log)
+                    }
+                    self.state = ok ? .succeeded(label) : .failed(failMsg)
                     done(ok)
                     self.next()
                 }
@@ -191,7 +210,7 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
 struct AppStoreView: View {
     @ObservedObject var manager: EnvironmentManager
     var run: (LinuxApplication) -> Void
-    @StateObject private var model = AppStoreModel()
+    @ObservedObject private var model = AppStoreModel.shared
     @State private var section = 0
     @State private var query = ""
     @State private var selected: StoreItem?

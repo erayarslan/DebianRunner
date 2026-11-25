@@ -39,6 +39,9 @@ struct inode_data *inode_get_unlocked(struct mount *mount, ino_t inode);
 
 // calls mount->fs->inode_orphaned if this inode is orphaned (after releasing inodes_lock)
 void inode_check_orphaned(struct mount *mount, ino_t ino);
+// Atomically checks whether an inode is currently open in memory; if so, marks
+// orphan_pending so cleanup runs on final release and returns true.
+bool inode_check_alive_and_mark_orphan(struct mount *mount, ino_t ino);
 
 // file locking stuff (maybe should go in kernel/calls.h?)
 

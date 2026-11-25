@@ -250,7 +250,7 @@ dword_t sys_mount(addr_t source_addr, addr_t point_addr, addr_t type_addr, dword
     char point_raw[MAX_PATH];
     if (user_read_string(point_addr, point_raw, sizeof(point_raw)))
         return _EFAULT;
-    char data[MAX_PATH];
+    char data[MAX_PATH] = "";
     if (data_addr != 0) {
         if (user_read_string(data_addr, data, sizeof(data)))
             return _EFAULT;

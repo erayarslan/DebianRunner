@@ -200,7 +200,7 @@ const char *host_nofile_describe(char *buf, size_t size);
 struct fd *fd_mapping_identity(struct fd *source);
 bool fd_is_mapping_identity(struct fd *fd);
 int fd_mapping_identity_path(struct fd *fd, char *buf);
-bool fd_mapping_identity_stat(struct fd *fd, dev_t *dev, ino_t *ino);
+bool fd_mapping_identity_stat(struct fd *fd, dev_t *dev, ino_t *ino, off_t *size, int64_t *mtime_ns);
 int fd_close(struct fd *fd);
 
 int fd_getflags(struct fd *fd);

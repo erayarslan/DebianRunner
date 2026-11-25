@@ -15,10 +15,10 @@ enum DiagnosticPrivacy {
     private static let compiledPatterns: [(NSRegularExpression, String)] = [
         (#"(?i)(password|passwd|token|secret|api[_-]?key|cookie|authorization)"?\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"#, "$1=[REDACTED]"),
         (#"(?i)Bearer\s+\S+"#, "Bearer [REDACTED]"),
-        (#"(https?://)[^/\s]*@"#, "$1[REDACTED]@"),
-        (#"(https?://[^/\s?#]+)[/][^\s]*"#, "$1/[path omitted]"),
-        (#"(https?://[^\s?#]+)[?#][^\s]*"#, "$1?[REDACTED]"),
-        (#"title=.*$"#, "title=[omitted]")
+        (#"(?i)(https?://)[^/\s]*@"#, "$1[REDACTED]@"),
+        (#"(?i)(https?://[^/\s?#]+)[/][^\s]*"#, "$1/[path omitted]"),
+        (#"(?i)(https?://[^\s?#]+)[?#][^\s]*"#, "$1?[REDACTED]"),
+        (#"(?m)title=.*$"#, "title=[omitted]")
     ].compactMap { pattern, replacement in
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
         return (regex, replacement)
@@ -231,8 +231,11 @@ final class StructuredLogStore {
         }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         var data = try encoder.encode(safe); data.append(10)
+        if handle == nil {
+            try reopen()
+        }
         if size + data.count > maximumBytes {
-            try handle?.close(); handle = nil
+            try handle?.close(); handle = nil; size = 0
             let fm = FileManager.default
             for n in stride(from: retainedFiles, through: 1, by: -1) {
                 let target = directory.appendingPathComponent("events.\(n).jsonl")

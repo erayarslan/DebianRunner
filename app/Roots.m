@@ -159,7 +159,11 @@ static NSString *kDefaultRoot = @"Default Root";
 }
 
 - (BOOL)forceDestroyAllRoots:(NSError **)error {
-    NSArray<NSString *> *allRoots = self.roots.array.copy;
+    __block NSArray<NSString *> *allRoots = nil;
+    void (^snapshotRoots)(void) = ^{
+        allRoots = self.roots.array.copy;
+    };
+    if (NSThread.isMainThread) snapshotRoots(); else dispatch_sync(dispatch_get_main_queue(), snapshotRoots);
     NSError *firstError = nil;
     for (NSString *name in allRoots) {
         NSError *rmError = nil;
@@ -205,7 +209,10 @@ static void root_import_progress_callback(void *cookie, double progress, const c
 - (BOOL)importVerifiedRootFromArchive:(NSURL *)archive name:(NSString *)name sha256:(NSString *)expected metadata:(NSDictionary *)metadata error:(NSError **)error progressReporter:(id<ProgressReporter> _Nullable)progress {
 #endif
 #ifdef LINUXRUNNER
-    if (!validRunnerRoot(name) || [self.roots containsObject:name]) {
+    __block BOOL duplicate = NO;
+    void (^checkDup)(void) = ^{ duplicate = [self.roots containsObject:name]; };
+    if (NSThread.isMainThread) checkDup(); else dispatch_sync(dispatch_get_main_queue(), checkDup);
+    if (!validRunnerRoot(name) || duplicate) {
         if (error) *error = [NSError errorWithDomain:@"dev.linuxrunner.rootfs" code:EINVAL
             userInfo:@{NSLocalizedDescriptionKey:@"Invalid or duplicate environment root identifier."}];
         return NO;
@@ -350,17 +357,24 @@ static void root_import_progress_callback(void *cookie, double progress, const c
 }
 
 - (BOOL)destroyRootNamed:(NSString *)name error:(NSError **)error {
+    __block BOOL exists = NO;
+    __block BOOL isDefault = NO;
+    void (^checkState)(void) = ^{
+        exists = [self.roots containsObject:name];
+        isDefault = [name isEqualToString:self.defaultRoot];
+    };
+    if (NSThread.isMainThread) checkState(); else dispatch_sync(dispatch_get_main_queue(), checkState);
 #ifdef LINUXRUNNER
-    if (!validRunnerRoot(name) || ![self.roots containsObject:name]) {
+    if (!validRunnerRoot(name) || !exists) {
         if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:EINVAL userInfo:@{NSLocalizedDescriptionKey:@"Invalid or missing distribution."}];
         return NO;
     }
 #endif
-    if ([name isEqualToString:self.defaultRoot]) {
-        *error = [NSError errorWithDomain:@"ios-linuxkit" code:0 userInfo:@{NSLocalizedDescriptionKey: @"Cannot delete the default filesystem"}];
+    if (isDefault) {
+        if (error) *error = [NSError errorWithDomain:@"ios-linuxkit" code:0 userInfo:@{NSLocalizedDescriptionKey: @"Cannot delete the default filesystem"}];
         return NO;
     }
-    NSAssert([self.roots containsObject:name], @"root does not exist: %@", name);
+    NSAssert(exists, @"root does not exist: %@", name);
     if (![NSFileManager.defaultManager removeItemAtURL:[self rootUrl:name] error:error])
         return NO;
     void (^removeRoot)(void) = ^{ [[self mutableOrderedSetValueForKey:@"roots"] removeObject:name]; };
