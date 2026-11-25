@@ -49,6 +49,14 @@ static int safe_path(const char *p) {
     if(!p||*p=='/'||strlen(p)>4095)return 0;
     for(const char *q=p;*q;){const char *end=strchr(q,'/');size_t n=end?(size_t)(end-q):strlen(q);if(n==2&&q[0]=='.'&&q[1]=='.')return 0;if(!end)break;q=end+1;}return 1;
 }
+static int dir(struct bootstrap *s,struct archive *a,const char *path,int mode) {
+    text(s->destination,sizeof s->destination,path);
+    struct archive_entry *e=archive_entry_new();if(!e)return fail(s,NULL,"allocation","archive_entry_new",ENOMEM,NULL);
+    archive_entry_set_pathname(e,path);archive_entry_set_filetype(e,AE_IFDIR);archive_entry_set_perm(e,mode);archive_entry_set_size(e,0);archive_entry_set_uid(e,0);archive_entry_set_gid(e,0);archive_entry_set_mtime(e,0,0);
+    errno=0;int r=archive_write_header(a,e);archive_entry_free(e);
+    if(r!=ARCHIVE_OK)return fail(s,a,"filesystem","archive_write_header",archive_errno(a)>0?archive_errno(a):EIO,NULL);
+    return 0;
+}
 static int file(struct bootstrap *s,struct archive *a,const char *path,const char *data,size_t size,int mode) {
     text(s->destination,sizeof s->destination,path);
     struct archive_entry *e=archive_entry_new();if(!e)return fail(s,NULL,"allocation","archive_entry_new",ENOMEM,NULL);
@@ -179,6 +187,7 @@ package_error:
     CONFIG("etc/group","root:x:0:\nusers:x:100:\nnogroup:x:65534:\n",0644);CONFIG("etc/shadow","root:*:20000:0:99999:7:::\n",0600);
     CONFIG("etc/apt/sources.list","deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://ftp.linux.org.tr/debian trixie main\ndeb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://ftp.linux.org.tr/debian trixie-updates main\ndeb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://ftp.linux.org.tr/debian-security trixie-security main\n",0644);
     CONFIG("usr/sbin/policy-rc.d","#!/bin/sh\n# No service manager/kernel is booted in this userspace environment.\nexit 101\n",0755);
+    if(dir(s,writer,"usr/lib/linuxrunner",0755))goto done;
     CONFIG("usr/lib/linuxrunner/initialize-debian.sh","#!/bin/sh\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\nmkdir -p /tmp /run /run/sshd /proc /dev /root /usr/local /var/lib/linuxrunner /var/lib/dpkg/updates /var/lib/apt/lists/partial /var/cache/apt/archives/partial\nchmod 1777 /tmp\nchmod 755 /run/sshd\nif [ ! -f /var/lib/linuxrunner/initialized ]; then\n if [ ! -f /var/lib/linuxrunner/accounts-initialized ]; then\n cp /usr/share/base-passwd/passwd.master /etc/passwd\n cp /usr/share/base-passwd/group.master /etc/group\n if ! grep -q '^_apt:' /etc/passwd; then\n printf '_apt:x:100:65534::/nonexistent:/usr/sbin/nologin\\n' >>/etc/passwd\n fi\n touch /var/lib/linuxrunner/accounts-initialized\n fi\n echo 'DEBIAN_INIT: configuring authenticated official packages'\n dpkg --configure -a\n update-ca-certificates\n if [ ! -x /usr/sbin/sshd ]; then\n echo 'DEBIAN_INIT: installing default OpenSSH server'\n if apt-get update && apt-get install -y --no-install-recommends openssh-server; then\n mkdir -p /run/sshd /etc/ssh && chmod 755 /run/sshd\n ssh-keygen -A >/dev/null 2>&1 || true\n echo 'DEBIAN_INIT: openssh-server ready'\n else\n echo 'DEBIAN_INIT: openssh-server deferred until online'\n fi\n fi\n touch /var/lib/linuxrunner/initialized\n echo 'DEBIAN_INIT: PASS'\nfi\n",0755);
     CONFIG("usr/lib/linuxrunner/init.sh","#!/bin/sh\n/usr/lib/linuxrunner/initialize-debian.sh >/var/log/linuxrunner-initialize.log 2>&1\nwhile :; do sleep 3600; done\n",0755);
 done:

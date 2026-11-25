@@ -16,11 +16,6 @@ on:
       - 'assets/**'
   workflow_dispatch:
     inputs:
-      jit:
-        description: 'Include optional ARM64 JIT translator (LINUXRUNNER_JIT=YES)'
-        required: false
-        type: boolean
-        default: false
       diagnostic:
         description: 'Build diagnostic variant (--diagnostic)'
         required: false
@@ -41,12 +36,20 @@ concurrency:
 
 jobs:
   build-ipa:
-    name: Build Unsigned iOS IPA
+    name: Build ${{ matrix.label }} iOS IPA
     runs-on: macos-15
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Standard
+            jit: 'NO'
+          - label: JIT
+            jit: 'YES'
     env:
       BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'dev.debianrunner.app' }}
-      LINUXRUNNER_JIT: ${{ github.event.inputs.jit == 'true' && 'YES' || 'NO' }}
+      LINUXRUNNER_JIT: ${{ matrix.jit }}
       DIAGNOSTIC: ${{ github.event.inputs.diagnostic == 'true' && 'YES' || 'NO' }}
     steps:
       - name: Checkout repository
@@ -122,7 +125,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ github.run_number }}
+          name: build-logs-${{ matrix.label }}-${{ github.run_number }}
           retention-days: 1
           if-no-files-found: ignore
           path: |
@@ -137,22 +140,30 @@ jobs:
             tail -n 200 build/releases/archive.log
           fi
 
-      - name: Publish GitHub Release on tag
-        if: startsWith(github.ref, 'refs/tags/v')
+  publish-release:
+    name: Publish GitHub Release on Tag
+    needs: build-ipa
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built IPA artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release create "${TAG}" \
-            "build/releases/${ARTIFACT_NAME}.ipa" \
-            "build/releases/${ARTIFACT_NAME}.ipa.sha256" \
-            "build/releases/${ARTIFACT_NAME}.validation.json" \
-            "build/releases/artifact-verification.json" \
+          shopt -s nullglob
+          files=(
+            release-assets/*.ipa
+            release-assets/*.ipa.sha256
+            release-assets/*.validation.json
+          )
+          gh release create "${TAG}" "${files[@]}" \
             --title "DebianRunner ${TAG}" \
-            --notes "Unsigned ARM64 iOS IPA for headless Debian 13 (trixie) minimal. Sideload with AltStore, SideStore, Sideloadly, or TrollStore." \
-            || gh release upload "${TAG}" \
-            "build/releases/${ARTIFACT_NAME}.ipa" \
-            "build/releases/${ARTIFACT_NAME}.ipa.sha256" \
-            "build/releases/${ARTIFACT_NAME}.validation.json" \
-            "build/releases/artifact-verification.json" \
-            --clobber
+            --notes "Unsigned ARM64 iOS IPAs (Standard and JIT-capable) for headless Debian 13 (trixie) minimal. Sideload with AltStore, SideStore, Sideloadly, or TrollStore." \
+            || gh release upload "${TAG}" "${files[@]}" --clobber

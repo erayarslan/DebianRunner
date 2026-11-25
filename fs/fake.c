@@ -781,8 +781,18 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     db_begin_write(fs);
     int err = realfs.mkdir(mount, path, 0777);
     if (err < 0) {
-        db_rollback(fs);
-        return err;
+        // Recover "ghost" directories that exist on host disk (e.g., parent
+        // directories created implicitly during archive import) without a
+        // meta.db row so mkdir doesn't fail EEXIST while stat returns ENOENT.
+        struct stat st;
+        if (err == _EEXIST && path_get_inode(fs, path) == 0 &&
+                fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                S_ISDIR(st.st_mode)) {
+            err = 0;
+        } else {
+            db_rollback(fs);
+            return err;
+        }
     }
     struct ish_stat ishstat;
     ishstat.mode = mode | S_IFDIR;

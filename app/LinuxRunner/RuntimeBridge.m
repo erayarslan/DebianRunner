@@ -625,8 +625,8 @@ static NSString *LRThermalState(void) {
         return;
     }
     NSString *script =
-        @"src=/home/mobile/Downloads/.linuxrunner-support/service-manager.sh\n"
-        "[ -f \"$src\" ] || exit 0\n"
+        @"src=/home/mobile/Downloads/.linuxrunner/support/service-manager.sh\n"
+        "[ -f \"$src\" ] || exit 1\n"
         "mkdir -p /usr/lib/linuxrunner /usr/local/bin /run/debianrunner-systemd/system /var/log/debianrunner-systemd /var/lib/systemd/linger\n"
         "chmod 1777 /run/debianrunner-systemd 2>/dev/null || true\n"
         "if ! cmp -s \"$src\" /usr/lib/linuxrunner/service-manager.sh 2>/dev/null; then\n"

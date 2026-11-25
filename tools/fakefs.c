@@ -243,12 +243,20 @@ static bool fakefs_import_contents(const char *archive_path, int archive_fd, con
         char *slash = entry_path_copy;
         while ((slash = strchr(*slash ? slash + 1 : slash, '/')) != NULL) {
             *slash = '\0';
-            int err = mkdirat(root_fd, fix_path(entry_path_copy), 0777);
-            *slash = '/';
-            if (err < 0) {
-                if (errno == EEXIST) continue;
-                POSIX_ERR();
+            int merr = mkdirat(root_fd, fix_path(entry_path_copy), 0777);
+            if (merr == 0) {
+                struct ish_stat dir_stat = {.mode = S_IFDIR | 0755};
+                sqlite3_bind_blob64(insert_stat, 1, &dir_stat, sizeof(dir_stat), SQLITE_TRANSIENT);
+                STEP_RESET(insert_stat);
+                sqlite3_bind_blob64(insert_path, 1, entry_path_copy, strlen(entry_path_copy), SQLITE_TRANSIENT);
+                sqlite3_bind_int64(insert_path, 2, sqlite3_last_insert_rowid(db));
+                STEP_RESET(insert_path);
+                *slash = '/';
+                continue;
             }
+            *slash = '/';
+            if (errno == EEXIST) continue;
+            POSIX_ERR();
         }
         free(entry_path_copy);
 
