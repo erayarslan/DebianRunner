@@ -2278,10 +2278,24 @@ struct ExecutionEngineView: View {
                 }
                 Text(report["detail"] as? String ?? "").font(.footnote).foregroundColor(.secondary)
                 if compiled {
-                    LabeledRow("Running", active ? "ARM64 JIT (with interpreter for untranslated code)" : "ARM64 Interpreter")
+                    let pic = report["pic"] as? Bool ?? false
+                    let reused = (report["reused"] as? NSNumber)?.uint64Value ?? 0
+                    let usedKB = (report["region_used_kb"] as? NSNumber)?.uint64Value ?? 0
+                    let capKB = (report["region_capacity_kb"] as? NSNumber)?.uint64Value ?? 0
+                    let exhausted = report["region_exhausted"] as? Bool ?? false
+                    LabeledRow("Running", active ? (pic ? "ARM64 JIT (PIC shared)" : "ARM64 JIT (with interpreter for untranslated code)") : "ARM64 Interpreter")
                     LabeledRow("Debugger attached", (report["debugger"] as? Bool ?? false) ? "Yes" : "No")
                     LabeledRow("Guest blocks translated", "\((report["blocks"] as? NSNumber)?.uint64Value ?? 0)")
-                    LabeledRow("Native code", "\((report["code_kb"] as? NSNumber)?.uint64Value ?? 0) KB")
+                    if pic || reused > 0 {
+                        LabeledRow("Blocks reused (PIC)", "\(reused)")
+                    }
+                    if capKB > 0 {
+                        let usedMB = Double(usedKB) / 1024.0
+                        let capMB = Double(capKB) / 1024.0
+                        LabeledRow("Code region", "\(String(format: "%.1f / %.0f MB", usedMB, capMB))\(exhausted ? " (Full)" : "")")
+                    } else {
+                        LabeledRow("Native code", "\((report["code_kb"] as? NSNumber)?.uint64Value ?? 0) KB")
+                    }
                     LabeledRow("iOS", report["os"] as? String ?? "")
                 }
             } header: { Text("JIT Status") } footer: {

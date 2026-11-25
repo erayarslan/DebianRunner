@@ -747,8 +747,16 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
     NSString *state,*detail;
 #ifdef LINUXRUNNER_JIT_BUILD
     uint64_t blocks=0,segments=0,bytes=0;jit_counters(&blocks,&segments,&bytes);
+    uint64_t regionUsed=0,regionCap=0,reused=0;bool pic=false,exhausted=false;
+    jit_region_stats(&regionUsed,&regionCap,&reused,&pic,&exhausted);
     r[@"blocks"]=@(blocks);r[@"segments"]=@(segments);r[@"code_kb"]=@(bytes/1024);
-    if(LRJITActive&&segments>0){state=@"JIT Active";detail=[NSString stringWithFormat:@"%@ · %llu guest blocks translated, %llu native segments installed, %llu KB generated code",LRJITDetail,blocks,segments,bytes/1024];}
+    r[@"reused"]=@(reused);r[@"region_used_kb"]=@(regionUsed/1024);r[@"region_capacity_kb"]=@(regionCap/1024);
+    r[@"pic"]=@(pic);r[@"region_exhausted"]=@(exhausted);
+    if(LRJITActive&&segments>0){
+        state=@"JIT Active";
+        NSString *regionText=regionCap>0?[NSString stringWithFormat:@"%.1f / %.0f MB code region%@",(double)regionUsed/(1024.0*1024.0),(double)regionCap/(1024.0*1024.0),exhausted?@" (full)":@""]:[NSString stringWithFormat:@"%llu KB generated code",bytes/1024];
+        detail=pic?[NSString stringWithFormat:@"%@ · %llu blocks (%llu reused, PIC) · %@",LRJITDetail,blocks,reused,regionText]:[NSString stringWithFormat:@"%@ · %llu guest blocks translated, %llu native segments · %@",LRJITDetail,blocks,segments,regionText];
+    }
     else if(LRJITActive){state=@"JIT Initializing";detail=[NSString stringWithFormat:@"%@ · code region verified (test code returned the expected value); no guest code translated yet — start or use Linux",LRJITDetail];}
     else if(activationQuarantined&&!LRJITLastFailure){state=@"JIT Failed";detail=[NSString stringWithFormat:@"A previous activation (%@) ended LinuxRunner; that method is disabled. Interpreter fallback active.",selectedPath];}
     else if([self.executionMode isEqual:@"interpreter"]){state=@"Interpreter Active";detail=self.debuggerAttached?@"A debugger is attached: choose Automatic or JIT to use it":@"Interpreter selected";}

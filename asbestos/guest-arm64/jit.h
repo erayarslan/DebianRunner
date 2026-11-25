@@ -138,6 +138,11 @@ size_t jit_describe(char *buf, size_t size);
 // installed into block code streams (the dispatcher runs them whenever the
 // guest reaches those blocks) and native code bytes. Any pointer may be NULL.
 void jit_counters(uint64_t *blocks, uint64_t *segments, uint64_t *code_bytes);
+// Code region & PIC sharing state: bytes reserved in the native region, total
+// region capacity (0 if no region), blocks served from the PIC registry, and
+// whether PIC sharing / region exhaustion are active. Any pointer may be NULL.
+void jit_region_stats(uint64_t *used_bytes, uint64_t *capacity_bytes,
+                      uint64_t *reused_blocks, bool *pic_enabled, bool *exhausted);
 // Writes to /proc/ish/jit: "off" / "on" stop / resume installing AOT images
 // in blocks compiled afterwards (for A/B timing on a device). -1: unknown.
 int jit_control(const char *cmd, size_t len);

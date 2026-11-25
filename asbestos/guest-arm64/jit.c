@@ -40,6 +40,7 @@ static void sys_icache_invalidate(void *start, size_t bytes) {
 #include "emu/mmu.h"
 #include "emu/tlb.h"
 #include "kernel/fs.h"
+#include "fs/fd.h"
 #include "kernel/memory.h"
 #include "cpu-offsets.h"
 
@@ -173,6 +174,18 @@ void jit_counters(uint64_t *blocks, uint64_t *segments, uint64_t *code_bytes) {
     if (blocks) *blocks = atomic_load_explicit(&st_blocks, memory_order_relaxed);
     if (segments) *segments = atomic_load_explicit(&st_segments, memory_order_relaxed);
     if (code_bytes) *code_bytes = atomic_load_explicit(&st_bytes, memory_order_relaxed);
+}
+
+void jit_region_stats(uint64_t *used_bytes, uint64_t *capacity_bytes,
+                      uint64_t *reused_blocks, bool *pic_enabled, bool *exhausted) {
+    size_t reserved = region ? atomic_load_explicit(&region_used, memory_order_relaxed) : 0;
+    if (reserved > REGION_SIZE)
+        reserved = REGION_SIZE;
+    if (used_bytes) *used_bytes = (uint64_t) reserved;
+    if (capacity_bytes) *capacity_bytes = region ? (uint64_t) REGION_SIZE : 0;
+    if (reused_blocks) *reused_blocks = atomic_load_explicit(&st_shared, memory_order_relaxed);
+    if (pic_enabled) *pic_enabled = pic_on;
+    if (exhausted) *exhausted = atomic_load_explicit(&region_exhausted, memory_order_relaxed);
 }
 #if !TARGET_OS_OSX && !defined(__linux__) && !defined(ISH_JIT_NO_EMIT)
 // iOS: the translator never maps executable memory by itself. The app calls
@@ -2153,7 +2166,7 @@ struct reg_entry {
     struct { unsigned pos; uint8_t *code; struct rec_seg *rec; } *seg;
     uint32_t key[];
 };
-#define REG_BUCKETS (1u << 16)
+#define REG_BUCKETS (1u << 18)
 static struct reg_entry **reg_table;
 static pthread_mutex_t reg_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -2217,7 +2230,8 @@ struct ctx_node {
 };
 static pthread_mutex_t ctx_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static struct jit_ctx *ctx_get(struct asbestos *a, int mod, uint64_t base, const struct aot_module *owner) {
+static struct jit_ctx *ctx_get(struct asbestos *a, int mod, uint64_t base, const struct aot_module *owner,
+                               size_t max_idx) {
     pthread_mutex_lock(&ctx_lock);
     struct ctx_node *n;
     for (n = a->jit_ctxs; n; n = n->next)
@@ -2225,8 +2239,8 @@ static struct jit_ctx *ctx_get(struct asbestos *a, int mod, uint64_t base, const
             break;
     if (!n && (n = malloc(sizeof(*n)))) {
         // Address space only: pages are touched as translations get indices.
-        // An image knows how many it uses.
-        size_t nidx = owner ? owner->nidx : CTX_MAX;
+        // An image knows how many it uses; runtime modules size by executable text.
+        size_t nidx = owner ? owner->nidx : (max_idx ? max_idx : CTX_MAX);
         size_t far = CTX_FAR * nidx, bytes = far + CTX_BLK + CTX_SLOT * nidx;
         void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (p == MAP_FAILED) {
@@ -2265,7 +2279,7 @@ static __thread struct tlb *cm_tlb;   // tlb of the block being compiled (code m
 
 // Module, offset and base of the guest code at pc; anonymous code is its own
 // module per address, at base 0. -1 if pc is not mapped.
-static int jit_locate(addr_t pc, uint64_t *off, uint64_t *base);
+static int jit_locate(addr_t pc, uint64_t *off, uint64_t *base, unsigned *max_idx_out);
 
 // Every unit must come from the same mapping as the block start: constants
 // are relative to one base.
@@ -2276,7 +2290,7 @@ static bool one_mapping(const struct jit_units *U, int mod, uint64_t base) {
             continue;
         page = PAGE(U->u[i].pc);
         uint64_t off, b2;
-        if (jit_locate(U->u[i].pc, &off, &b2) != mod || b2 != base)
+        if (jit_locate(U->u[i].pc, &off, &b2, NULL) != mod || b2 != base)
             return false;
     }
     return true;
@@ -2645,7 +2659,7 @@ struct aot_place {
 static bool aot_slot_usable(struct aot_place *p, const struct aot_module *m, const struct aot_trans *t,
                             const struct fiber_block *b) {
     if (p->m != m) {
-        p->ctx = ctx_get(p->a, p->mod, p->base, m);
+        p->ctx = ctx_get(p->a, p->mod, p->base, m, 0);
         p->m = m;
     }
     struct jit_ctx *ctx = p->ctx;
@@ -2873,11 +2887,13 @@ static const struct aot_trans *aot_lookup(int mod, const struct fiber_block *b, 
 static void jit_translate(struct fiber_block *b, const struct jit_units *U, struct em *e, uint32_t *key) {
     e->record = false;
     if (!pic_on) {
-        jit_native(b, U, e);
+        if (!atomic_load_explicit(&region_exhausted, memory_order_relaxed))
+            jit_native(b, U, e);
         return;
     }
     uint64_t off, base;
-    int mod = jit_locate(b->addr, &off, &base);
+    unsigned max_idx = CTX_MAX;
+    int mod = jit_locate(b->addr, &off, &base, &max_idx);
     struct asbestos *a = cm_tlb ? cm_tlb->mmu->asbestos : NULL;
     if (mod < 0 || !a || !U->n || !one_mapping(U, mod, base))
         return;
@@ -2886,11 +2902,10 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
         return;
     if (rec_target_only && (off >> PAGE_BITS) % rec_shards != rec_shard)
         return;
-    // This process's own translations need a context with room for CTX_MAX
-    // indices (8MB of address space, per module mapping of every guest
-    // process, all in this one host process): not made when only images run.
+    // This process's own translations need a context sized for this module's
+    // slot space (at most CTX_MAX): not made when only images run.
     struct jit_ctx *ctx = NULL;
-    if (!aot_only && !(ctx = ctx_get(a, mod, base, NULL)))
+    if (!aot_only && !(ctx = ctx_get(a, mod, base, NULL, max_idx)))
         return;
     unsigned nkey = reg_key(b, U, mod, off, key);
     // for the registry (images are found by offset; aot_lookup() hashes for its memo)
@@ -2909,7 +2924,7 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
         mod_blocks[mod]++;
     if (at) {
         pthread_mutex_unlock(&reg_lock);
-        struct jit_ctx *actx = ctx_get(a, mod, base, img);
+        struct jit_ctx *actx = ctx_get(a, mod, base, img, 0);
         if (!actx)
             return;
         if (!aot_install(b, actx, at, img->entry_off, dbase)) {
@@ -2941,15 +2956,16 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
         if (r->hash == h && r->nkey == nkey && !memcmp(r->key, key, nkey * 4))
             break;
     unsigned idx = 0;
-    if (!r && reg_table)
-        idx = mod_tables_fit(mod) ? mod_next_idx[mod]++ : CTX_MAX;
+    bool exhausted = atomic_load_explicit(&region_exhausted, memory_order_relaxed);
+    if (!r && reg_table && !exhausted)
+        idx = mod_tables_fit(mod) ? mod_next_idx[mod]++ : max_idx;
     pthread_mutex_unlock(&reg_lock);
     if (r) {
         reg_install(b, ctx, r);
         atomic_fetch_add_explicit(&st_shared, 1, memory_order_relaxed);
         return;
     }
-    if (!reg_table || idx >= CTX_MAX)
+    if (!reg_table || exhausted || idx >= max_idx)
         return;
     // The code may run as soon as the first segment is installed.
     e->record = rec_module(mod);
@@ -2958,7 +2974,8 @@ static void jit_translate(struct fiber_block *b, const struct jit_units *U, stru
     b->jit_ctx = ctx;
     slot_set(ctx, idx, b, base, base);
     jit_native(b, U, e);
-    if (e->ninst > sizeof(e->inst) / sizeof(e->inst[0]))
+    if (e->ninst > sizeof(e->inst) / sizeof(e->inst[0]) ||
+        (e->ninst == 0 && atomic_load_explicit(&region_exhausted, memory_order_relaxed)))
         return;
     r = malloc(sizeof(*r) + nkey * 4);
     if (!r)
@@ -3024,6 +3041,10 @@ int jit_crash_recover(void *ucontext) {
 struct cm_module {
     char path[256];              // the first path it was seen at
     uint8_t id[20], id_len;      // NT_GNU_BUILD_ID, id_len 0 if none
+    dev_t dev;
+    ino_t ino;
+    bool have_stat;
+    unsigned max_idx;            // per-module PIC context slot capacity (<= CTX_MAX)
     uint64_t blocks, units, segments, bytes;
 };
 struct cm_segment { uint64_t code, off, pc; uint32_t words, units, insn; int mod; };
@@ -3035,7 +3056,10 @@ static struct cm_segment *cm_segs;
 static size_t cm_nsegs, cm_capsegs;
 
 // NT_GNU_BUILD_ID of the ELF file behind fd (at most 20 bytes); 0 if none.
-static unsigned elf_build_id(struct fd *fd, uint8_t id[20]) {
+// Also sums executable PT_LOAD segment memsz into *exec_bytes_out when requested.
+static unsigned elf_build_id(struct fd *fd, uint8_t id[20], uint64_t *exec_bytes_out) {
+    if (exec_bytes_out)
+        *exec_bytes_out = 0;
     uint8_t eh[64];
     if (!fd->ops->pread || fd->ops->pread(fd, eh, sizeof(eh), 0) != sizeof(eh))
         return 0;
@@ -3050,12 +3074,21 @@ static unsigned elf_build_id(struct fd *fd, uint8_t id[20]) {
     if (phentsize != 56 || phnum == 0 || phnum > 64 ||
         fd->ops->pread(fd, ph, (size_t) phnum * 56, (off_t) phoff) != (ssize_t) phnum * 56)
         return 0;
+    unsigned found_id_len = 0;
     for (unsigned i = 0; i < phnum; i++) {
-        uint32_t type;
-        uint64_t noff, nsize;
+        uint32_t type, pflags;
+        uint64_t noff, nsize, memsz;
         memcpy(&type, ph + 56 * i, 4);
+        memcpy(&pflags, ph + 56 * i + 4, 4);
         memcpy(&noff, ph + 56 * i + 8, 8);
         memcpy(&nsize, ph + 56 * i + 32, 8);
+        memcpy(&memsz, ph + 56 * i + 40, 8);
+        if (type == 1 /* PT_LOAD */ && (pflags & 1u /* PF_X */) && exec_bytes_out) {
+            *exec_bytes_out += memsz;
+            continue;
+        }
+        if (found_id_len)
+            continue;
         uint8_t n[1024];
         if (type != 4 /* PT_NOTE */ || nsize > sizeof(n) || fd->ops->pread(fd, n, nsize, (off_t) noff) != (ssize_t) nsize)
             continue;
@@ -3070,19 +3103,44 @@ static unsigned elf_build_id(struct fd *fd, uint8_t id[20]) {
             if (ntype == 3 /* NT_GNU_BUILD_ID */ && namesz == 4 && !memcmp(n + name, "GNU", 4) &&
                 descsz > 0 && descsz <= 20) {
                 memcpy(id, n + desc, descsz);
-                return descsz;
+                found_id_len = descsz;
+                break;
             }
             p = desc + ((descsz + 3u) & ~3u);
         }
     }
-    return 0;
+    return found_id_len;
 }
 
-static int cm_module_of(const char *path, const uint8_t *id, unsigned id_len) {
+static unsigned calc_mod_max_idx(const char *path, uint64_t exec_bytes) {
+    if (!strcmp(path, "[vdso]"))
+        return 4096;
+    if (exec_bytes == 0)
+        return CTX_MAX;
+    // Every ARM64 instruction is 4 bytes and basic blocks typically span 4-6
+    // instructions, so exec_bytes / 4 (rounded to power-of-2, floor 8192)
+    // provides generous headroom while avoiding 20 MiB VA reservations per small .so.
+    uint64_t need = exec_bytes / 4;
+    if (need >= CTX_MAX)
+        return CTX_MAX;
+    unsigned cap = 8192;
+    while (cap < need && cap < CTX_MAX)
+        cap <<= 1;
+    return cap > CTX_MAX ? CTX_MAX : cap;
+}
+
+static int cm_module_of(const char *path, const uint8_t *id, unsigned id_len, uint64_t exec_bytes,
+                        dev_t dev, ino_t ino, bool have_stat) {
     for (unsigned i = 0; i < cm_nmods; i++)
         if (id_len ? cm_mods[i].id_len == id_len && !memcmp(cm_mods[i].id, id, id_len)
-                   : !cm_mods[i].id_len && !strcmp(cm_mods[i].path, path))
+                   : !cm_mods[i].id_len && !strcmp(cm_mods[i].path, path)) {
+            if (have_stat && !cm_mods[i].have_stat) {
+                cm_mods[i].dev = dev;
+                cm_mods[i].ino = ino;
+                cm_mods[i].have_stat = true;
+            }
             return (int) i;
+        }
     if (cm_nmods == cm_capmods) {
         unsigned cap = cm_capmods ? 2 * cm_capmods : 64;
         struct cm_module *m = realloc(cm_mods, cap * sizeof(*m));
@@ -3096,6 +3154,10 @@ static int cm_module_of(const char *path, const uint8_t *id, unsigned id_len) {
     snprintf(m->path, sizeof(m->path), "%s", path);
     memcpy(m->id, id, id_len);
     m->id_len = (uint8_t) id_len;
+    m->dev = dev;
+    m->ino = ino;
+    m->have_stat = have_stat;
+    m->max_idx = calc_mod_max_idx(path, exec_bytes);
     return (int) cm_nmods++;
 }
 
@@ -3120,33 +3182,50 @@ static int cm_locate(addr_t pc, uint64_t *off, struct data **datap) {
     // Looked up once per mapping (shared by forked address spaces).
     if (data->jit_mod)
         return data->jit_mod - 1;
+    dev_t dev = 0;
+    ino_t ino = 0;
+    bool have_stat = false;
+    if (!data->name && data->fd && fd_is_mapping_identity(data->fd) &&
+        fd_mapping_identity_stat(data->fd, &dev, &ino)) {
+        have_stat = true;
+        for (unsigned i = 0; i < cm_nmods; i++) {
+            if (cm_mods[i].have_stat && cm_mods[i].dev == dev && cm_mods[i].ino == ino) {
+                data->jit_mod = (int) i + 1;
+                return (int) i;
+            }
+        }
+    }
     char path[MAX_PATH] = "[anon]";
     uint8_t id[20];
     unsigned id_len = 0;
+    uint64_t exec_bytes = 0;
     if (data->name) {
         snprintf(path, sizeof(path), "%s", data->name);
     } else if (data->fd) {
         if (generic_getpath(data->fd, path) < 0)
             snprintf(path, sizeof(path), "[unnamed file]");
-        id_len = elf_build_id(data->fd, id);
+        id_len = elf_build_id(data->fd, id, &exec_bytes);
     }
-    int mod = cm_module_of(path, id, id_len);
+    int mod = cm_module_of(path, id, id_len, exec_bytes, dev, ino, have_stat);
     if (mod >= 0)
         data->jit_mod = mod + 1;
     return mod;
 }
 
-static int jit_locate(addr_t pc, uint64_t *off, uint64_t *base) {
+static int jit_locate(addr_t pc, uint64_t *off, uint64_t *base, unsigned *max_idx_out) {
     pthread_mutex_lock(&cm_lock);
     struct data *data;
     int mod = cm_locate(pc, off, &data);
     bool anon = mod >= 0 && !data->fd;
+    unsigned max_idx = (mod >= 0 && (unsigned) mod < cm_nmods && cm_mods[mod].max_idx) ? cm_mods[mod].max_idx : CTX_MAX;
     pthread_mutex_unlock(&cm_lock);
     if (mod < 0)
         return -1;
     if (anon)
         *off = pc;
     *base = pc - *off;
+    if (max_idx_out)
+        *max_idx_out = max_idx;
     return mod;
 }
 
@@ -3470,6 +3549,18 @@ size_t jit_describe(char *buf, size_t size) {
                        aot_only ? "AOT images only (no executable memory)" :
                        pic_on ? "JIT, position-independent" : "JIT";
     OUT("mode: %s\n", mode);
+    if (region) {
+        size_t reserved = atomic_load_explicit(&region_used, memory_order_relaxed);
+        if (reserved > REGION_SIZE)
+            reserved = REGION_SIZE;
+        bool exhausted = atomic_load_explicit(&region_exhausted, memory_order_relaxed);
+        OUT("code region: %.1f / %.1f MB (%.0f%%, %llu segments%s)\n",
+            (double) reserved / (1024.0 * 1024.0),
+            (double) REGION_SIZE / (1024.0 * 1024.0),
+            100.0 * (double) reserved / (double) REGION_SIZE,
+            (unsigned long long) atomic_load_explicit(&st_segments, memory_order_relaxed),
+            exhausted ? ", EXHAUSTED" : "");
+    }
     OUT("AOT: %s (echo on|off > /proc/ish/jit; affects blocks compiled afterwards, i.e. new processes)\n",
         aot_off ? "off" : "on");
     OUT("blocks translated or looked up: %llu, AOT installs: %llu (moved: %llu, with pc-relative immediates "
@@ -3584,8 +3675,15 @@ static void jit_init(void) {
     simd_on = !env_off("ISH_JIT_SIMD");
 #ifndef ISH_JIT_NO_EMIT
     // AOT images are PIC code, so PIC is the default once one is linked in.
+    // On iOS, a single long-lived host process shares one fixed 120 MB code
+    // region across all guest processes, so enable PIC sharing by default to
+    // reuse translations across repeated tool invocations (cc1, gcc, cmake).
     const char *pic = getenv("ISH_JIT_PIC");
+#if defined(__APPLE__) && !TARGET_OS_OSX
+    pic_on = pic ? pic[0] == '1' : true;
+#else
     pic_on = pic ? pic[0] == '1' : have_images;
+#endif
     if (!have_region)
         pic_on = true;
 #endif
