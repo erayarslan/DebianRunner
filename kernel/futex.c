@@ -55,7 +55,7 @@ static int pi_key_locked(struct mem *mem, addr_t addr, bool private, int access,
     } else if (pte->data->fd) {
         struct stat stat;
         if (fd_is_mapping_identity(pte->data->fd)) {
-            if (!fd_mapping_identity_stat(pte->data->fd, &stat.st_dev, &stat.st_ino)) return _EINVAL;
+            if (!fd_mapping_identity_stat(pte->data->fd, &stat.st_dev, &stat.st_ino, NULL, NULL)) return _EINVAL;
         } else if (fstat(pte->data->fd->real_fd, &stat)) return errno_map();
         *key = (struct pi_key){pte->data->fd,
             pte->data->file_offset + pte->offset - pte->data->mapping_offset + PGOFFSET(addr), 3,
