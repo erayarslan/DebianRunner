@@ -65,7 +65,9 @@ __attribute__((weak)) void *mem_ptr(struct mem *mem, addr_t addr, int type) {
 bool arm64_block_stats_enabled;
 static bool arm64_block_stats_dumped;
 static bool arm64_eager_prechain_enabled = true;
-static bool arm64_eager_prechain_incoming_enabled = true;
+// Incoming prechain mutates previously published blocks; keep opt-in to avoid
+// racing concurrent guest threads entering fiber_enter from syscalls.
+static bool arm64_eager_prechain_incoming_enabled = false;
 static _Atomic uint64_t arm64_block_stats_entries;
 static _Atomic uint64_t arm64_block_stats_cache_hits;
 static _Atomic uint64_t arm64_block_stats_cache_misses;

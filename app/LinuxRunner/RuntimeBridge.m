@@ -409,11 +409,16 @@ static struct lr_transfer_control LRTransferCallbacks(LRTransferControl *control
     bootAttempted = YES;
 #if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
     // Scale the Asbestos translation cache cap with device RAM while leaving
-    // headroom for guest data and UIKit within the iOS app memory limit.
+    // headroom for guest data, JIT code region (120 MB), and UIKit within iOS Jetsam limits.
     unsigned long long physMem = NSProcessInfo.processInfo.physicalMemory;
+#ifdef LINUXRUNNER_JIT_BUILD
+    const char *codeCapMB = physMem >= (7ULL << 30)  ? "64"
+                          : "32";
+#else
     const char *codeCapMB = physMem >= (10ULL << 30) ? "96"
                           : physMem >= (7ULL << 30)  ? "64"
                           : "32";
+#endif
     setenv("ISH_CODE_CAP_MB", codeCapMB, 0);
     setenv("ISH_CODE_IDLE_FLUSH_S", "60", 0);
 #endif

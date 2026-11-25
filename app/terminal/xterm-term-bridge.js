@@ -1029,6 +1029,12 @@
                 core.element.classList.toggle('focus', active);
             if (active) {
                 core?._renderService?.handleFocus?.();
+                if (hadPrev) {
+                    // iOS WebKit can purge offscreen Canvas2D glyph atlases while
+                    // backgrounded (e.g., switching to Safari for OAuth login).
+                    term.clearTextureAtlas?.();
+                    term.refresh(0, term.rows - 1);
+                }
                 ensureCursorVisible();
             } else {
                 core?._renderService?.handleBlur?.();

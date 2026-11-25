@@ -20,7 +20,7 @@ typedef struct tty *tty_t;
 typedef struct linux_tty *tty_t;
 #endif
 
-@interface Terminal () <WKScriptMessageHandler> {
+@interface Terminal () <WKScriptMessageHandler, WKNavigationDelegate> {
 #if !ISH_LINUX
     lock_t _dataLock;
     cond_t _dataConsumed;
@@ -131,6 +131,7 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         // Make the web view really big so that if a program tries to write to the terminal before it's displayed, the text probably won't wrap too badly.
         CGRect webviewSize = CGRectMake(0, 0, 10000, 10000);
         _webView = [[CustomWebView alloc] initWithFrame:webviewSize configuration:config];
+        _webView.navigationDelegate = self;
         if (@available(macOS 13.3, iOS 16.4, tvOS 16.4, *))
             _webView.inspectable = YES;
         _webView.layer.drawsAsynchronously = YES;
@@ -221,6 +222,29 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
             self.applicationCursor = [body[1] boolValue];
         else if ([property isEqualToString:@"bracketedPaste"] && [body[1] isKindOfClass:NSNumber.class])
             self.bracketedPaste = [body[1] boolValue];
+    }
+}
+
+- (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
+    NSLog(@"terminal web content process terminated; reloading frontend");
+    self.loaded = NO;
+#if !ISH_LINUX
+    lock(&_dataLock);
+    _outputInProgress = NO;
+    notify(&_dataConsumed);
+    unlock(&_dataLock);
+#else
+    @synchronized (self) {
+        _outputInProgress = NO;
+    }
+#endif
+#if USE_XTERM_RENDERER
+    NSURL *xtermHtmlFile = [NSBundle.mainBundle URLForResource:@"xterm-term" withExtension:@"html"];
+#else
+    NSURL *xtermHtmlFile = [NSBundle.mainBundle URLForResource:@"term" withExtension:@"html"];
+#endif
+    if (xtermHtmlFile) {
+        [webView loadFileURL:xtermHtmlFile allowingReadAccessToURL:xtermHtmlFile.URLByDeletingLastPathComponent];
     }
 }
 

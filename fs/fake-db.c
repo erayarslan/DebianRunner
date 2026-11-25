@@ -6,6 +6,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 #include "kernel/errno.h"
 #include "debug.h"
 #include "misc.h"
@@ -622,6 +625,17 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
     static const char *tuning[] = {
         "pragma mmap_size=0",
         "pragma cache_size=-2048",      // 2 MB in-process page cache
+        "pragma synchronous=NORMAL",
+        "pragma temp_store=MEMORY",
+        "pragma wal_autocheckpoint=8000",
+        "pragma journal_size_limit=67108864",
+    };
+#elif defined(__APPLE__) && TARGET_OS_IOS && !TARGET_OS_SIMULATOR
+    // Keep SQLite memory bounded inside iOS app Jetsam headroom while still
+    // fitting Debian minimal's meta.db (~10-15 MB) completely in cache.
+    static const char *tuning[] = {
+        "pragma mmap_size=67108864",    // 64 MB
+        "pragma cache_size=-16384",     // 16 MB in-process page cache
         "pragma synchronous=NORMAL",
         "pragma temp_store=MEMORY",
         "pragma wal_autocheckpoint=8000",

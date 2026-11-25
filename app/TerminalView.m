@@ -474,9 +474,11 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
     [self syncTerminalRenderFocus];
 }
 - (void)applicationDidBecomeActive:(NSNotification *)notif {
+    self.markedText = nil;
     [self syncTerminalRenderFocus];
 }
 - (void)applicationWillResignActive:(NSNotification *)notif {
+    self.markedText = nil;
     self.terminalFocused = NO;
 }
 
@@ -820,7 +822,24 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
 }
 
 - (void)deleteBackward {
-    [self insertText:@"\x7f"];
+    self.markedText = nil;
+#if USE_XTERM_RENDERER
+    if (self.selectionActive) {
+        [self clearTerminalSelection];
+    }
+#endif
+    if (self.controlKey.selected && !self.controlKey.highlighted) {
+        self.controlKey.selected = NO;
+        self.controlKey.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
+    }
+    if (self.altKey.selected) {
+        self.altKey.selected = NO;
+        self.altKey.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
+        [self.altKey sendActionsForControlEvents:UIControlEventValueChanged];
+    }
+    [self scrollToBottomForUserInput];
+    static const uint8_t del = 0x7f;
+    [self.terminal sendInput:[NSData dataWithBytes:&del length:1]];
 }
 
 - (BOOL)hasText {
@@ -834,7 +853,11 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
 }
 
 - (void)unmarkText {
-    [self insertText:self.markedText];
+    NSString *text = self.markedText;
+    self.markedText = nil;
+    if (text.length > 0) {
+        [self insertText:text];
+    }
 }
 
 - (UITextRange *)markedTextRange {
@@ -866,6 +889,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
 #pragma mark Keyboard Actions
 
 - (void)paste:(id)sender {
+    self.markedText = nil;
     NSString *string = UIPasteboard.generalPasteboard.string;
     if (string.length == 0)
         return;
@@ -1314,6 +1338,10 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
 
 - (struct rowcol)rowcolFromPoint:(CGPoint)point {
     CGSize sensitivity = self.actualFloatingCursorSensitivity;
+    if (!isfinite(sensitivity.width) || !isfinite(sensitivity.height) ||
+        sensitivity.width < 1.0 || sensitivity.height < 1.0) {
+        return (struct rowcol) {0, 0};
+    }
     return (struct rowcol) {
         .row = (int) (-point.y / sensitivity.height),
         .col = (int) (point.x / sensitivity.width),
@@ -1326,9 +1354,16 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
 }
 
 - (void)updateFloatingCursorAtPoint:(CGPoint)point {
+    CGSize sensitivity = self.actualFloatingCursorSensitivity;
+    if (!isfinite(sensitivity.width) || !isfinite(sensitivity.height) ||
+        sensitivity.width < 1.0 || sensitivity.height < 1.0) {
+        return;
+    }
     struct rowcol newPos = [self rowcolFromPoint:point];
-    int rowDiff = newPos.row - self.floatingCursor.row;
-    int colDiff = newPos.col - self.floatingCursor.col;
+    int rowDiff = MAX(-64, MIN(64, newPos.row - self.floatingCursor.row));
+    int colDiff = MAX(-64, MIN(64, newPos.col - self.floatingCursor.col));
+    if (rowDiff == 0 && colDiff == 0)
+        return;
     NSMutableString *arrows = [NSMutableString string];
     for (int i = 0; i < abs(rowDiff); i++) {
         [arrows appendString:[self.terminal arrow:rowDiff > 0 ? 'A': 'B']];
@@ -1365,6 +1400,19 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"scrollState", @"n
 - (UITextSpellCheckingType)spellCheckingType {
     return UITextSpellCheckingTypeNo;
 }
+#if defined(__IPHONE_17_0) && __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_17_0
+- (UITextInlinePredictionType)inlinePredictionType API_AVAILABLE(ios(17.0)) {
+    return UITextInlinePredictionTypeNo;
+}
+#endif
+#if defined(__IPHONE_18_0) && __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_18_0
+- (UITextMathExpressionCompletionType)mathExpressionCompletionType API_AVAILABLE(ios(18.0)) {
+    return UITextMathExpressionCompletionTypeNo;
+}
+- (UIWritingToolsBehavior)writingToolsBehavior API_AVAILABLE(ios(18.0)) {
+    return UIWritingToolsBehaviorNone;
+}
+#endif
 
 #pragma mark Hardware Keyboard
 
