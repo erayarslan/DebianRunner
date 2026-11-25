@@ -9,7 +9,7 @@ import BackgroundTasks
 #endif
 
 /// User-started long work (Debian installation, APT package changes, headless
-/// mode packages, an opted-in terminal) and what iOS genuinely allows it
+/// mode packages) and what iOS genuinely allows it
 /// while LinuxRunner is not in front:
 ///
 /// * Always: a UIApplication background-task assertion, a short grace period

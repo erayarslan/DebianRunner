@@ -22,7 +22,9 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
-		<string>stikdebug</string>
+		<string>termius</string>
+		<string>ssh</string>
+		<string>shortcuts</string>
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
@@ -48,13 +50,6 @@
 	<array>
 		<string>dev.linuxrunner.scene</string>
 	</array>
-	<key>UIAppFonts</key>
-	<array>
-		<string>JetBrainsMonoNerdFontMono-Regular.ttf</string>
-		<string>JetBrainsMonoNerdFontMono-Bold.ttf</string>
-		<string>FiraCodeNerdFontMono-Regular.ttf</string>
-		<string>FiraCodeNerdFontMono-Bold.ttf</string>
-	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -70,8 +65,6 @@
 					<string>Main App</string>
 					<key>UISceneDelegateClassName</key>
 					<string>SceneDelegate</string>
-					<key>UISceneStoryboardFile</key>
-					<string>Terminal</string>
 				</dict>
 			</array>
 		</dict>
@@ -89,8 +82,6 @@
 	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>$(LINUXRUNNER_LAUNCH_STORYBOARD)</string>
-	<key>UIMainStoryboardFile</key>
-	<string>Terminal</string>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>

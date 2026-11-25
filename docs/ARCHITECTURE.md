@@ -1,23 +1,21 @@
 # How DebianRunner Works
 
-DebianRunner hosts headless **Debian GNU/Linux 13 (trixie) minimal ARM64** userspace inside an iOS/iPadOS application. It combines instruction interpretation, optional block translation (JIT), and a Linux ABI compatibility layer. It does not boot a Linux kernel, use hardware virtualization, or include desktop/GUI stacks.
+DebianRunner hosts headless **Debian GNU/Linux 13 (trixie) minimal ARM64** userspace inside an iOS/iPadOS application. It combines ARM64 instruction interpretation with a Linux ABI compatibility layer. It does not boot a Linux kernel, use hardware virtualization, or include desktop/GUI stacks.
 
 ```text
 Debian 13 (trixie) minimal ARM64 programs and APT packages
        │ ELF loading, guest address spaces
        ▼
-ARM64 interpreter ─── optional JIT, when iOS permits executable memory
+ARM64 interpreter (Asbestos threaded gadgets)
        │
 Linux syscall compatibility: processes, threads, signals, memory, files, PTYs, sockets
        │
-iOS/iPadOS host APIs: storage (fakefs), terminal UI, networking, BLE/MIDI serial
+iOS/iPadOS host APIs: storage (fakefs), SwiftUI manager & Termius SSH handoff, networking, BLE/MIDI serial
 ```
 
 ## Load and Execute ARM64 Programs
 
 The ELF loader maps ARM64 Linux executables and shared libraries into guest address spaces, prepares process state, and transfers control to the runtime. The Asbestos interpreter decodes supported instructions into cached sequences of precompiled host routines (gadgets).
-
-The optional JIT translates supported guest blocks into host machine code when iOS grants executable memory; without permission, the interpreter remains active. [JIT implementation](engine/IOS_JIT.md)
 
 ## Supply Linux Semantics
 
@@ -33,7 +31,7 @@ Linux sockets use host platform networking. Interface, address, and route querie
 
 ## Implementation Map
 
-- `asbestos/guest-arm64/`: ARM64 interpreter gadgets, instruction decoding, and optional JIT.
+- `asbestos/guest-arm64/`: ARM64 interpreter gadgets and instruction decoding.
 - `emu/`, `kernel/`, `fs/`: execution state, Linux syscall compatibility, procfs, devfs, and `fakefs`.
 - `app/LinuxRunner/`: SwiftUI/UIKit interface, Debian bootstrap (`DebianBootstrap.c`, `DebianInstaller.swift`), native runtime bridge (`RuntimeBridge.m`), `DebianSupport.bundle`, and `Support.bundle`.
 - `tests/linuxrunner/`: runtime, syscall, ABI, filesystem, and Debian bootstrap tests.

@@ -4,8 +4,6 @@
 NSString *const LRSystemCPUCoresKey = @"LinuxRunnerSystem.cpuCores";
 NSString *const LRSystemMemoryMBKey = @"LinuxRunnerSystem.memoryMB";
 #include "LinuxAccountPolicy.h"
-#include "JITActivationPolicy.h"
-#import "StikDebugRequest.h"
 #include <sys/utsname.h>
 #include <math.h>
 #import "FileTransfer.h"
@@ -20,9 +18,6 @@ NSString *const LRSystemMemoryMBKey = @"LinuxRunnerSystem.memoryMB";
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <sys/proc.h>
-#ifdef LINUXRUNNER_JIT_BUILD
-#include "asbestos/guest-arm64/jit.h"
-#endif
 #include <os/log.h>
 #include <errno.h>
 #include <stdio.h>
@@ -37,17 +32,11 @@ NSString *const LRSystemMemoryMBKey = @"LinuxRunnerSystem.memoryMB";
 #import "../AppGroup.h"
 #import "../AppDelegate.h"
 #import "../iOSFS.h"
-#import "../Terminal.h"
 #include "PasswordHash.h"
-@class TerminalViewController;
-static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval timeout, void (^done)(BOOL ended));
 static int LRTransferStaging(void);
-@interface TerminalViewController (LRAccountProcess)
-@property (readonly) int sessionPid;
-@property (nonatomic) Terminal *sessionTerminal;
-@end
 @interface LRRuntimeBridge (LRSupportInstall)
 + (void)runSupportInstall:(NSArray<NSString *> *)arguments title:(NSString *)title progress:(void (^)(NSString *))progress completion:(void (^)(NSError * _Nullable))completion;
++ (void)runHeadlessCommand:(NSArray<NSString *> *)command directory:(NSString *)directory stdinData:(NSData * _Nullable)stdinData timeout:(NSTimeInterval)timeout completion:(void (^ _Nullable)(int exitCode))completion;
 @end
 #include <fcntl.h>
 #include <unistd.h>
@@ -61,10 +50,24 @@ static int LRTransferStaging(void);
 #include "kernel/signal.h"
 #include "kernel/futex.h"
 #include "fs/proc.h"
+#include "fs/real.h"
 #include "kernel/fs.h"
 #include "kernel/errno.h"
 #include "fs/path.h"
 #include "fs/fd.h"
+
+static void LRConvertCommandToArgs(NSArray<NSString *> *command, char *argv, size_t maxSize) {
+    char *p = argv;
+    for (NSString *cmd in command) {
+        const char *c = cmd.UTF8String;
+        while (p < argv + maxSize - 1 && (*p++ = *c++));
+        *p = '\0';
+    }
+    if (p < argv + maxSize - 1)
+        *++p = '\0';
+    else if (maxSize > 0)
+        argv[maxSize - 1] = '\0';
+}
 
 // Persistent startup trace, initialized in main before UIKit delegates/roots.
 // Never called by an OS signal handler. Fatal signals remain Apple's crash reports.
@@ -162,9 +165,6 @@ static void LRObserveMemory(const char *operation, uint64_t address, uint64_t le
 extern void (*runtime_syscall_observer)(int, uint64_t, uint64_t, unsigned);
 extern void (*runtime_guest_fault)(int, int, const char *, uint64_t, uint64_t, int, uint64_t, uint32_t);
 extern void (*runtime_fault_context)(const char *);
-static BOOL LRJITActive;
-static NSString *LRJITDetail=@"Interpreter";
-static NSString *LRJITLastFailure;
 static void LRGuestFault(int pid,int ppid,const char *comm,uint64_t pc,uint64_t sp,int signal,uint64_t address,uint32_t instruction) {
     char line[300];snprintf(line,sizeof line,"guest fault pid=%d ppid=%d comm=%.16s signal=%d pc=%#llx sp=%#llx address=%#llx instruction=%#x",pid,ppid,comm,signal,(unsigned long long)pc,(unsigned long long)sp,(unsigned long long)address,instruction);LRBootEvent(line);
     LRBootLogSync();
@@ -174,7 +174,7 @@ static void LRGuestFault(int pid,int ppid,const char *comm,uint64_t pc,uint64_t 
         uint64_t lr = current ? current->cpu.regs[30] : 0;
         NSString *root = LRRuntimeBridge.activeRootName.length ? LRRuntimeBridge.activeRootName : @"unknown";
         NSString *decoded = (instruction & 0xffe0001f) == 0xd4200000 ? [NSString stringWithFormat:@"BRK #%u",(instruction>>5)&65535] : instruction == 0x2ea07842 ? @"SQNEG v2.2s, v2.2s" : @"raw instruction; full disassembly unavailable";
-        [LRGuestCrashCenter begin:@{@"application":[NSString stringWithUTF8String:comm]?:@"unknown",@"executable":[NSString stringWithUTF8String:executable]?:@"unknown",@"pid":@(current?current->tgid:pid).stringValue,@"tid":@(pid).stringValue,@"ppid":@(ppid).stringValue,@"signal":@(signal).stringValue,@"signal_name":signal==4?@"SIGILL":signal==5?@"SIGTRAP":signal==6?@"SIGABRT":signal==7?@"SIGBUS":signal==11?@"SIGSEGV":@"none",@"pc":[NSString stringWithFormat:@"%#llx",(unsigned long long)pc],@"lr":[NSString stringWithFormat:@"%#llx",(unsigned long long)lr],@"sp":[NSString stringWithFormat:@"%#llx",(unsigned long long)sp],@"address":[NSString stringWithFormat:@"%#llx",(unsigned long long)address],@"instruction":[NSString stringWithFormat:@"%#x",instruction],@"disassembly":decoded,@"rootfs":root,@"version":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]?:@"unknown",@"build":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]?:@"unknown",@"source_commit":[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"unknown",@"environment":LRJITActive?@"iOS ARM64 JIT; 4 KB guest pages":@"iOS ARM64 interpreter; 4 KB guest pages"}];
+        [LRGuestCrashCenter begin:@{@"application":[NSString stringWithUTF8String:comm]?:@"unknown",@"executable":[NSString stringWithUTF8String:executable]?:@"unknown",@"pid":@(current?current->tgid:pid).stringValue,@"tid":@(pid).stringValue,@"ppid":@(ppid).stringValue,@"signal":@(signal).stringValue,@"signal_name":signal==4?@"SIGILL":signal==5?@"SIGTRAP":signal==6?@"SIGABRT":signal==7?@"SIGBUS":signal==11?@"SIGSEGV":@"none",@"pc":[NSString stringWithFormat:@"%#llx",(unsigned long long)pc],@"lr":[NSString stringWithFormat:@"%#llx",(unsigned long long)lr],@"sp":[NSString stringWithFormat:@"%#llx",(unsigned long long)sp],@"address":[NSString stringWithFormat:@"%#llx",(unsigned long long)address],@"instruction":[NSString stringWithFormat:@"%#x",instruction],@"disassembly":decoded,@"rootfs":root,@"version":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]?:@"unknown",@"build":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]?:@"unknown",@"source_commit":[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"unknown",@"environment":@"iOS ARM64 interpreter; 4 KB guest pages"}];
     }
 }
 extern void (*runtime_guest_output)(int,int,int,const char *);
@@ -413,16 +413,11 @@ static struct lr_transfer_control LRTransferCallbacks(LRTransferControl *control
     bootAttempted = YES;
 #if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
     // Scale the Asbestos translation cache cap with device RAM while leaving
-    // headroom for guest data, JIT code region (120 MB), and UIKit within iOS Jetsam limits.
+    // headroom for guest data and UIKit within iOS Jetsam limits.
     unsigned long long physMem = NSProcessInfo.processInfo.physicalMemory;
-#ifdef LINUXRUNNER_JIT_BUILD
-    const char *codeCapMB = physMem >= (7ULL << 30)  ? "64"
-                          : "32";
-#else
     const char *codeCapMB = physMem >= (10ULL << 30) ? "96"
                           : physMem >= (7ULL << 30)  ? "64"
                           : "32";
-#endif
     setenv("ISH_CODE_CAP_MB", codeCapMB, 0);
     setenv("ISH_CODE_IDLE_FLUSH_S", "60", 0);
 #endif
@@ -572,7 +567,7 @@ static NSString *LRThermalState(void) {
     unlock(&pids_lock);
     mach_task_basic_info_data_t info={0};mach_msg_type_number_t count=MACH_TASK_BASIC_INFO_COUNT;
     BOOL haveMemory=task_info(mach_task_self(),MACH_TASK_BASIC_INFO,(task_info_t)&info,&count)==KERN_SUCCESS;
-    return @{@"runtime":self.runtimeStatus,@"source_commit":[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"unavailable",@"distribution_root":self.activeRootName.length?self.activeRootName:@"none",@"distribution":@"debian",@"architecture":@"aarch64",@"backend":LRJITActive?@"ARM64 JIT":@"ARM64 interpreter",@"jit_backend_active":@(LRJITActive),@"host_page_size":@(getpagesize()),@"guest_page_size":@4096,@"host_resident_bytes":haveMemory?@(info.resident_size):@0,@"memory_measured":@(haveMemory),@"host_thermal_state":LRThermalState(),@"low_power_mode":@(NSProcessInfo.processInfo.lowPowerModeEnabled),@"guest_processes":@(processes),@"guest_threads":@(threads),@"runtime_uptime_seconds":@(runtimeStartedAt?NSProcessInfo.processInfo.systemUptime-runtimeStartedAt:0),@"thread_state_limit":@"Counts are live tasks; no claim of precise sleeping/blocked state"};
+    return @{@"runtime":self.runtimeStatus,@"source_commit":[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"unavailable",@"distribution_root":self.activeRootName.length?self.activeRootName:@"none",@"distribution":@"debian",@"architecture":@"aarch64",@"backend":@"ARM64 interpreter",@"host_page_size":@(getpagesize()),@"guest_page_size":@4096,@"host_resident_bytes":haveMemory?@(info.resident_size):@0,@"memory_measured":@(haveMemory),@"host_thermal_state":LRThermalState(),@"low_power_mode":@(NSProcessInfo.processInfo.lowPowerModeEnabled),@"guest_processes":@(processes),@"guest_threads":@(threads),@"runtime_uptime_seconds":@(runtimeStartedAt?NSProcessInfo.processInfo.systemUptime-runtimeStartedAt:0),@"thread_state_limit":@"Counts are live tasks; no claim of precise sleeping/blocked state"};
 }
 + (NSURL *)catalogURL { return [ContainerURL() URLByAppendingPathComponent:@"environments.json"]; }
 + (NSArray<NSString *> *)rootNames { return Roots.instance.roots.array; }
@@ -611,7 +606,7 @@ static NSString *LRThermalState(void) {
         // snapshotWriter contention and MAP_SHARED writes on every guest syscall.
         __atomic_store_n(&runtime_syscall_observer, NULL, __ATOMIC_RELEASE);
     }
-    [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"boot result=%d backend=asbestos jit=%s", error, LRJITActive ? "true" : "false"]];
+    [self logCategory:@"EXEC" event:[NSString stringWithFormat:@"boot result=%d backend=asbestos", error]];
     if (error != 0) {
         LRBootLogSync();
     }
@@ -690,153 +685,6 @@ static NSUInteger LRServiceManagerInitRetries;
     int result = fakefs_bind_mount("/home/mobile/Downloads", exchange.fileSystemRepresentation, false);
     [self logCategory:@"FS" event:[NSString stringWithFormat:@"exchange mount result=%d", result]];
     return result;
-}
-+ (NSDictionary *)probeJITPermissions {
-    size_t size=getpagesize();void *page=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
-    int allocationError=page==MAP_FAILED?errno:0,protectionError=0;
-    BOOL permitted=NO;if(page!=MAP_FAILED){permitted=mprotect(page,size,PROT_READ|PROT_EXEC)==0;if(!permitted)protectionError=errno;munmap(page,size);}
-    BOOL available = self.jitCompiledIn;
-    BOOL active = LRJITActive;
-    NSString *reason = active ? (LRJITDetail ?: @"JIT backend active.")
-        : (available ? @"JIT-capable build; translator stays inactive until iOS authorizes executable memory."
-                     : @"Interpreter-only build. Public VM permission probe does not establish generated-code execution or translator activation.");
-    NSDictionary *result=@{@"backend_available":@(available),@"backend_active":@(active),@"executable_protection_change":@(permitted),@"allocation_errno":@(allocationError),@"protection_errno":@(protectionError),@"generated_code_executed":@(active),@"capability_verified":@(active),@"reason":reason};
-    [self logCategory:@"JIT" event:[NSString stringWithFormat:@"permission_probe=%d allocation_errno=%d protection_errno=%d backend_available=%d capability_verified=%d",permitted,allocationError,protectionError,available,active]];return result;
-}
-
-// ---- Execution backend -----------------------------------------------------
-static NSString *const LRExecutionModeKey=@"LinuxRunnerExecutionMode";
-static NSString *const LRJITAttemptKey=@"LinuxRunnerJITAttemptInProgress";
-static NSString *const LRJITCrashedPathsKey=@"LinuxRunnerJITCrashedPaths";
-+ (BOOL)jitCompiledIn {
-#ifdef LINUXRUNNER_JIT_BUILD
-    return YES;
-#else
-    return NO;
-#endif
-}
-+ (NSString *)executionMode {
-    NSString *mode=[NSUserDefaults.standardUserDefaults stringForKey:LRExecutionModeKey];
-    if(!mode)return self.jitCompiledIn?@"automatic":@"interpreter";
-    return [@[@"automatic",@"jit"] containsObject:mode]?mode:@"interpreter";
-}
-+ (void)setExecutionMode:(NSString *)mode {
-    [NSUserDefaults.standardUserDefaults setObject:[@[@"automatic",@"jit"] containsObject:mode]?mode:@"interpreter" forKey:LRExecutionModeKey];
-}
-extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
-+ (BOOL)debuggerAttached {
-    struct kinfo_proc info={0};size_t size=sizeof info;int mib[]={CTL_KERN,KERN_PROC,KERN_PROC_PID,getpid()};
-    BOOL traced=sysctl(mib,4,&info,&size,NULL,0)==0&&(info.kp_proc.p_flag&P_TRACED);
-    uint32_t flags=0;BOOL debugged=csops(getpid(),0 /* CS_OPS_STATUS */,&flags,sizeof flags)==0&&(flags&0x10000000 /* CS_DEBUGGED */);
-    return traced||debugged;
-}
-+ (BOOL)requiresPreparedJITRegion {
-    NSInteger major=NSProcessInfo.processInfo.operatingSystemVersion.majorVersion;
-    if(major<26)return NO;
-    struct utsname name;uname(&name);NSString *hardware=[NSString stringWithUTF8String:name.machine];
-    if(major>=27)return ![hardware isEqual:@"iPad8,11"]&&![hardware isEqual:@"iPad8,12"];
-    BOOL pad=[hardware hasPrefix:@"iPad"];
-    if(!pad&&![hardware hasPrefix:@"iPhone"])return YES;
-    NSScanner *scanner=[NSScanner scannerWithString:[hardware substringFromIndex:pad?4:6]];
-    NSInteger majorModel=0,minorModel=0;
-    if(![scanner scanInteger:&majorModel]||![scanner scanString:@"," intoString:nil]||![scanner scanInteger:&minorModel])return YES;
-    return majorModel > 14 || (majorModel == 14 && minorModel >= (pad ? 5 : 2));
-}
-+ (NSURL *)stikDebugRequestURL {
-    return LRStikDebugRequest(NSBundle.mainBundle.bundleIdentifier,getpid(),self.requiresPreparedJITRegion);
-}
-+ (NSDictionary *)executionBackendStatus {
-    return @{@"compiled":@(self.jitCompiledIn),@"mode":self.executionMode,@"active":LRJITActive?@"jit":@"interpreter",@"detail":LRJITDetail?:@"",@"debugger":@(self.debuggerAttached),@"txm":@(self.requiresPreparedJITRegion)};
-}
-+ (BOOL)retryJITAfterFailure:(NSString **)detail {
-    NSUserDefaults *defaults=NSUserDefaults.standardUserDefaults;
-    NSMutableArray *paths=[[defaults stringArrayForKey:LRJITCrashedPathsKey] mutableCopy]?:[NSMutableArray array];
-    [paths removeObject:self.requiresPreparedJITRegion?@"txm":@"classic"];
-    [defaults setObject:paths forKey:LRJITCrashedPathsKey];
-    LRJITLastFailure=nil;
-    return [self activateJIT:detail];
-}
-+ (BOOL)activateJIT:(NSString **)detail {
-    NSString *(^done)(BOOL,NSString *)=^NSString *(BOOL ok,NSString *why){LRJITActive=LRJITActive||ok;LRJITDetail=why;[self logCategory:@"JIT" event:[NSString stringWithFormat:@"activate ok=%d %@",ok,why]];return why;};
-#ifdef LINUXRUNNER_JIT_BUILD
-    if(LRJITActive){if(detail)*detail=LRJITDetail;return YES;}
-    NSUserDefaults *defaults=NSUserDefaults.standardUserDefaults;
-    NSArray *crashed=[defaults stringArrayForKey:LRJITCrashedPathsKey]?:@[];
-    BOOL traced=self.debuggerAttached,txmDevice=self.requiresPreparedJITRegion;
-    NSMutableArray *paths=[NSMutableArray array];
-    unsigned allowed=lr_jit_activation_paths(txmDevice,traced||txmDevice,[crashed containsObject:@"classic"],[crashed containsObject:@"txm"]);
-    if(allowed&LRJITTryClassic)[paths addObject:@"classic"];
-    if(allowed&LRJITTryPrepared)[paths addObject:@"txm"];
-    NSString *why=txmDevice&&!traced?@"StikDebug is not attached with its universal.js script. On this device JIT needs that script, and StikDebug does not pick it for LinuxRunner by itself: use Attach with StikDebug in LinuxRunner (Settings › Execution Engine), or assign universal.js to LinuxRunner in StikDebug first.":@"The selected JIT method is quarantined after an interrupted activation. Use Activate JIT Now to review a manual retry.";
-    for(NSString *path in paths){
-        [defaults setObject:path forKey:LRJITAttemptKey];[defaults synchronize];
-        char text[256]={0};int rc=jit_ios_acquire([path isEqual:@"txm"],text,sizeof text);
-        [defaults removeObjectForKey:LRJITAttemptKey];[defaults synchronize];
-        why=[NSString stringWithFormat:@"%@: %s",[path isEqual:@"txm"]?@"TXM":@"Classic",text];
-        if(rc==0){if(detail)*detail=done(YES,[@"JIT active · " stringByAppendingString:why]);return YES;}
-    }
-    LRJITLastFailure=why;
-    if(detail)*detail=done(NO,why);return NO;
-#else
-    if(detail)*detail=done(NO,@"This build is interpreter-only; install the JIT build to use the JIT.");return NO;
-#endif
-}
-+ (NSDictionary *)jitStatusReport {
-    NSMutableDictionary *r=[NSMutableDictionary dictionaryWithDictionary:@{@"compiled":@(self.jitCompiledIn),@"mode":self.executionMode,@"debugger":@(self.debuggerAttached),@"txm":@(self.requiresPreparedJITRegion),@"os":NSProcessInfo.processInfo.operatingSystemVersionString}];
-    NSArray *crashed=[NSUserDefaults.standardUserDefaults stringArrayForKey:LRJITCrashedPathsKey]?:@[];
-    NSString *selectedPath=self.requiresPreparedJITRegion?@"txm":@"classic";
-    BOOL activationQuarantined=[crashed containsObject:selectedPath];
-    NSString *state,*detail;
-#ifdef LINUXRUNNER_JIT_BUILD
-    uint64_t blocks=0,segments=0,bytes=0;jit_counters(&blocks,&segments,&bytes);
-    uint64_t regionUsed=0,regionCap=0,reused=0;bool pic=false,exhausted=false;
-    jit_region_stats(&regionUsed,&regionCap,&reused,&pic,&exhausted);
-    r[@"blocks"]=@(blocks);r[@"segments"]=@(segments);r[@"code_kb"]=@(bytes/1024);
-    r[@"reused"]=@(reused);r[@"region_used_kb"]=@(regionUsed/1024);r[@"region_capacity_kb"]=@(regionCap/1024);
-    r[@"pic"]=@(pic);r[@"region_exhausted"]=@(exhausted);
-    if(LRJITActive&&segments>0){
-        state=@"JIT Active";
-        NSString *regionText=regionCap>0?[NSString stringWithFormat:@"%.1f / %.0f MB code region%@",(double)regionUsed/(1024.0*1024.0),(double)regionCap/(1024.0*1024.0),exhausted?@" (full)":@""]:[NSString stringWithFormat:@"%llu KB generated code",bytes/1024];
-        detail=pic?[NSString stringWithFormat:@"%@ · %llu blocks (%llu reused, PIC) · %@",LRJITDetail,blocks,reused,regionText]:[NSString stringWithFormat:@"%@ · %llu guest blocks translated, %llu native segments · %@",LRJITDetail,blocks,segments,regionText];
-    }
-    else if(LRJITActive){state=@"JIT Initializing";detail=[NSString stringWithFormat:@"%@ · code region verified (test code returned the expected value); no guest code translated yet — start or use Linux",LRJITDetail];}
-    else if(activationQuarantined&&!LRJITLastFailure){state=@"JIT Failed";detail=[NSString stringWithFormat:@"A previous activation (%@) ended LinuxRunner; that method is disabled. Interpreter fallback active.",selectedPath];}
-    else if([self.executionMode isEqual:@"interpreter"]){state=@"Interpreter Active";detail=self.debuggerAttached?@"A debugger is attached: choose Automatic or JIT to use it":@"Interpreter selected";}
-    else if(LRJITLastFailure){state=@"JIT Unavailable";detail=[LRJITLastFailure stringByAppendingString:@" · interpreter fallback active"];}
-    else if(self.debuggerAttached){state=@"JIT Available";detail=@"Debugger attached · tap Activate JIT Now";}
-    else {state=@"Waiting for JIT Authorization";detail=self.requiresPreparedJITRegion?@"No debugger attached. On this iPhone, JIT needs StikDebug's universal.js script, which StikDebug does not choose for LinuxRunner by itself: tap Attach with StikDebug here (it asks StikDebug for universal.js), or in StikDebug assign universal.js to LinuxRunner before enabling JIT. \"JIT request completed\" without the script does not enable JIT on this device.":@"Executable memory not yet allowed · enable JIT for LinuxRunner in StikDebug and return here";}
-#else
-    state=@"Interpreter Active";detail=@"This build is interpreter-only";
-#endif
-    r[@"activationQuarantined"]=@(activationQuarantined);
-    r[@"state"]=state;r[@"detail"]=detail;return r;
-}
-+ (void)retryJITWhenAuthorized {
-    if(!self.jitCompiledIn||LRJITActive||[self.executionMode isEqual:@"interpreter"])return;
-    if(self.requiresPreparedJITRegion&&!self.debuggerAttached)return;
-    NSString *why=nil;[self activateJIT:&why];
-}
-+ (void)prepareExecutionBackendAtLaunch {
-    static dispatch_once_t observe;
-    dispatch_once(&observe,^{[NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){[LRRuntimeBridge retryJITWhenAuthorized];}];});
-    NSUserDefaults *defaults=NSUserDefaults.standardUserDefaults;
-    NSString *build=[NSString stringWithFormat:@"%@/%@",[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]?:@"?",[NSBundle.mainBundle objectForInfoDictionaryKey:@"LinuxRunnerSourceCommit"]?:@"?"];
-    if(![[defaults stringForKey:@"LinuxRunnerJITQuarantineBuild"] isEqual:build]){
-        if([defaults stringArrayForKey:LRJITCrashedPathsKey].count)[self logCategory:@"JIT" event:@"new build: previous JIT quarantine cleared"];
-        [defaults removeObjectForKey:LRJITCrashedPathsKey];[defaults setObject:build forKey:@"LinuxRunnerJITQuarantineBuild"];
-    }
-    NSString *crashedPath=[defaults stringForKey:LRJITAttemptKey];
-    if(crashedPath){
-        NSArray *crashed=[defaults stringArrayForKey:LRJITCrashedPathsKey]?:@[];
-        [defaults setObject:[crashed arrayByAddingObject:crashedPath] forKey:LRJITCrashedPathsKey];
-        [defaults removeObjectForKey:LRJITAttemptKey];[defaults synchronize];
-        LRJITDetail=[NSString stringWithFormat:@"Interpreter · the last JIT activation (%@) ended LinuxRunner; that method is disabled",crashedPath];
-        [self logCategory:@"JIT" event:LRJITDetail];
-    }
-    NSString *mode=self.executionMode;
-    if(!self.jitCompiledIn||[mode isEqual:@"interpreter"])return;
-    if(!self.requiresPreparedJITRegion||self.debuggerAttached){NSString *why=nil;[self activateJIT:&why];}
-    else LRJITDetail=@"Interpreter · attach with StikDebug in Settings › Execution Engine to start the JIT";
 }
 + (NSString *)activeDistributionID {
     return self.activeRootName.length ? @"debian" : nil;
@@ -1546,9 +1394,8 @@ void LRSetDatalessMaterialization(void) {
         "else su -l \"$u\" -s /bin/sh -c \"sh /home/mobile/Downloads/.linuxrunner/support/share-check.sh '$d' '$tmp' '$token'\"; fi\n"
         "cp \"$tmp\" \"$out.tmp\" && mv \"$out.tmp\" \"$out\"; rm -f \"$tmp\"\n";
     NSArray *command = @[@"/bin/sh", @"-c", script, @"linuxrunner-share-check", self.defaultLinuxUser, folder[@"mountPoint"], guestOut, token];
-    TerminalViewController *process = [self terminalForCommand:command directory:@"/"];
-    LRWaitForProcess(process, 60, ^(BOOL ended) {
-        (void)process;
+    [self runHeadlessCommand:command directory:@"/" timeout:60.0 completion:^(int exitCode) {
+        (void)exitCode;
         NSString *text = [[NSString stringWithContentsOfURL:result encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSString *linux = text.length ? [@"Linux: " stringByAppendingString:[text stringByReplacingOccurrencesOfString:@"\n" withString:@" · "]] : @"Linux: the check did not finish";
         NSString *roundTrip = @"";
@@ -1561,7 +1408,7 @@ void LRSetDatalessMaterialization(void) {
         }
         [self logCategory:@"FILES" event:[NSString stringWithFormat:@"shared folder check %@ | %@ | %@%@", folder[@"mountPoint"], [ios stringByReplacingOccurrencesOfString:@"\n" withString:@" | "], linux, [roundTrip stringByReplacingOccurrencesOfString:@"\n" withString:@" "]]];
         completion([NSString stringWithFormat:@"%@\n%@%@", ios, linux, roundTrip]);
-    });
+    }];
 }
 + (void)checkAppSharedFolder:(void (^)(NSString *summary))completion {
     NSString *root = self.activeRootName;
@@ -1578,9 +1425,8 @@ void LRSetDatalessMaterialization(void) {
         "else su -l \"$u\" -s /bin/sh -c \"sh /home/mobile/Downloads/.linuxrunner/support/share-check.sh '$d' '$tmp' '$token'\"; fi\n"
         "cp \"$tmp\" \"$out.tmp\" && mv \"$out.tmp\" \"$out\"; rm -f \"$tmp\"\n";
     NSArray *command = @[@"/bin/sh", @"-c", script, @"linuxrunner-share-check", self.defaultLinuxUser, @"/mnt/LinuxRunnerShared", @"/home/mobile/Downloads/.linuxrunner/support/share-check-app.txt", token];
-    TerminalViewController *process = [self terminalForCommand:command directory:@"/"];
-    LRWaitForProcess(process, 60, ^(BOOL ended) {
-        (void)process;
+    [self runHeadlessCommand:command directory:@"/" timeout:60.0 completion:^(int exitCode) {
+        (void)exitCode;
         NSString *text = [[NSString stringWithContentsOfURL:result encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSString *linux = text.length ? [@"Linux: " stringByAppendingString:[text stringByReplacingOccurrencesOfString:@"\n" withString:@" · "]] : @"Linux: the check did not finish";
         NSString *roundTrip = @"";
@@ -1593,7 +1439,7 @@ void LRSetDatalessMaterialization(void) {
         }
         [self logCategory:@"FILES" event:[NSString stringWithFormat:@"app shared folder check | %@ | %@%@", ios, linux, [roundTrip stringByReplacingOccurrencesOfString:@"\n" withString:@" "]]];
         completion([NSString stringWithFormat:@"%@\n%@%@", ios, linux, roundTrip]);
-    });
+    }];
 }
 + (void)prepareUserSharedFolder:(NSDictionary *)account {
     if (!self.isRunning || !validRoot(self.activeRootName)) return;
@@ -1625,53 +1471,7 @@ void LRSetDatalessMaterialization(void) {
         [self logCategory:@"FILES" event:[NSString stringWithFormat:@"shared folder %@ owner=%u:%u result=%d", folder[@"mountPoint"], uid, gid, err]];
     }
 }
-static NSArray<NSString *> *LRLoginCommand(NSString *name, NSError **error) {
-    if (!LRLoginAccount(name)) {
-        if (error) *error = lrError(ENOENT, @"The selected Linux account no longer exists or does not have a login shell.");
-        return nil;
-    }
-    NSString *su = LRAccountTool(@[@"/bin/su", @"/usr/bin/su"]);
-    if (!su) { if (error) *error = lrError(ENOENT, @"Install Debian's su/login tools first."); return nil; }
-    return @[su, @"-l", name];
-}
-+ (NSArray *)defaultLinuxLoginCommand:(NSError **)error {
-    NSString *name = self.defaultLinuxUser;
-    if ([name isEqual:@"root"]) return nil;
-    return LRLoginCommand(name, error);
-}
-+ (TerminalViewController *)terminalForLinuxUser:(NSString *)name error:(NSError **)error {
-    NSArray *command = LRLoginCommand(name, error);
-    return command ? [self terminalForCommand:command directory:@"/"] : nil;
-}
-+ (TerminalViewController *)createLinuxUser:(NSString *)name error:(NSError **)error { return [self createLinuxUser:name administrator:YES passwordlessSudo:YES error:error]; }
 + (BOOL)canGrantAdministrator { return LRAccountTool(@[@"/usr/bin/sudo", @"/bin/sudo"]) != nil; }
-+ (TerminalViewController *)createLinuxUser:(NSString *)name administrator:(BOOL)administrator error:(NSError **)error {
-    return [self createLinuxUser:name administrator:administrator passwordlessSudo:administrator error:error];
-}
-+ (TerminalViewController *)createLinuxUser:(NSString *)name administrator:(BOOL)administrator passwordlessSudo:(BOOL)passwordlessSudo error:(NSError **)error {
-    if (!lr_linux_account_name_valid(name.UTF8String) || [name isEqual:@"root"]) {
-        if (error) *error=lrError(EINVAL, @"Use 1–32 lowercase ASCII letters, digits, underscores or hyphens, starting with a letter or underscore."); return nil;
-    }
-    NSString *passwd=LRAccountTool(@[@"/usr/bin/passwd", @"/bin/passwd"]);
-    NSString *create=LRAccountTool(@[@"/usr/sbin/useradd", @"/usr/bin/useradd"]);
-    if (!passwd || !create) { if(error)*error=lrError(ENOENT, @"Account tools are not installed yet. Use Create Account in Linux Users; it installs them automatically."); return nil; }
-    NSString *grant=@"";
-    if (administrator) {
-        if (!self.canGrantAdministrator) { if(error)*error=lrError(ENOENT, @"sudo is not installed in this environment; install it first, or create the user without administrator access."); return nil; }
-        grant=@" && { getent group sudo >/dev/null || groupadd --system sudo; } && usermod -aG sudo -- \"$1\"";
-        if (passwordlessSudo) {
-            grant=[grant stringByAppendingString:
-                @" && mkdir -p /etc/sudoers.d && chmod 750 /etc/sudoers.d"
-                " && printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\\n' \"$1\" > \"/etc/sudoers.d/90-debianrunner-$1.tmp\""
-                " && chmod 440 \"/etc/sudoers.d/90-debianrunner-$1.tmp\""
-                " && { chown 0:0 \"/etc/sudoers.d/90-debianrunner-$1.tmp\" 2>/dev/null || true; }"
-                " && { ! command -v visudo >/dev/null 2>&1 || visudo -cf \"/etc/sudoers.d/90-debianrunner-$1.tmp\" >/dev/null || { rm -f \"/etc/sudoers.d/90-debianrunner-$1.tmp\"; exit 1; }; }"
-                " && mv -f \"/etc/sudoers.d/90-debianrunner-$1.tmp\" \"/etc/sudoers.d/90-debianrunner-$1\""];
-        }
-    }
-    NSString *script=[NSString stringWithFormat:@"\"$2\" --create-home --shell /bin/bash -- \"$1\"%@ && exec \"$3\" \"$1\"", grant];
-    return [self terminalForCommand:@[@"/bin/sh", @"-c", script, @"linuxrunner-create-user", name, create, passwd] directory:@"/"];
-}
 // ---- Native account setup ---------------------------------------------------
 static NSData *LRReadGuestFile(NSString *path, size_t limit) {
     struct fs_info *fs = LRAccountFS(); if (!fs) return nil;
@@ -1689,13 +1489,6 @@ static NSData *LRReadGuestFile(NSString *path, size_t limit) {
 + (BOOL)accountToolsPresent {
     return LRAccountTool(@[@"/usr/bin/passwd", @"/bin/passwd"]) && LRAccountTool(@[@"/usr/sbin/chpasswd", @"/sbin/chpasswd", @"/usr/bin/chpasswd", @"/bin/chpasswd"]) &&
         LRAccountTool(@[@"/usr/sbin/useradd", @"/usr/bin/useradd"]);
-}
-static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval timeout, void (^done)(BOOL ended)) {
-    NSDate *start = NSDate.date;
-    [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *timer) {
-        BOOL ended = process.sessionPid <= 0;
-        if (ended || -[start timeIntervalSinceNow] > timeout) { [timer invalidate]; done(ended); }
-    }];
 }
 + (void)createLinuxUser:(NSString *)name password:(NSString *)password administrator:(BOOL)administrator
                progress:(void (^)(NSString *))progress completion:(void (^)(NSError *))completion {
@@ -1725,13 +1518,15 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
                     "mv -f \"/etc/sudoers.d/90-debianrunner-$1.tmp\" \"/etc/sudoers.d/90-debianrunner-$1\"\n"];
             }
         }
-        NSString *script = [NSString stringWithFormat:@"set -e\nstty -echo 2>/dev/null || true\n"
+        NSString *script = [NSString stringWithFormat:@"set -e\n"
             "useradd --create-home --shell /bin/bash -- \"$1\"\n"
             "%@IFS= read -r hash\nprintf '%%s:%%s\\n' \"$1\" \"$hash\" | chpasswd -e\n", grant];
-        TerminalViewController *process = [self terminalForCommand:@[@"/bin/sh", @"-c", script, @"linuxrunner-create-user", name] directory:@"/"];
-        [process.sessionTerminal sendInput:[[hashed stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-        LRWaitForProcess(process, 120, ^(BOOL ended) {
-            (void)process;
+        NSData *stdinData = [[hashed stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+        [self runHeadlessCommand:@[@"/bin/sh", @"-c", script, @"linuxrunner-create-user", name]
+                       directory:@"/"
+                       stdinData:stdinData
+                         timeout:120.0
+                      completion:^(int exitCode) {
             NSString *shadow = [[NSString alloc] initWithData:LRReadGuestFile(@"/etc/shadow", 1 << 20) ?: [NSData data] encoding:NSUTF8StringEncoding];
             BOOL stored = NO;
             for (NSString *line in [shadow componentsSeparatedByString:@"\n"]) {
@@ -1739,10 +1534,10 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
                 if (fields.count > 1 && [fields[0] isEqual:name] && [fields[1] isEqual:hashed]) stored = YES;
             }
             BOOL exists = NO; for (NSDictionary *account in self.linuxAccounts) if ([account[@"name"] isEqual:name]) exists = YES;
-            [self logCategory:@"ACCOUNT" event:[NSString stringWithFormat:@"native create user=%@ admin=%d nopasswd=%d ended=%d exists=%d password_set=%d", name, administrator, grantNopasswd, ended, exists, stored]];
+            [self logCategory:@"ACCOUNT" event:[NSString stringWithFormat:@"native create user=%@ admin=%d nopasswd=%d exit=%d exists=%d password_set=%d", name, administrator, grantNopasswd, exitCode, exists, stored]];
             if (exists && stored) completion(nil);
             else completion(lrError(EIO, exists ? @"The account was created but its password could not be set. Set it in Linux Users." : @"The account could not be created. Details are in Runtime Diagnostics (ACCOUNT)."));
-        });
+        }];
     };
     [self ensureAccountTools:administrator progress:progress then:create failure:completion];
 }
@@ -1767,24 +1562,31 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
     NSString *hashed = @(hash); memset(hash, 0, sizeof hash);
     [self ensureAccountTools:NO progress:progress then:^{
         progress(@"Setting the password");
-        TerminalViewController *process = [self terminalForCommand:@[@"/bin/sh", @"-c", @"stty -echo 2>/dev/null || true\nIFS= read -r hash\nprintf '%s:%s\\n' \"$1\" \"$hash\" | chpasswd -e\n", @"linuxrunner-set-password", name] directory:@"/"];
-        [process.sessionTerminal sendInput:[[hashed stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-        LRWaitForProcess(process, 60, ^(BOOL ended) {
-            (void)process;
+        NSData *stdinData = [[hashed stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+        [self runHeadlessCommand:@[@"/bin/sh", @"-c", @"IFS= read -r hash\nprintf '%s:%s\\n' \"$1\" \"$hash\" | chpasswd -e\n", @"linuxrunner-set-password", name]
+                       directory:@"/"
+                       stdinData:stdinData
+                         timeout:60.0
+                      completion:^(int exitCode) {
             NSString *shadow = [[NSString alloc] initWithData:LRReadGuestFile(@"/etc/shadow", 1 << 20) ?: [NSData data] encoding:NSUTF8StringEncoding];
             BOOL stored = NO;
             for (NSString *line in [shadow componentsSeparatedByString:@"\n"]) { NSArray *f = [line componentsSeparatedByString:@":"]; if (f.count > 1 && [f[0] isEqual:name] && [f[1] isEqual:hashed]) stored = YES; }
-            [self logCategory:@"ACCOUNT" event:[NSString stringWithFormat:@"native password user=%@ ended=%d set=%d", name, ended, stored]];
+            [self logCategory:@"ACCOUNT" event:[NSString stringWithFormat:@"native password user=%@ exit=%d set=%d", name, exitCode, stored]];
             completion(stored ? nil : lrError(EIO, @"The password could not be set."));
-        });
+        }];
     } failure:completion];
 }
 
 // ---- Headless Guest Command Runner & Built-in OpenSSH Server ---------------
-// Spawns short-lived guest commands attached to /dev/null with zero WebViews
-// and zero PTYs so polling or restarting sshd never leaks WKWebViews or
-// triggers SIGHUP when a helper shell exits.
+// Spawns guest commands attached to /dev/null (or a short host pipe for stdin)
+// with zero WebViews and zero PTYs.
 + (void)runHeadlessCommand:(NSArray<NSString *> *)command directory:(NSString *)directory completion:(void (^ _Nullable)(int exitCode))completion {
+    [self runHeadlessCommand:command directory:directory stdinData:nil timeout:20.0 completion:completion];
+}
++ (void)runHeadlessCommand:(NSArray<NSString *> *)command directory:(NSString *)directory timeout:(NSTimeInterval)timeout completion:(void (^ _Nullable)(int exitCode))completion {
+    [self runHeadlessCommand:command directory:directory stdinData:nil timeout:timeout completion:completion];
+}
++ (void)runHeadlessCommand:(NSArray<NSString *> *)command directory:(NSString *)directory stdinData:(NSData * _Nullable)stdinData timeout:(NSTimeInterval)timeout completion:(void (^ _Nullable)(int exitCode))completion {
     void (^launch)(void) = ^{
         if (!self.isRunning || command.count == 0) {
             if (completion) completion(-1);
@@ -1798,6 +1600,10 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
                 return;
             }
             bytes += length + 1;
+        }
+        if (stdinData.length > 4096) {
+            if (completion) completion(-EINVAL);
+            return;
         }
 #if !ISH_LINUX
         int err = become_new_init_child();
@@ -1814,12 +1620,46 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
         };
         err = create_stdio("/dev/null", MEM_MAJOR, DEV_NULL_MINOR);
         if (err < 0) { failLaunch(err); return; }
+        if (stdinData.length > 0) {
+            int p[2] = {-1, -1};
+            if (pipe(p) != 0) { failLaunch(-errno); return; }
+            fcntl(p[0], F_SETFD, FD_CLOEXEC);
+            fcntl(p[1], F_SETFD, FD_CLOEXEC);
+            const uint8_t *ptr = (const uint8_t *)stdinData.bytes;
+            size_t remaining = stdinData.length;
+            while (remaining > 0) {
+                ssize_t written = write(p[1], ptr, remaining);
+                if (written < 0) {
+                    if (errno == EINTR) continue;
+                    int saved = errno;
+                    close(p[0]); close(p[1]);
+                    failLaunch(-saved);
+                    return;
+                }
+                ptr += written;
+                remaining -= (size_t)written;
+            }
+            close(p[1]);
+            struct fd *stdinFd = adhoc_fd_create(&realfs_fdops);
+            if (!stdinFd) {
+                close(p[0]);
+                failLaunch(_ENOMEM);
+                return;
+            }
+            stdinFd->real_fd = p[0];
+            stdinFd->dir = NULL;
+            stdinFd->type = S_IFIFO;
+            stdinFd->stat.mode = S_IFIFO | 0600;
+            stdinFd->flags = O_RDONLY_;
+            fd_close(current->files->files[0]);
+            current->files->files[0] = stdinFd;
+        }
         if (directory.length) {
             struct fd *dir = generic_open(directory.UTF8String, O_RDONLY_ | O_DIRECTORY_, 0);
             if (!IS_ERR(dir)) fs_chdir(current->fs, dir);
         }
         char argv[4096];
-        [Terminal convertCommand:command toArgs:argv limitSize:sizeof(argv)];
+        LRConvertCommandToArgs(command, argv, sizeof(argv));
         const char *envp = "TERM=dumb\0"
             "HOME=/root\0"
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
@@ -1832,12 +1672,12 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
         int pid = current->pid;
         __block BOOL completed = NO;
         __block id observer = nil;
-        __block NSTimer *timeout = nil;
+        __block NSTimer *timer = nil;
         void (^finish)(int) = ^(int code) {
             if (completed) return;
             completed = YES;
             if (observer) { [NSNotificationCenter.defaultCenter removeObserver:observer]; observer = nil; }
-            if (timeout) { [timeout invalidate]; timeout = nil; }
+            if (timer) { [timer invalidate]; timer = nil; }
             if (completion) completion(code);
         };
         if (completion) {
@@ -1848,15 +1688,17 @@ static void LRWaitForProcess(TerminalViewController *process, NSTimeInterval tim
                     finish(exitStatus);
                 }
             }];
-            timeout = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:NO block:^(NSTimer * _Nonnull t) {
-                (void)t;
-                finish(-ETIMEDOUT);
-            }];
+            if (timeout > 0) {
+                timer = [NSTimer scheduledTimerWithTimeInterval:timeout repeats:NO block:^(NSTimer * _Nonnull t) {
+                    (void)t;
+                    finish(-ETIMEDOUT);
+                }];
+            }
         }
         err = task_start(current);
         if (err < 0) {
             if (observer) { [NSNotificationCenter.defaultCenter removeObserver:observer]; observer = nil; }
-            if (timeout) { [timeout invalidate]; timeout = nil; }
+            if (timer) { [timer invalidate]; timer = nil; }
             failLaunch(err);
             return;
         }
@@ -2018,14 +1860,19 @@ static NSString *LRInstallKind = @"";
     for (NSString *name in @[@"install-result", @"apt-status"]) [NSFileManager.defaultManager removeItemAtURL:[support URLByAppendingPathComponent:name] error:nil];
     NSURL *logURL = [support URLByAppendingPathComponent:@"debian-support.sh.log"], *resultURL = [support URLByAppendingPathComponent:@"install-result"], *statusURL = [support URLByAppendingPathComponent:@"apt-status"];
     [NSFileManager.defaultManager removeItemAtURL:logURL error:nil];
-    TerminalViewController *installer = [self terminalForCommand:[@[@"/bin/sh", @"/home/mobile/Downloads/.linuxrunner/support/installer-run.sh", @"debian-support.sh"] arrayByAddingObjectsFromArray:arguments] directory:@"/root"];
-    if (!installer) { completion(lrError(EIO, @"The installer could not be started. Restart LinuxRunner and try again.")); return; }
+    if (!self.isRunning) { completion(lrError(EIO, @"The installer could not be started because Debian Minimal is not running.")); return; }
     LRActiveInstall = title;
     [self beginAwake:@"installation"];
     [self logCategory:@"SETUP" event:[NSString stringWithFormat:@"support install started: %@ (%@)", title, [arguments componentsJoinedByString:@" "]]];
-    NSDate *start = NSDate.date; __block NSDate *endedAt = nil; __block NSString *reported = nil; __block NSDate *lastChange = NSDate.date; __block NSUInteger lastSignature = 0;
+    NSDate *start = NSDate.date; __block BOOL processEnded = NO; __block NSDate *endedAt = nil; __block NSString *reported = nil; __block NSDate *lastChange = NSDate.date; __block NSUInteger lastSignature = 0;
     LRInstallSteps = @[]; LRInstallKind = @"";
     [self postInstall:title phase:@"running" stage:@"Checking existing installation" detail:@"" fraction:-1 elapsed:0 error:nil log:nil];
+    NSArray<NSString *> *command = [@[@"/bin/sh", @"/home/mobile/Downloads/.linuxrunner/support/installer-run.sh", @"debian-support.sh"] arrayByAddingObjectsFromArray:arguments];
+    [self runHeadlessCommand:command directory:@"/root" stdinData:nil timeout:0 completion:^(int exitCode) {
+        (void)exitCode;
+        processEnded = YES;
+        if (!endedAt) endedAt = NSDate.date;
+    }];
     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
         NSString *log = [NSString stringWithContentsOfURL:logURL encoding:NSUTF8StringEncoding error:nil] ?: @"";
         NSString *stage = nil, *detail = @"", *category = nil, *failureDetail = nil, *kind = @""; long done = -1, total = -1;
@@ -2058,14 +1905,14 @@ static NSString *LRInstallKind = @"";
             }
         }
         NSString *result = [[NSString stringWithContentsOfURL:resultURL encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (installer.sessionPid <= 0 && !endedAt) endedAt = NSDate.date;
+        if (processEnded && !endedAt) endedAt = NSDate.date;
         NSTimeInterval elapsed = -[start timeIntervalSinceNow];
         NSUInteger signature = log.length ^ ([[NSString stringWithContentsOfURL:statusURL encoding:NSUTF8StringEncoding error:nil] ?: @"" hash] << 1);
         if (signature != lastSignature) { lastSignature = signature; lastChange = NSDate.date; }
         BOOL stalled = -[lastChange timeIntervalSinceNow] > 45 * 60;
         BOOL finished = result.length || (endedAt && -[endedAt timeIntervalSinceNow] > 5) || stalled;
         if (finished) {
-            [timer invalidate]; (void)installer;
+            [timer invalidate];
             LRActiveInstall = nil;
             [self endAwake:@"installation"];
             [self logCategory:@"SETUP" event:[NSString stringWithFormat:@"support install finished: %@ result=%@ stage=%@ category=%@ seconds=%.0f", title, result ?: @"none", stage ?: @"none", category ?: @"none", elapsed]];
@@ -2114,29 +1961,24 @@ static NSCountedSet<NSString *> *LRAwakeSet;
         }
     });
 }
-+ (TerminalViewController *)changeLinuxPassword:(NSString *)name error:(NSError **)error {
-    if (!LRLoginAccount(name)) { if(error)*error=lrError(ENOENT,@"Refresh the account list first."); return nil; }
-    NSString *passwd=LRAccountTool(@[@"/usr/bin/passwd", @"/bin/passwd"]);
-    if (!passwd) { if(error)*error=lrError(ENOENT,@"The guest passwd program is not installed."); return nil; }
-    return [self terminalForCommand:@[passwd,name] directory:@"/"];
-}
-+ (TerminalViewController *)removeLinuxUserKeepingHome:(NSString *)name error:(NSError **)error {
++ (void)removeLinuxUserKeepingHome:(NSString *)name completion:(void (^)(NSError * _Nullable))completion {
     NSDictionary *account = LRLoginAccount(name);
-    if (!account) { if(error)*error=lrError(ENOENT,@"Refresh the account list first."); return nil; }
+    if (!account) { completion(lrError(ENOENT, @"Refresh the account list first.")); return; }
     if ([account[@"uid"] longLongValue] < 1000 || [name isEqual:self.defaultLinuxUser]) {
-        if(error)*error=lrError(EPERM,@"System accounts and the default login cannot be removed. Select a different default login first.");
-        return nil;
+        completion(lrError(EPERM, @"System accounts and the default login cannot be removed. Select a different default login first."));
+        return;
     }
     NSString *remove = LRAccountTool(@[@"/usr/sbin/userdel", @"/usr/bin/userdel"]);
-    if (!remove) { if(error)*error=lrError(ENOENT,@"Debian's account-removal tool (userdel) is missing. Install passwd first."); return nil; }
-    return [self terminalForCommand:@[@"/bin/sh", @"-c", @"\"$2\" -- \"$1\" && rm -f \"/etc/sudoers.d/90-debianrunner-$1\"", @"linuxrunner-remove-user", name, remove] directory:@"/"];
-}
-+ (TerminalViewController *)terminalForCommand:(NSArray<NSString *> *)command directory:(NSString *)directory {
-    TerminalViewController *vc = [[UIStoryboard storyboardWithName:@"Terminal" bundle:nil] instantiateInitialViewController];
-    vc.runnerCommand = command; vc.runnerDirectory = directory; vc.runnerReportsExit = YES;
-    [vc loadViewIfNeeded];
-    [vc startNewSession];
-    return vc;
+    if (!remove) { completion(lrError(ENOENT, @"Debian's account-removal tool (userdel) is missing. Install passwd first.")); return; }
+    [self runHeadlessCommand:@[@"/bin/sh", @"-c", @"\"$2\" -- \"$1\" && rm -f \"/etc/sudoers.d/90-debianrunner-$1\"", @"linuxrunner-remove-user", name, remove]
+                   directory:@"/"
+                     timeout:60.0
+                  completion:^(int exitCode) {
+        BOOL stillExists = LRLoginAccount(name) != nil;
+        [self logCategory:@"ACCOUNT" event:[NSString stringWithFormat:@"native remove user=%@ exit=%d still_exists=%d", name, exitCode, stillExists]];
+        if (!stillExists) completion(nil);
+        else completion(lrError(EIO, @"The account could not be removed. Close any active SSH sessions for this user and try again."));
+    }];
 }
 + (NSURL *)prepareApplicationSupport:(NSError **)error { return LRPrepareSupport(error); }
 + (void)logCategory:(NSString *)category event:(NSString *)event {
@@ -2151,11 +1993,9 @@ static NSCountedSet<NSString *> *LRAwakeSet;
 + (NSURL *)exportLogs:(NSError **)error {
     NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"LinuxRunner-diagnostics-%@.txt", NSUUID.UUID.UUIDString]]];
-    NSDictionary *jit = self.jitStatusReport;
-    NSString *header = [NSString stringWithFormat:@"LinuxRunner %@ (%@)\nDebian 13 (trixie) minimal ARM64 compatibility runtime\nJIT: %@ · %@ (mode %@, debugger %@, blocks %@)\n%@\n",
+    NSString *header = [NSString stringWithFormat:@"LinuxRunner %@ (%@)\nDebian 13 (trixie) minimal ARM64 compatibility runtime\nExecution: ARM64 Interpreter\n%@\n",
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"],
-        jit[@"state"], jit[@"detail"], jit[@"mode"], [jit[@"debugger"] boolValue] ? @"attached" : @"none", jit[@"blocks"] ?: @0,
         self.runtimeStatus];
     LRBootLogSync();
     if (bootSnapshot) msync(bootSnapshot, sizeof(*bootSnapshot), MS_SYNC);
@@ -2385,9 +2225,7 @@ static int LRSharedDirectory(NSString *root,NSString *relative){
 }
 - (void)openManager {
     if (!LRRuntimeBridge.isRunning) return;
-    TerminalViewController *terminal = [[UIStoryboard storyboardWithName:@"Terminal" bundle:nil] instantiateInitialViewController];
-    [terminal loadViewIfNeeded]; [terminal startNewSession];
-    self.view.window.rootViewController = [LinuxRunnerShell makeControllerWithTerminal:terminal];
+    self.view.window.rootViewController = [LinuxRunnerShell makeController];
     LRBootEvent("UI attached: environment manager after manual runtime start");
 }
 - (void)exportLogs {

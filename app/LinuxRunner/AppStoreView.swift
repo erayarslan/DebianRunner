@@ -47,12 +47,12 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
     @Published var stage = ""
     @Published var state: StoreOperationState = .idle
     @Published var loadedRoot = ""
-    private var runner: TerminalViewController?
+    private var runningOperation = false
     private var timer: Timer?
     private var queue: [(String, String, (Bool) -> Void)] = []
 
     var root: String { LRRuntimeBridge.activeRootName() }
-    var busy: Bool { if case .running = state { return true }; return runner != nil }
+    var busy: Bool { if case .running = state { return true }; return runningOperation }
     let packageManager = "APT"
     private var support: URL { LRRuntimeBridge.exchangeURL(root).appendingPathComponent(".linuxrunner/support") }
     private func read(_ name: String, _ bytes: UInt) -> String {
@@ -113,23 +113,28 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
 
     private func enqueue(_ operation: String, _ value: String, _ done: @escaping (Bool) -> Void) {
         queue.append((operation, value, done))
-        if runner == nil { next() }
+        if !runningOperation { next() }
     }
     private func next() {
-        guard runner == nil, !queue.isEmpty else { return }
+        guard !runningOperation, !queue.isEmpty else { return }
         let (operation, value, done) = queue.removeFirst()
         do {
             _ = try LRRuntimeBridge.prepareApplicationSupport()
             let command = try PackageOperation.command(operation, value: value)
             let resultURL = support.appendingPathComponent("package-result")
             try? FileManager.default.removeItem(at: resultURL)
-            guard let session = LRRuntimeBridge.terminal(forCommand: command, directory: "/root") as TerminalViewController? else { throw EnvironmentError.invalidCommand }
-            runner = session
+            guard LRRuntimeBridge.isRunning() else { throw EnvironmentError.invalidCommand }
+            runningOperation = true
             let label = Self.label(operation, value)
             state = .running(label); stage = label; log = ""
             LRRuntimeBridge.logCategory("PACKAGE", event: "packages operation=\(operation) root=\(root)")
             let started = Date()
             var exitedAt: Date? = nil
+            LRRuntimeBridge.runHeadlessCommand(command, directory: "/root", timeout: 1800) { _ in
+                Task { @MainActor in
+                    if exitedAt == nil { exitedAt = Date() }
+                }
+            }
             timer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] t in
                 Task { @MainActor in
                     guard let self else { t.invalidate(); return }
@@ -138,18 +143,12 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
                     if !tail.isEmpty { self.log = tail }
                     if let line = tail.components(separatedBy: .newlines).last(where: { $0.hasPrefix("PACKAGE_STAGE: ") }) { self.stage = String(line.dropFirst(15)) }
                     let incomplete = code.isEmpty || code == "running"
-                    if session.sessionPid <= 0 {
-                        if exitedAt == nil { exitedAt = Date() }
-                    } else {
-                        exitedAt = nil
-                    }
                     let processDied = incomplete && exitedAt.map { Date().timeIntervalSince($0) > 2.0 } == true
                     // No result within 30 minutes (or process exited without writing final status): report, never guess.
                     let stalled = (Date().timeIntervalSince(started) > 1800 && incomplete) || processDied
                     guard !incomplete || stalled else { return }
                     t.invalidate(); self.timer = nil
-                    self.runner?.terminal?.destroy()
-                    self.runner = nil
+                    self.runningOperation = false
                     self.log = self.read("package-operation.log", 16384)
                     let ok = code == "0"
                     let failMsg: String
@@ -166,6 +165,7 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
                 }
             }
         } catch {
+            runningOperation = false
             state = .failed(error.localizedDescription); done(false); next()
         }
     }
@@ -174,7 +174,7 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
     static func protectedRemoval(plan: [PlanChange], text: String) -> String? {
         let core: Set<String> = ["bash", "dash", "coreutils", "libc6", "libc-bin", "apt", "dpkg", "base-files", "base-passwd", "debianutils", "diffutils", "login", "passwd", "util-linux", "sudo", "openssl", "ca-certificates", "tar", "gzip", "sed", "grep", "findutils", "perl-base", "mawk", "ncurses-base", "ncurses-bin", "sysvinit-utils"]
         let hits = plan.filter { $0.action == "remove" && core.contains($0.package) }.map(\.package)
-        if !hits.isEmpty { return "This would remove core Debian packages (\(hits.prefix(4).joined(separator: ", "))). DebianRunner will not do that from Packages; use the terminal if you really mean it." }
+        if !hits.isEmpty { return "This would remove core Debian packages (\(hits.prefix(4).joined(separator: ", "))). DebianRunner will not do that from Packages; use SSH in Termius if you really mean it." }
         let lower = text.lowercased()
         if lower.contains("essential packages will be removed") || lower.contains("protected packages") || lower.contains("is protected") {
             return "APT marks this change as removing essential or protected system packages. It was not applied."
@@ -209,7 +209,6 @@ enum StoreOperationState: Equatable { case idle, running(String), failed(String)
 
 struct AppStoreView: View {
     @ObservedObject var manager: EnvironmentManager
-    var run: (LinuxApplication) -> Void
     @ObservedObject private var model = AppStoreModel.shared
     @State private var section = 0
     @State private var query = ""
@@ -230,7 +229,7 @@ struct AppStoreView: View {
                     else { updatesSection }
                     if let environment {
                         Section("Maintenance") {
-                            NavigationLink(destination: PackageView(environment: environment, manager: manager, run: run)) {
+                            NavigationLink(destination: PackageView(environment: environment, manager: manager)) {
                                 Label("Repair Center & Advanced", systemImage: "wrench.and.screwdriver")
                             }
                         }
@@ -240,7 +239,7 @@ struct AppStoreView: View {
         }
         .background {
             if let environment {
-                NavigationLink(destination: PackageView(environment: environment, manager: manager, run: run), isActive: $showAdvanced) {
+                NavigationLink(destination: PackageView(environment: environment, manager: manager), isActive: $showAdvanced) {
                     EmptyView()
                 }
                 .hidden()

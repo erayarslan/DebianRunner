@@ -1,6 +1,6 @@
 # Install DebianRunner
 
-Installing the IPA installs DebianRunner. On first launch, DebianRunner downloads and verifies **Debian GNU/Linux 13 (trixie) minimal ARM64** packages inside the app. No jailbreak or JIT activation is required.
+Installing the IPA installs DebianRunner. On first launch, DebianRunner downloads and verifies **Debian GNU/Linux 13 (trixie) minimal ARM64** packages inside the app. No jailbreak is required.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ Installing the IPA installs DebianRunner. On first launch, DebianRunner download
 2. Sign and install it with AltStore, SideStore, Sideloadly, TrollStore, or Xcode.
 3. Open DebianRunner and complete the **Install Debian Minimal** setup wizard. See [Getting Started](GETTING_STARTED.md).
 
-The default bundle identifier is `dev.debianrunner.app`. App Group access (`group.<bundle-id>`) enables mounting the full Debian root filesystem in Apple's native **Files** app via the embedded `iSHFileProvider.appex` extension; if signed without an App Group, DebianRunner falls back to private application storage cleanly. Ordinary interpreter execution does not require debugger/JIT permissions; see [JIT](engine/IOS_JIT.md) for optional JIT details.
+The default bundle identifier is `dev.debianrunner.app`. App Group access (`group.<bundle-id>`) enables mounting the full Debian root filesystem in Apple's native **Files** app via the embedded `iSHFileProvider.appex` extension; if signed without an App Group, DebianRunner falls back to private application storage cleanly. Interpreter execution requires no debugger or special entitlements.
 
 ## Update Without Losing Debian Minimal
 

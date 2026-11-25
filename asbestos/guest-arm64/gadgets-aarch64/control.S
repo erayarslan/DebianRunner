@@ -111,11 +111,7 @@
     str x8, [_cpu, #(CPU_x0 + 30*8)]
 #ifndef DISABLE_RET_CACHE
     // Store _pc in ret_cache keyed by return address
-#ifdef ISH_JIT
-    ubfx w12, w8, #4, #12
-#else
     ubfx w12, w8, #2, #12
-#endif
     add x13, _cpu, #LOCAL_ret_cache
     str _pc, [x13, x12, lsl #3]
 #endif
@@ -149,32 +145,6 @@
  * Branch to register with link (BLR)
  * Code stream: [gadget addr][rn (64-bit)][return addr (64-bit)]
  */
-#ifdef ISH_JIT
-/*
- * Code stream: [gadget addr][block_self_ptr][return_addr][return_cont][rn]
- * The first words match BL, so the ret_cache entry has the format RET expects.
- */
-.gadget branch_link_reg
-    ldr x8, [_pc, #24]      // rn
-    ldr x11, [_pc, #8]      // return address
-
-    and x8, x8, #0x1f
-    add x9, _cpu, #CPU_x0
-    ldr x10, [x9, x8, lsl #3]   // read the target before x30 is overwritten (blr x30)
-
-    // Save return address to X30
-    str x11, [_cpu, #(CPU_x0 + 30*8)]
-#ifndef DISABLE_RET_CACHE
-    ubfx w12, w11, #4, #12
-    add x13, _cpu, #LOCAL_ret_cache
-    str _pc, [x13, x12, lsl #3]
-#endif
-
-    // Mask to 48-bit (see branch_reg for rationale)
-    and x10, x10, #0xffffffffffff
-    str x10, [_cpu, #CPU_pc]
-    b fiber_ret
-#else
 .gadget branch_link_reg
     ldr x8, [_pc]           // rn
     add _pc, _pc, #8
@@ -196,13 +166,12 @@
  * Return (RET)
  * Code stream: [gadget addr][rn (64-bit, usually 30)]
  *
- * Uses return address cache to stay in JIT when possible.
+ * Uses return address cache to stay in gadget execution when possible.
  * BL stores _pc in ret_cache, where:
  *   _pc[0] = block_self_ptr  (BL's block, for last_block when unchained)
  *   _pc[1] = return_addr     (for validation)
  *   _pc[2] = return_cont     (return-site block->code or fake_ip)
  */
-#endif
 .gadget ret
     ldr x8, [_pc]           // rn
     and x8, x8, #0x1f
@@ -212,11 +181,7 @@
     str x10, [_cpu, #CPU_pc]
 #ifndef DISABLE_RET_CACHE
     // Look up return address in ret_cache
-#ifdef ISH_JIT
-    ubfx w12, w10, #4, #12
-#else
     ubfx w12, w10, #2, #12
-#endif
     add x13, _cpu, #LOCAL_ret_cache
     ldr x14, [x13, x12, lsl #3]  // x14 = saved _pc from BL
     // Cache miss?
@@ -244,7 +209,6 @@ ret_no_cache:
 #endif
     b fiber_ret
 
-#ifndef ISH_JIT
 /*
  * Indirect branch through the per-thread block cache (ISH_INDIRECT_BRANCH_CACHE).
  * In: x10 = guest target, already stored in CPU_pc.
@@ -314,16 +278,10 @@ indirect_cache_dispatch:
     ldr w9, [x12]
     cmp w8, w9
     b.ne 8f
-#ifdef ISH_JIT
-    // x9 = block_cache[(ip ^ (ip >> 12)) & 4095] (must match asbestos.c & jit.c)
-    eor x11, x10, x10, lsr #12
-    and x11, x11, #0xfff
-#else
     // x9 = block_cache[((ip >> 2) ^ (ip >> 14)) & 4095]
     // Equivalent to ((ip ^ (ip >> 12)) >> 2) & 0xfff in 2 instructions.
     eor x11, x10, x10, lsr #12
     ubfx x11, x11, #2, #12
-#endif
     add x12, _tlb, #((TLB_block_cache-TLB_entries) & 0xfff)
     add x12, x12, #((TLB_block_cache-TLB_entries) >> 12), lsl #12
     ldr x9, [x12, x11, lsl #3]
@@ -354,11 +312,7 @@ indirect_cache_dispatch:
     ldr x10, [x9, x8, lsl #3]   // x10 = return address (guest PC)
     str x10, [_cpu, #CPU_pc]
 #ifndef DISABLE_RET_CACHE
-#ifdef ISH_JIT
-    ubfx w12, w10, #4, #12
-#else
     ubfx w12, w10, #2, #12
-#endif
     add x13, _cpu, #LOCAL_ret_cache
     ldr x14, [x13, x12, lsl #3]
     cbz x14, 1f
@@ -405,18 +359,13 @@ indirect_cache_dispatch:
     ldr x10, [x9, x8, lsl #3]   // read the target before x30 is overwritten (blr x30)
     str x11, [_cpu, #(CPU_x0 + 30*8)]
 #ifndef DISABLE_RET_CACHE
-#ifdef ISH_JIT
-    ubfx w12, w11, #4, #12
-#else
     ubfx w12, w11, #2, #12
-#endif
     add x13, _cpu, #LOCAL_ret_cache
     str _pc, [x13, x12, lsl #3]
 #endif
     and x10, x10, #0xffffffffffff
     str x10, [_cpu, #CPU_pc]
     b indirect_cache_dispatch
-#endif
 
 /*
  * Compare and branch if zero (CBZ)

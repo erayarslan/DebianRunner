@@ -19,8 +19,8 @@ body:
   - type: input
     id: environment
     attributes:
-      label: Package and execution mode
-      placeholder: Affected Debian package/version, interpreter or JIT mode
+      label: Package and environment
+      placeholder: Affected Debian package/version or command
     validations:
       required: true
   - type: textarea

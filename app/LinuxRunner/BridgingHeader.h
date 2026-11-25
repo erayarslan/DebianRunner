@@ -4,4 +4,3 @@
 #import "../UserPreferences.h"
 #import "../BLESerial.h"
 #import "../MIDISerial.h"
-#import "../TerminalView.h"

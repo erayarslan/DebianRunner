@@ -13,7 +13,7 @@ const fixtures = resolve(import.meta.dir, '../tests/arm64/benchmarks');
 const stage = mkdtempSync(join(tmpdir(), 'linuxkit-pi-auth-'));
 chmodSync(stage, 0o700);
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
-    !/API_KEY|TOKEN|CREDENTIAL|^ISH_JIT|^ISH_AOT|^ISH_BIND_MOUNTS/.test(key)));
+    !/API_KEY|TOKEN|CREDENTIAL|^ISH_BIND_MOUNTS/.test(key)));
 try {
     if (mode === 'copilot') {
         const path = process.env.PI_AUTH_FILE || join(homedir(), '.pi/agent/auth.json');

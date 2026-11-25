@@ -16,7 +16,6 @@ ln -sf /value "$TMP/root/jail/inside/absolute"
 tar -C "$TMP/root" -czf "$TMP/root.tar.gz" .
 "$BUILD_DIR/tools/fakefsify" "$TMP/root.tar.gz" "$TMP/fake"
 DEFS=(-DGUEST_ARM64=1 -DENGINE_ASBESTOS=1)
-if grep -q -- '-DISH_JIT=1' "$BUILD_DIR/compile_commands.json"; then DEFS+=(-DISH_JIT=1); fi
 "${CC:-clang}" -O2 -Wall -Wextra -Werror "${DEFS[@]}" -I"$PROJECT" -I"$BUILD_DIR" -pthread \
     "$HERE/native-fs.c" -Wl,--wrap=malloc -Wl,--start-group "$BUILD_DIR/libish.a" \
     "$BUILD_DIR/libish_emu.a" "$BUILD_DIR/libfakefs.a" -Wl,--end-group -lrt -lm -ldl -lsqlite3 -o "$TMP/native-fs"

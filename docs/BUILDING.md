@@ -8,13 +8,12 @@ You do not need a Mac to build an installable unsigned `.ipa`:
 
 1. Open **Actions → Build DebianRunner IPA** in [erayarslan/DebianRunner](https://github.com/erayarslan/DebianRunner/actions).
 2. Trigger **Run workflow** manually (or push commits to `main`, or push a `v*` tag to publish a GitHub Release automatically).
-   - `jit` (`false` by default): set to `true` to build the optional-JIT variant (`LINUXRUNNER_JIT=YES`).
    - `diagnostic` (`false` by default): set to `true` for `--diagnostic` builds.
    - `bundle_id` (`dev.debianrunner.app` by default): override the bundle identifier if desired.
 3. Download the uploaded `DebianRunner-<run>` artifact containing `DebianRunner.ipa`, `DebianRunner.ipa.sha256`, and validation reports.
 4. Sideload `DebianRunner.ipa` with AltStore, SideStore, Sideloadly, or TrollStore.
 
-The workflow ([`.github/workflows/build-ipa.yml`](../.github/workflows/build-ipa.yml)) runs on GitHub's `macos-15` Apple Silicon runner, initializes `deps/libapps` and `deps/libarchive`, installs `meson`, `ninja`, and `lld`, builds the unsigned IPA with `scripts/build-ipa.sh --unsigned`, and verifies it with `scripts/verify-ipa.py`.
+The workflow ([`.github/workflows/build-ipa.yml`](../.github/workflows/build-ipa.yml)) runs on GitHub's `macos-15` Apple Silicon runner, initializes `deps/libarchive`, installs `meson`, `ninja`, and `lld`, builds the unsigned IPA with `scripts/build-ipa.sh --unsigned`, and verifies it with `scripts/verify-ipa.py`.
 
 ## Local macOS Build Requirements
 
@@ -23,28 +22,17 @@ Use macOS with full Xcode and an iPhoneOS SDK, Git, Python 3, Meson, Ninja, `ld.
 ```sh
 git clone https://github.com/erayarslan/DebianRunner.git
 cd DebianRunner
-git submodule update --init --recursive --checkout -- deps/libapps deps/libarchive
+git submodule update --init --recursive --checkout -- deps/libarchive
 scripts/bootstrap-macos.sh
 ```
 
 The inherited `deps/linux` gitlink is optional and not used to boot a kernel in the app. No CMake, shader compilers, or external GPU dependencies are needed.
 
-## Interpreter Variant (Default)
-
-The source default sets `LINUXRUNNER_JIT=NO`:
+## Build Unsigned IPA Locally
 
 ```sh
 scripts/build-ipa.sh --unsigned
 python3 scripts/verify-ipa.py build/releases
-```
-
-## Optional-JIT Variant
-
-To include the optional ARM64 JIT translator (off at runtime unless enabled in Settings and permitted by iOS):
-
-```sh
-LINUXRUNNER_JIT=YES scripts/build-ipa.sh --unsigned
-LINUXRUNNER_JIT=YES python3 scripts/verify-ipa.py build/releases
 ```
 
 ## Packaging and Signing
@@ -58,7 +46,7 @@ Unsigned mode applies an ad-hoc signature without Apple provisioning. For your o
 ## Host Runtime Build and Support Manifest Check
 
 ```sh
-meson setup build/host -Dengine=asbestos -Dguest_arch=arm64 -Djit=false -Djit_emit=false -Dcli_aot=
+meson setup build/host -Dengine=asbestos -Dguest_arch=arm64
 ninja -C build/host ish
 python3 scripts/generate-support-manifest.py --check
 ```

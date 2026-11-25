@@ -1,6 +1,6 @@
 # DebianRunner User Guide
 
-Start with [Installing DebianRunner](INSTALLATION.md), then [Getting Started with Debian Minimal](GETTING_STARTED.md). JIT is optional; no desktop environment is required or included.
+Start with [Installing DebianRunner](INSTALLATION.md), then [Getting Started with Debian Minimal](GETTING_STARTED.md). No desktop environment is required or included.
 
 - [Import/export and shared files](FILE_SHARING.md)
 - [Networking and headless modes](NETWORKING_AND_DISPLAYS.md)

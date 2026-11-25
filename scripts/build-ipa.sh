@@ -31,8 +31,6 @@ args=(-project iSH.xcodeproj -scheme LinuxRunner -configuration Release
       IPHONEOS_DEPLOYMENT_TARGET=15.0 "LINUXRUNNER_DIAGNOSTIC=$diagnostic"
       "ROOT_BUNDLE_IDENTIFIER=${BUNDLE_ID:-dev.debianrunner.app}")
 if [[ $diagnostic == YES ]]; then args+=(CODE_SIGN_ENTITLEMENTS=app/LinuxRunner/PrivateContainer.entitlements); fi
-# Optional variant (app/AppARM64.xcconfig): JIT-capable runtime (off until enabled in Settings).
-if [[ ${LINUXRUNNER_JIT:-NO} == YES ]]; then args+=(LINUXRUNNER_JIT=YES); fi
 if [[ $mode == unsigned ]]; then
     args+=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO)
 else

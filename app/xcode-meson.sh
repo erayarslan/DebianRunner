@@ -1,28 +1,5 @@
 #!/bin/bash
 
-jit=false
-jit_emit=false
-# JIT-capable app variant (LINUXRUNNER_JIT=YES): the translator is compiled in
-# but only runs once iOS grants executable memory; the default build stays
-# interpreter-only because the JIT build's gadgets are slower when it is off.
-if [[ $# -eq 0 && ${LINUXRUNNER_JIT:-NO} == YES ]]; then
-    jit=true
-    jit_emit=true
-fi
-if [[ $# -ne 0 ]]; then
-    if [[ $# -ne 1 || $1 != --aot-bootstrap || ${TARGET_NAME:-} != iSH-ARM64-AOT-Bootstrap || ${ARCHS:-} != arm64 || ${MESON_BUILD_DIR:-} != */meson-aot-bootstrap ]]; then
-        echo 'AOT bootstrap requires its isolated ARM64 target and Meson directory' >&2
-        exit 2
-    fi
-    for define in GUEST_ARM64=1 ISH_JIT=1 ISH_JIT_NO_EMIT=1 ISH_AOT_BOOTSTRAP=1; do
-        case " ${GCC_PREPROCESSOR_DEFINITIONS:-} " in
-            *" $define "*) ;;
-            *) echo "AOT bootstrap is missing shared definition: $define" >&2; exit 2 ;;
-        esac
-    done
-    jit=true
-fi
-
 # Try to figure out the user's PATH to pick up their installed utilities.
 # Do not use sudo here: personal Apple developer machines are not always
 # configured with sudo for the GUI user, and the build only needs PATH hints.
@@ -83,8 +60,7 @@ EOF
     if [[ -n "$GUEST_ARCH" ]]; then
         guest_arch_opt="-Dguest_arch=$GUEST_ARCH"
     fi
-    (set -x; meson setup . "$SRCROOT" --cross-file "$crossfile" $guest_arch_opt \
-        -Djit=$jit -Djit_emit=$jit_emit -Dcli_aot=) || exit $?
+    (set -x; meson setup . "$SRCROOT" --cross-file "$crossfile" $guest_arch_opt) || exit $?
     config=$(meson introspect --buildoptions)
 fi
 
@@ -112,11 +88,7 @@ if [[ -n "$ISH_KERNEL" ]]; then
 fi
 kconfig=""
 guest_arch=${GUEST_ARCH:-arm64}
-# Reset backend, emission and CLI images together, including in reused builds.
-# Only the isolated bootstrap target may compile the native backend; it still
-# installs the native fault adapter; static images are linked separately only
-# when the checked Apple image build is explicitly requested.
-(set -x; meson configure -Djit=$jit -Djit_emit=$jit_emit -Dcli_aot= -Dvdso_required=true) || exit $?
+(set -x; meson configure -Dvdso_required=true) || exit $?
 # Configure optimization + debug together so Meson derives buildtype cleanly
 # (debug for -O0/-g, custom for -O3/-g) without passing -Dbuildtype=custom
 # directly (which hits KeyError in Meson 1.8.0 and warns when combined with

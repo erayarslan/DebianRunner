@@ -20,7 +20,7 @@ for (const [name, marker, count] of [
         const run = Bun.spawnSync([resolve(ish!), '-f', resolve(root!), '/usr/bin/env',
             'BUN_JSC_useJIT=0', 'BUN_JSC_numberOfGCMarkers=1', 'BUN_JSC_useConcurrentGC=0',
             '/usr/local/bin/bun', '/mnt/crypto-script', '/mnt/crypto-oracle'], {
-            env: { ...process.env, ISH_JIT: '0',
+            env: { ...process.env,
                 ISH_BIND_MOUNTS: `/mnt/crypto-script=${script}:ro,/mnt/crypto-oracle=${fixture}:ro` },
             timeout: 120000,
         });

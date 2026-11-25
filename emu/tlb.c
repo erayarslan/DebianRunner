@@ -43,12 +43,6 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
                 tlb->frame->fault_code = NULL;
                 tlb->frame->xzr_read = 0;
                 tlb->frame->xzr_sink = 0;
-#ifdef ISH_JIT
-                tlb->frame->native_fault_host_pc = 0;
-                tlb->frame->native_fault_guest_pc = 0;
-                tlb->frame->native_fault_addr = 0;
-                tlb->frame->native_fault_write = 0;
-#endif
             }
         }
     }
@@ -66,7 +60,7 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
 void tlb_flush(struct tlb *tlb) {
     uint64_t changes = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
 #ifdef GUEST_ARM64
-    // All ARM64 TLB lookup paths (tlb.h, gadgets.h, jit.c) verify
+    // All ARM64 TLB lookup paths (tlb.h, gadgets.h) verify
     // entry.gen == mmu->changes. When mmu->changes has advanced on the same
     // mmu without wrapping to 0, older entries already miss in O(1).
     // Forced flushes at the same generation (e.g. INT_JIT_CRASH) or wrap to 0

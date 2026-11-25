@@ -25,9 +25,6 @@
 #include <string.h>
 #include "asbestos/gen.h"
 #include "asbestos/frame.h"
-#ifdef ISH_JIT
-#include "asbestos/guest-arm64/jit.h"
-#endif
 #include "emu/arch/arm64/decode.h"
 #include "emu/interrupt.h"
 
@@ -1271,9 +1268,6 @@ void gen_start(addr_t addr, struct gen_state *state) {
     state->oom = block == NULL;
     if (block != NULL) {
         block->addr = addr;
-#ifdef ISH_JIT
-        jit_block_init(block);
-#endif
     }
 }
 
@@ -2950,18 +2944,15 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
 
         switch (opc) {
             case 0:  // BR
-#ifndef ISH_JIT
                 if (arm64_indirect_branch_cache_enabled) {
                     gen(state, (unsigned long) gadget_branch_reg_cached);
                     gen(state, rn);
                     break;
                 }
-#endif
                 gen(state, (unsigned long) gadget_branch_reg);
                 gen(state, rn);
                 break;
             case 1:  // BLR
-#ifndef ISH_JIT
                 if (!arm64_indirect_branch_cache_enabled) {
                     gen(state, (unsigned long) gadget_branch_link_reg);
                     gen(state, rn);
@@ -2969,9 +2960,6 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
                     break;
                 }
                 gen(state, (unsigned long) gadget_branch_link_reg_cached);
-#else
-                gen(state, (unsigned long) gadget_branch_link_reg);
-#endif
                 // Same leading words as BL, so the ret_cache entry has the
                 // format RET expects: [self][return addr][return cont][rn].
                 gen(state, 0); // block self, patched by gen_end
@@ -2982,12 +2970,9 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
                 state->jump_ip[0] = state->size - 2;
                 break;
             case 2:  // RET
-#ifndef ISH_JIT
                 // A return the ret_cache misses tries the block cache, as BR.
                 if (arm64_indirect_branch_cache_enabled) gen(state, (unsigned long) gadget_ret_cached);
-                else
-#endif
-                gen(state, (unsigned long) gadget_ret);
+                else gen(state, (unsigned long) gadget_ret);
                 gen(state, rn);  // usually X30
                 break;
             default:

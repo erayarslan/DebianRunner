@@ -12,7 +12,6 @@
 #include <mach/mach.h>
 #endif
 #import <SystemConfiguration/SystemConfiguration.h>
-#import "AboutViewController.h"
 #ifdef LINUXRUNNER
 #import "LinuxRunner/RuntimeBridge.h"
 #import "LinuxRunner/BootLog.h"
@@ -31,7 +30,6 @@
 #import "MIDISerial.h"
 #import "NSObject+SaneKVO.h"
 #import "Roots.h"
-#import "TerminalViewController.h"
 #import "UserPreferences.h"
 #import "UIApplication+OpenURL.h"
 #include "kernel/init.h"
@@ -43,10 +41,6 @@
 #include "DebugServer.h"
 #endif
 #include "kernel/native_offload.h"
-#if defined(ISH_AOT_BOOTSTRAP) || defined(ISH_JIT)
-#include "asbestos/guest-arm64/jit.h"
-#include "platform/native_fault.h"
-#endif
 #ifdef ISH_FFMPEG_TEST
 extern void native_builtins_init(void);
 #endif
@@ -102,6 +96,37 @@ static void ios_handle_die(const char *msg) {
     NSString *message = [NSString stringWithFormat:@"%s: %s", __func__, msg];
     iSHExceptionHandler([[NSException alloc] initWithName:NSGenericException reason:message userInfo:nil]);
 }
+
+static int headless_console_init(struct tty *tty) {
+    (void)tty;
+    return 0;
+}
+static int headless_console_write(struct tty *tty, const void *buf, size_t len, bool blocking) {
+    (void)tty; (void)buf; (void)blocking;
+    return (int)len;
+}
+static void headless_console_cleanup(struct tty *tty) {
+    (void)tty;
+}
+static const struct tty_driver_ops headless_console_ops = {
+    .init = headless_console_init,
+    .write = headless_console_write,
+    .cleanup = headless_console_cleanup,
+};
+DEFINE_TTY_DRIVER(headless_console_driver, &headless_console_ops, TTY_CONSOLE_MAJOR, 64);
+
+static void convertCommandToArgs(NSArray<NSString *> *command, char *argv, size_t maxSize) {
+    char *p = argv;
+    for (NSString *cmd in command) {
+        const char *c = cmd.UTF8String;
+        while (p < argv + maxSize - 1 && (*p++ = *c++));
+        *p = '\0';
+    }
+    if (p < argv + maxSize - 1)
+        *++p = '\0';
+    else if (maxSize > 0)
+        argv[maxSize - 1] = '\0';
+}
 #elif ISH_LINUX
 void ReportPanic(const char *message) {
     [NSNotificationCenter.defaultCenter postNotificationName:KernelPanicNotification object:nil userInfo:@{@"message":@(message)}];
@@ -114,50 +139,6 @@ static int bootError;
 
 - (int)boot {
 #if !ISH_LINUX
-#if defined(ISH_JIT) && !defined(ISH_AOT_BOOTSTRAP)
-    if (ish_app_native_fault_install() != 0)
-        NSLog(@"WARNING: failed to install native JIT fault recovery handler");
-#endif
-#ifdef ISH_AOT_BOOTSTRAP
-#if !defined(ISH_JIT) || !defined(ISH_JIT_NO_EMIT)
-#error AOT bootstrap requires matching native/no-emitter definitions
-#endif
-    if (jit_aot_prepare_layout() != 0 || ish_app_native_fault_install() != 0)
-        return _EINVAL;
-    NSURL *identityURL = [NSBundle.mainBundle URLForResource:@"aot-build" withExtension:@"json"];
-    NSData *identityData = identityURL ? [NSData dataWithContentsOfURL:identityURL] : nil;
-    NSDictionary *identity = identityData ? [NSJSONSerialization JSONObjectWithData:identityData options:0 error:nil] : nil;
-    if (!identity || [identity[@"executionEnabled"] boolValue] != (ISH_AOT_IMAGE_EXECUTION != 0))
-        return _EINVAL;
-    NSLog(@"AOT_BUILD: version=%@ build=%@ revision=%@ images=%@ enabled=%d",
-          [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
-          [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"],
-          identity[@"sourceRevision"], identity[@"imageManifestSha256"], ISH_AOT_IMAGE_EXECUTION);
-    if (setenv("ISH_JIT", ISH_AOT_IMAGE_EXECUTION ? "1" : "0", 1) != 0 ||
-            setenv("ISH_AOT_FAMILY", "0", 1) != 0)
-        return _ENOMEM;
-#if ISH_AOT_IMAGE_EXECUTION
-    NSArray *modules = identity[@"modules"];
-    if ((modules.count != 3 && modules.count != 9 && modules.count != 10) || jit_aot_start((unsigned)modules.count) != 0)
-        return _EINVAL;
-    struct jit_layout expected;
-    jit_layout_read(&expected);
-    NSDictionary *contract = identity[@"contract"];
-    if ([contract[@"abi"] unsignedIntValue] != expected.abi ||
-            [contract[@"prologue_words"] unsignedIntValue] != expected.prologue_words ||
-            [contract[@"entry_off"] unsignedIntValue] != expected.entry_off ||
-            [contract[@"n_pinned"] unsignedIntValue] != expected.n_pinned)
-        return _EINVAL;
-#endif
-    char layout[2048];
-    jit_layout_describe(layout, sizeof(layout));
-    NSData *layoutData = [[NSString stringWithUTF8String:layout] dataUsingEncoding:NSUTF8StringEncoding];
-    NSURL *documents = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
-    NSError *layoutError = nil;
-    if (![layoutData writeToURL:[documents URLByAppendingPathComponent:@"aot-layout.json"] options:NSDataWritingAtomic error:&layoutError])
-        NSLog(@"AOT layout evidence write failed: %@", layoutError);
-    NSLog(@"AOT target layout: %s", layout);
-#endif
 #ifdef LINUXRUNNER
     LRBootEvent("environment metadata: loading Debian root catalog");
     if (Roots.instance.initializationError || !Roots.instance.defaultRoot) return _ENOENT;
@@ -275,7 +256,7 @@ static int bootError;
     if (worst > 103) [LRRuntimeBridge logCategory:@"SOCKET" event:[NSString stringWithFormat:@"AF_UNIX host path may exceed sun_path (%zu bytes); local sockets can fail with ENAMETOOLONG", worst]];
 #endif
     
-    tty_drivers[TTY_CONSOLE_MAJOR] = &ios_console_driver;
+    tty_drivers[TTY_CONSOLE_MAJOR] = &headless_console_driver;
     LRBLESerialInstall();
     LRMIDISerialInstall();
     set_console_device(TTY_CONSOLE_MAJOR, 1);
@@ -298,7 +279,7 @@ static int bootError;
     }
     NSLog(@"booting guest init with command: %@", [command componentsJoinedByString:@" "]);
     char argv[4096];
-    [Terminal convertCommand:command toArgs:argv limitSize:sizeof(argv)];
+    convertCommandToArgs(command, argv, sizeof(argv));
     const char *envp =
         "TERM=xterm-256color\0"
         "LANG=C.UTF-8\0"
@@ -511,8 +492,6 @@ static void configureGuestHostAlias(void) {
 #ifdef LINUXRUNNER
 - (int)startLinuxRuntime {
     if (![LRRuntimeBridge beginBoot]) return bootError;
-    // Before the first guest block: the JIT starts only if iOS already allows it.
-    [LRRuntimeBridge prepareExecutionBackendAtLaunch];
     CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
     bootError = [self boot];
     if (bootError == 0) [LRRuntimeBridge applySharedFolderOwnership];
@@ -556,15 +535,6 @@ void NetworkReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkReach
                          [NSBundle.mainBundle objectForInfoDictionaryKey:(NSString *) kCFBundleVersionKey]];
     extern const char *proc_ish_version;
     proc_ish_version = strdup(ishVersion.UTF8String);
-#ifdef ISH_AOT_BOOTSTRAP
-    NSDictionary *identity = [NSJSONSerialization JSONObjectWithData:
-        [NSData dataWithContentsOfURL:[NSBundle.mainBundle URLForResource:@"aot-build" withExtension:@"json"]]
-        options:0 error:nil];
-    NSString *aotVersion = [ishVersion stringByAppendingFormat:@" AOT=%d images=%@ revision=%@",
-        ISH_AOT_IMAGE_EXECUTION, identity[@"imageManifestSha256"], identity[@"sourceRevision"]];
-    free((void *)proc_ish_version);
-    proc_ish_version = strdup(aotVersion.UTF8String);
-#endif
     // this defaults key is set when taking app store screenshots
     extern const char *uname_hostname_override;
     NSString *hostnameOverride = UserPreferences.shared._hostnameOverride;
@@ -604,31 +574,7 @@ void NetworkReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkReach
     SCNetworkReachabilitySetCallback(self.reachability, NetworkReachabilityCallback, &context);
     SCNetworkReachabilityScheduleWithRunLoop(self.reachability, CFRunLoopGetMain(), kCFRunLoopCommonModes);
 
-    if (self.window != nil) {
-        // For iOS <13, where the app delegate owns the window instead of the scene
-        #ifdef LINUXRUNNER
-        if (NO) { // LinuxRunner has no inherited recovery settings screen
-#else
-        if ([NSUserDefaults.standardUserDefaults boolForKey:@"recovery"]) {
-#endif
-            UINavigationController *vc = [[UIStoryboard storyboardWithName:@"About" bundle:nil] instantiateInitialViewController];
-            AboutViewController *avc = (AboutViewController *) vc.topViewController;
-            avc.recoveryMode = YES;
-            self.window.rootViewController = vc;
-            return YES;
-        }
-        TerminalViewController *vc = (TerminalViewController *) self.window.rootViewController;
-        currentTerminalViewController = vc;
-        [vc startNewSession];
-    }
     return YES;
-}
-
-- (void)application:(UIApplication *)application didDiscardSceneSessions:(NSSet<UISceneSession *> *)sceneSessions API_AVAILABLE(ios(13.0)) {
-    for (UISceneSession *sceneSession in sceneSessions) {
-        NSString *terminalUUID = sceneSession.stateRestorationActivity.userInfo[@"TerminalUUID"];
-        [[Terminal terminalWithUUID:[[NSUUID alloc] initWithUUIDString:terminalUUID]] destroy];
-    }
 }
 
 - (void)dealloc {
@@ -648,7 +594,11 @@ void NetworkReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkReach
         message:@"Close the app from the app switcher, then reopen it to apply the change. Files are preserved."
         preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [currentTerminalViewController presentViewController:alert animated:YES completion:nil];
+    UIViewController *top = currentRootViewController;
+    while (top.presentedViewController != nil) {
+        top = top.presentedViewController;
+    }
+    [top presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)applicationDidEnterBackground:(UIApplication *)application {

@@ -4,7 +4,7 @@ Installing the IPA installs DebianRunner. On first launch, DebianRunner download
 
 ## 1. Install DebianRunner
 
-Install the built/signed IPA using AltStore, SideStore, Sideloadly, TrollStore, or Xcode. See [Installation](INSTALLATION.md). No jailbreak or JIT activation is required.
+Install the built/signed IPA using AltStore, SideStore, Sideloadly, TrollStore, or Xcode. See [Installation](INSTALLATION.md). No jailbreak is required.
 
 ## 2. First Launch & Debian Minimal Setup
 
@@ -19,13 +19,19 @@ When no Debian environment is installed yet, the setup wizard opens automaticall
    - Verified packages are assembled locally into a root filesystem archive and imported into an isolated `fakefs` root.
 3. On first launch, DebianRunner boots the newly installed Debian minimal runtime automatically (if another environment was already booted in the same app session, close and reopen DebianRunner when prompted).
 4. On **Your Account**, create a regular Linux user (with passwordless `sudo` administrator access enabled by default) or choose **Continue as root (Skip)**.
-5. Tap **Open Terminal** to launch a Debian bash shell.
+5. Tap **Open in Termius** (or open **Home → Termius & SSH**) to connect to your Debian shell at `127.0.0.1:2222`.
 
 First-boot package configuration (`dpkg --configure -a` and CA trust-store generation) runs automatically via `/usr/lib/linuxrunner/initialize-debian.sh`. Managed package and account operations wait for it to finish cleanly.
 
-## 3. Verify Your Environment
+## 3. Connect with Termius
 
-In the terminal, run:
+DebianRunner runs completely headlessly without an embedded WebView terminal. Instead, it installs `openssh-server` automatically, starts `sshd` on port `2222`, and hands off shell sessions to **Termius** on iPhone/iPad (with background keep-alive enabled automatically before switching apps):
+
+1. Install [Termius](https://apps.apple.com/app/id549039908) from the App Store and add a host pointing to `127.0.0.1`, port `2222`, with your Debian username and password (or SSH key).
+2. Tap **Open in Termius** from **Home**, **Debian**, or **Termius & SSH** to start `sshd`, enable background keep-alive, and switch directly to Termius.
+3. For 1-tap auto-connect straight into your saved Debian host, create an Apple Shortcut using Termius's **Connect to a host** action, select **Apple Shortcut** in **Termius & SSH → Redirect Mode**, and optionally turn on **Auto-Open Termius on Launch** (also available in **Settings → General**).
+
+Inside your Termius SSH session, verify your environment:
 
 ```sh
 cat /etc/os-release
@@ -37,22 +43,23 @@ The architecture reports `aarch64`.
 
 ## 4. Install CLI Packages with APT
 
-Use **Home → Packages** to browse curated CLI tools, search all Debian APT repositories, preview simulated APT transactions, and install, update, or remove packages.
+Use **Home → Packages** to browse curated CLI tools, search all Debian APT repositories, preview simulated APT transactions, and install, update, or remove packages headlessly with live log output.
 
-Or use `apt` directly in the terminal:
+Or use `apt` directly over SSH in Termius:
 
 ```sh
 apt-get update
 apt-get install --no-install-recommends git nano curl
 ```
 
-## 5. Connect via Built-in SSH Server
+## 5. LAN SSH & SFTP Access
 
-DebianRunner installs `openssh-server` automatically and starts `sshd` on port `2222` by default. Open **Home → SSH Server** (or **Debian → SSH Server**) to:
+Open **Home → Termius & SSH** (or **Debian → Termius & SSH**) to:
 
-- Copy the ready-to-run `ssh -p 2222 <user>@<iPhone-IP>` and `sftp -P 2222 <user>@<iPhone-IP>` commands.
+- Copy the ready-to-run local (`127.0.0.1:2222`) or Wi-Fi LAN `ssh -p 2222 <user>@<iPhone-IP>` and `sftp -P 2222 <user>@<iPhone-IP>` commands.
 - Start, stop, or restart `sshd`, toggle **Start SSH Automatically on Launch**, or enable **Allow Root Login**.
-- Turn on **Keep Linux Running in Background** so SSH connections stay alive while using other apps or locking your screen.
+- Configure **Redirect Mode** (`Termius App`, `SSH Link`, or `Apple Shortcut`) and **Auto-Open Termius on Launch**.
+- Manage **Keep Linux Running in Background** so SSH sessions stay alive while using Termius or locking your screen.
 
 ## 6. Manage or Wipe Debian Minimal
 
@@ -60,8 +67,7 @@ Open the **Debian** tab to inspect Debian Minimal status and storage usage, acce
 
 Finished or paused entries in the Home **Tasks** list can be removed individually or cleared all at once with **Clear**.
 
-## 7. CPU, Memory, and Optional JIT
+## 7. CPU and Memory
 
 - **Home → CPU & Memory** configures guest CPU cores and memory limits (applies on next launch).
 - **Home → Task Manager** shows live guest CPU, memory, and running processes.
-- **Settings → Advanced → Developer Mode → Execution Engine / StikDebug** inspects interpreter/JIT status. JIT is optional.

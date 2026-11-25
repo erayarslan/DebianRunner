@@ -50,7 +50,7 @@ struct LinuxEnvironment: Codable, Identifiable {
     var rootfsVersion = "13.7"
     var createdAt = Date()
     var lastBootedAt: Date?
-    var runtimeConfiguration = ["backend": "asbestos", "jit": "false"]
+    var runtimeConfiguration = ["backend": "asbestos"]
     var applications = [
         LinuxApplication(name: "Bash Shell", command: "/bin/bash", arguments: ["-l"]),
         LinuxApplication(name: "System information", command: "/bin/uname", arguments: ["-a"])

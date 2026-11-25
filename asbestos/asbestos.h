@@ -61,12 +61,6 @@ struct asbestos {
     // When 1, we can skip jetsam_lock (no other thread to synchronize with).
     unsigned active_threads;
 
-    // === RCU-like Optimization ===
-    // Atomic counter: number of threads currently executing JIT code.
-    // Jetsam cleanup waits until this reaches 0 before freeing blocks.
-    // This avoids read lock overhead on every JIT enter/exit.
-    _Atomic unsigned jit_active_threads;
-
     // Generation number for jetsam cleanup. Incremented when jetsam list
     // becomes non-empty. Threads check this to know when cleanup is needed.
     _Atomic unsigned jetsam_gen;
@@ -81,9 +75,6 @@ struct asbestos {
     uint32_t slice_tick;
     // Lock-free fast-path flag maintained under lock: true iff jetsam is non-empty.
     _Atomic bool jetsam_nonempty;
-#ifdef ISH_JIT
-    void *jit_ctxs;
-#endif
 };
 
 // this is roughly the average number of instructions in a basic block according to anonymous sources
@@ -131,14 +122,6 @@ struct fiber_block {
     struct fiber_fault_pc *fault_pcs;
     uint32_t fault_pc_count;
 
-#ifdef ISH_JIT
-    uint32_t *native_link[2];
-    uint32_t native_link_orig[2];
-    uint32_t *native_loop;
-    uintptr_t native_entry;
-    void *jit_ctx;
-    unsigned jit_idx;
-#endif
     unsigned long code[];
 };
 

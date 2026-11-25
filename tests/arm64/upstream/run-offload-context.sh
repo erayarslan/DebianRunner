@@ -16,7 +16,6 @@ ln -sf /b/item "$TMP/root/b/link"
 tar -C "$TMP/root" -czf "$TMP/root.tar.gz" .
 "$BUILD_DIR/tools/fakefsify" "$TMP/root.tar.gz" "$TMP/fake"
 DEFS=(-D_GNU_SOURCE -DGUEST_ARM64=1 -DENGINE_ASBESTOS=1 -DISH_NATIVE_OFFLOAD_TEST_HANDLERS=1)
-if grep -q -- '-DISH_JIT=1' "$BUILD_DIR/compile_commands.json"; then DEFS+=(-DISH_JIT=1); fi
 WRAPS=()
 for name in malloc calloc strdup free chdir fchdir opendir pipe pthread_create do_exit; do WRAPS+=(-Wl,--wrap=$name); done
 "${CC:-clang}" -O2 -Wall -Wextra -Werror -Wno-unused-function "${DEFS[@]}" \

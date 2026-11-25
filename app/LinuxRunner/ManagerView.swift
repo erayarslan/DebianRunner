@@ -182,8 +182,8 @@ private enum EnvironmentStorage {
 }
 
 @MainActor @objc(LinuxRunnerShell) final class LinuxRunnerShell: NSObject {
-    @objc static func makeController(terminal: TerminalViewController) -> UIViewController {
-        UIHostingController(rootView: ManagerView(terminal: terminal))
+    @objc static func makeController() -> UIViewController {
+        UIHostingController(rootView: ManagerView())
     }
     @objc(makeTaskManagerController) static func makeTaskManagerController() -> UIViewController {
         let host = UIHostingController(rootView: TaskManagerView())
@@ -192,7 +192,7 @@ private enum EnvironmentStorage {
     }
 }
 
-// Password entry stays in the distribution's passwd PTY or chpasswd -e. Native
+// Password hashes are passed over an anonymous stdin pipe to chpasswd -e. Native
 // state contains account names only; /etc/shadow and password bytes never enter SwiftUI.
 private struct PasswordTarget: Identifiable { let name: String; var id: String { name } }
 
@@ -231,10 +231,10 @@ private struct LinuxUsersView: View {
     @State private var accounts: [[String: String]] = []
     @State private var selected = "root"
     @State private var username = ""
-    @State private var session: TerminalPresentation?
     @State private var error: String?
     @State private var confirmRemove = false
     @State private var removeName = ""
+    @State private var removing = false
     @State private var newPassword = ""
     @State private var newConfirmation = ""
     @State private var newAdministrator = true
@@ -255,10 +255,10 @@ private struct LinuxUsersView: View {
         List {
             Section("Active Debian Environment") {
                 Text(LRRuntimeBridge.activeRootName().isEmpty ? "Not running" : LRRuntimeBridge.activeRootName()).font(.caption).foregroundColor(.secondary)
-                Text("New ordinary terminals log in as the selected user using su. Existing terminals and administrative/package launches retain their identity.").font(.footnote)
+                Text("Select the default Linux user shown for Termius SSH connections and Shared folder ownership.").font(.footnote)
                 Text("Linux UID permissions apply inside DebianRunner. Accounts do not create separate iOS security identities.").font(.footnote).foregroundColor(.secondary)
             }
-            Section("Default Linux Session User") {
+            Section("Default Linux User") {
                 Picker("Login account", selection: $selected) {
                     ForEach(accounts, id: \.self) { account in
                         Text("\(account["name"] ?? "") · UID \(account["uid"] ?? "")").tag(account["name"] ?? "")
@@ -267,13 +267,12 @@ private struct LinuxUsersView: View {
                         Text(selected + " (not available)").tag(selected)
                     }
                 }
-                Button("Use for New Sessions") {
+                Button("Set as Default User") {
                     do { _ = try LRRuntimeBridge.setDefaultLinuxUser(selected) }
                     catch { self.error = error.localizedDescription }
                 }.disabled(!running || !accounts.contains(where: { $0["name"] == selected }))
-                Button("Open Login Terminal") {
-                    do { session = TerminalPresentation(controller: try LRRuntimeBridge.terminal(forLinuxUser: selected)) }
-                    catch { self.error = error.localizedDescription }
+                Button("Open in Termius as \(selected)") {
+                    TermiusLauncher.openQuick(username: selected) { msg in error = msg }
                 }.disabled(!running || !accounts.contains(where: { $0["name"] == selected }))
             }
             Section("Create Linux User") {
@@ -294,16 +293,17 @@ private struct LinuxUsersView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(account["name"] ?? "").font(.headline)
                         Text("UID \(account["uid"] ?? "") · GID \(account["gid"] ?? "") · \(account["home"] ?? "")").font(.caption)
-                        Button("Set Password…") { passwordFor = PasswordTarget(name: account["name"] ?? "") }.disabled(!running)
+                        Button("Set Password…") { passwordFor = PasswordTarget(name: account["name"] ?? "") }.disabled(!running || removing)
                         if (Int(account["uid"] ?? "") ?? 0) >= 1000 {
                             Button("Remove Account — Keep Home…", role: .destructive) {
                                 removeName = account["name"] ?? ""
                                 confirmRemove = true
-                            }.disabled(!running || account["name"] == LRRuntimeBridge.defaultLinuxUser())
+                            }.disabled(!running || removing || account["name"] == LRRuntimeBridge.defaultLinuxUser())
                         }
                     }
                 }
-                Button("Refresh Accounts", action: refresh).disabled(!running)
+                if removing { HStack(spacing: 10) { ProgressView(); Text("Removing account…") } }
+                Button("Refresh Accounts", action: refresh).disabled(!running || removing)
                 Text("System users without a login shell are omitted. Removing an account preserves its home and files; their numeric ownership remains. System accounts and the default login are protected.").font(.caption).foregroundColor(.secondary)
             }
             if let error { Section("Account Operation") { Text(error).foregroundColor(.red) } }
@@ -313,14 +313,16 @@ private struct LinuxUsersView: View {
         .sheet(item: $passwordFor) { target in SetPasswordSheet(name: target.name) }
         .confirmationDialog("Remove \(removeName) and keep its home?", isPresented: $confirmRemove, titleVisibility: .visible) {
             Button("Remove Account — Keep Home", role: .destructive) {
-                do { session = TerminalPresentation(controller: try LRRuntimeBridge.removeLinuxUserKeepingHome(removeName)) }
-                catch { self.error = error.localizedDescription }
+                error = nil
+                removing = true
+                LRRuntimeBridge.removeLinuxUserKeepingHome(removeName) { failure in
+                    removing = false
+                    if let failure { self.error = failure.localizedDescription }
+                    refresh()
+                }
             }
         } message: {
-            Text("Debian updates its account databases. Home directories and files remain, with their existing numeric ownership. Close this user's sessions first. No forced deletion is used.")
-        }
-        .sheet(item: $session, onDismiss: refresh) { item in
-            TerminalScreen(controller: item.controller)
+            Text("Debian updates its account databases. Home directories and files remain, with their existing numeric ownership. Close this user's SSH sessions first. No forced deletion is used.")
         }
     }
     private func refresh() {
@@ -329,9 +331,154 @@ private struct LinuxUsersView: View {
     }
 }
 
-private struct TerminalPresentation: Identifiable {
-    let id = UUID()
-    let controller: TerminalViewController
+// MARK: - Termius Redirect & Auto-Open
+
+@MainActor enum TermiusLauncher {
+    static let autoOpenOnLaunchKey = "DebianRunner.termiusAutoOpenOnLaunch"
+    static let launchModeKey = "DebianRunner.termiusLaunchMode"
+    static let shortcutNameKey = "DebianRunner.termiusShortcutName"
+    static let appStoreURL = URL(string: "https://apps.apple.com/app/id549039908")!
+    static var didAutoOpenThisLaunch = false
+
+    static var isTermiusInstalled: Bool {
+        URL(string: "termius://").map { UIApplication.shared.canOpenURL($0) } ?? false
+    }
+
+    static var autoOpenOnLaunch: Bool {
+        get { UserDefaults.standard.bool(forKey: autoOpenOnLaunchKey) }
+        set { UserDefaults.standard.set(newValue, forKey: autoOpenOnLaunchKey) }
+    }
+
+    static var launchMode: String {
+        get { UserDefaults.standard.string(forKey: launchModeKey) ?? "termius" }
+        set { UserDefaults.standard.set(newValue, forKey: launchModeKey) }
+    }
+
+    static var shortcutName: String {
+        get { UserDefaults.standard.string(forKey: shortcutNameKey) ?? "DebianRunner" }
+        set { UserDefaults.standard.set(newValue, forKey: shortcutNameKey) }
+    }
+
+    static func preferredUsername(allowRoot: Bool = LRRuntimeBridge.sshAllowRootLogin()) -> String {
+        let user = LRRuntimeBridge.defaultLinuxUser()
+        if !user.isEmpty && (user != "root" || allowRoot) { return user }
+        if let firstNonRoot = LRRuntimeBridge.linuxAccounts().first(where: { $0["name"] != "root" && ($0["uid"].flatMap(Int.init) ?? 0) >= 1000 })?["name"] {
+            return firstNonRoot
+        }
+        return "root"
+    }
+
+    static func sshURL(user: String, host: String = "127.0.0.1", port: String = "2222") -> URL? {
+        var components = URLComponents()
+        components.scheme = "ssh"
+        components.user = user.isEmpty ? nil : user
+        components.host = host
+        components.port = Int(port) ?? 2222
+        return components.url
+    }
+
+    static func shortcutURL(name: String) -> URL? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var components = URLComponents()
+        components.scheme = "shortcuts"
+        components.host = "run-shortcut"
+        components.queryItems = [URLQueryItem(name: "name", value: trimmed)]
+        return components.url
+    }
+
+    /// Ensure background keep-alive stays active so sshd on 127.0.0.1:2222 remains
+    /// reachable after switching from DebianRunner into Termius on the same device.
+    static func ensureBackgroundKeepAlive() {
+        if !BackgroundRunner.shared.enabled {
+            UserDefaults.standard.set(true, forKey: BackgroundRunner.defaultsKey)
+            BackgroundRunner.shared.apply(true)
+        }
+    }
+
+    static func open(ssh: SSHServiceController, username: String? = nil, onNotice: (@MainActor (String) -> Void)? = nil) {
+        guard LRRuntimeBridge.isRunning() else {
+            onNotice?("Start Debian Minimal first before opening Termius.")
+            return
+        }
+        ensureBackgroundKeepAlive()
+        if ssh.isRunning {
+            openApp(port: ssh.port, username: username)
+        } else if ssh.isInstalled {
+            ssh.start { started in
+                if started {
+                    openApp(port: ssh.port, username: username)
+                } else {
+                    onNotice?("OpenSSH server did not start. Open Termius & SSH to check the log.")
+                }
+            }
+        } else if !ssh.installing {
+            ssh.installAndStart()
+            onNotice?("Installing OpenSSH server… tap Open in Termius once installation completes.")
+        } else {
+            onNotice?("OpenSSH server is installing… please wait a moment.")
+        }
+    }
+
+    static func openQuick(username: String? = nil, onNotice: (@MainActor (String) -> Void)? = nil) {
+        guard LRRuntimeBridge.isRunning() else {
+            onNotice?("Start Debian Minimal first before opening Termius.")
+            return
+        }
+        ensureBackgroundKeepAlive()
+        let status = LRRuntimeBridge.sshStatus()
+        let port = status["ssh.port"] ?? "2222"
+        if status["ssh"] == "running" {
+            openApp(port: port, username: username)
+        } else if LRRuntimeBridge.sshBinaryInstalled() {
+            LRRuntimeBridge.runSSHAction("start") { updated in
+                Task { @MainActor in
+                    if updated["ssh"] == "running" {
+                        openApp(port: updated["ssh.port"] ?? port, username: username)
+                    } else {
+                        onNotice?("OpenSSH server did not start. Open Termius & SSH to check the log.")
+                    }
+                }
+            }
+        } else {
+            onNotice?("OpenSSH server is not installed yet. Open Termius & SSH to install it.")
+        }
+    }
+
+    static func openApp(port: String = "2222", username: String? = nil) {
+        let user = username ?? preferredUsername()
+        let mode = launchMode
+        if mode == "shortcut", let url = shortcutURL(name: shortcutName), UIApplication.shared.canOpenURL(url) {
+            LRRuntimeBridge.logCategory("TERMIUS", event: "redirect via Apple Shortcut name=\(shortcutName)")
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            return
+        }
+        if mode == "ssh", let url = sshURL(user: user, host: "127.0.0.1", port: port), UIApplication.shared.canOpenURL(url) {
+            LRRuntimeBridge.logCategory("TERMIUS", event: "redirect via ssh:// user=\(user) port=\(port)")
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            return
+        }
+        if let termiusURL = URL(string: "termius://"), UIApplication.shared.canOpenURL(termiusURL) {
+            LRRuntimeBridge.logCategory("TERMIUS", event: "redirect to Termius app host=127.0.0.1:\(port) user=\(user)")
+            UIApplication.shared.open(termiusURL, options: [:], completionHandler: nil)
+            return
+        }
+        LRRuntimeBridge.logCategory("TERMIUS", event: "Termius not installed; opening App Store")
+        UIApplication.shared.open(appStoreURL, options: [:], completionHandler: nil)
+    }
+
+    static func maybeAutoOpenOnLaunch(ssh: SSHServiceController, setupPresented: Bool) {
+        guard autoOpenOnLaunch, !didAutoOpenThisLaunch, !setupPresented,
+              LRRuntimeBridge.isRunning(), ssh.isRunning,
+              UIApplication.shared.applicationState == .active else { return }
+        didAutoOpenThisLaunch = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard UIApplication.shared.applicationState == .active, LRRuntimeBridge.isRunning(), ssh.isRunning else { return }
+            ensureBackgroundKeepAlive()
+            openApp(port: ssh.port)
+        }
+    }
 }
 
 // MARK: - Built-in OpenSSH Server Controller & Screen
@@ -382,8 +529,11 @@ private struct TerminalPresentation: Identifiable {
         }
     }
 
-    func start() {
-        guard LRRuntimeBridge.isRunning(), !busy, !installing else { return }
+    func start(completion: (@MainActor (Bool) -> Void)? = nil) {
+        guard LRRuntimeBridge.isRunning(), !busy, !installing else {
+            completion?(isRunning)
+            return
+        }
         error = nil; busy = true
         LRRuntimeBridge.runSSHAction("start") { [weak self] updated in
             Task { @MainActor in
@@ -391,9 +541,11 @@ private struct TerminalPresentation: Identifiable {
                 self.busy = false
                 self.status = updated
                 self.logTail = LRRuntimeBridge.sshLogTail()
-                if updated["ssh"] != "running" {
+                let started = updated["ssh"] == "running"
+                if !started {
                     self.error = "OpenSSH server did not start. Expand SSH Server Log below for details."
                 }
+                completion?(started)
             }
         }
     }
@@ -475,8 +627,12 @@ private struct SSHServerView: View {
     @State private var autoStart = LRRuntimeBridge.sshAutoStart()
     @State private var allowRootLogin = LRRuntimeBridge.sshAllowRootLogin()
     @AppStorage(BackgroundRunner.defaultsKey) private var keepRunningInBackground = false
+    @AppStorage(TermiusLauncher.autoOpenOnLaunchKey) private var autoOpenTermiusOnLaunch = false
+    @AppStorage(TermiusLauncher.launchModeKey) private var termiusLaunchMode = "termius"
+    @AppStorage(TermiusLauncher.shortcutNameKey) private var termiusShortcutName = "DebianRunner"
     @ObservedObject private var backgroundRunner = BackgroundRunner.shared
     @State private var copied: String?
+    @State private var termiusNotice: String?
     @State private var runtimeRunning = LRRuntimeBridge.isRunning()
     @Environment(\.scenePhase) private var scenePhase
     private let timer = Timer.publish(every: 8, on: .main, in: .common).autoconnect()
@@ -510,6 +666,9 @@ private struct SSHServerView: View {
                 if !runtimeRunning {
                     notice("Start Debian Minimal from the Home or Debian tab to run the OpenSSH server.", symbol: "power", color: .orange)
                 }
+                if let termiusNotice {
+                    notice(termiusNotice, symbol: "info.circle.fill", color: .blue)
+                }
                 if needsNonRootUserNotice {
                     VStack(alignment: .leading, spacing: 8) {
                         Label("Create a Linux user or enable Allow Root Login", systemImage: "person.badge.key.fill")
@@ -523,6 +682,7 @@ private struct SSHServerView: View {
                     .padding(14).frame(maxWidth: .infinity, alignment: .leading)
                     .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.orange.opacity(0.12)))
                 }
+                termiusCard
                 if ssh.isRunning {
                     connectionCard
                 }
@@ -533,7 +693,7 @@ private struct SSHServerView: View {
             .padding(.horizontal, 20).padding(.vertical, 12).padding(.bottom, 96)
         }
         .background(Color(.systemGroupedBackground).ignoresSafeArea())
-        .navigationTitle("SSH Server")
+        .navigationTitle("Termius & SSH")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             runtimeRunning = LRRuntimeBridge.isRunning()
@@ -553,8 +713,8 @@ private struct SSHServerView: View {
         return HStack(spacing: 14) {
             LRIconTile(symbol: "network", colors: [.green, .teal], size: 48)
             VStack(alignment: .leading, spacing: 3) {
-                Text("OpenSSH Server").font(.headline)
-                Text("Remote shell, VS Code Remote, scp & SFTP on port \(ssh.port)")
+                Text("Termius & OpenSSH Server").font(.headline)
+                Text("Local Termius (127.0.0.1:\(ssh.port)), remote SSH, scp & SFTP")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 4)
@@ -567,12 +727,70 @@ private struct SSHServerView: View {
         .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
     }
 
+    private var termiusCard: some View {
+        let installed = TermiusLauncher.isTermiusInstalled
+        return LRCard(title: "Termius", symbol: "arrow.up.forward.app.fill", colors: [.blue, .indigo], value: installed ? "Installed" : "App Store") {
+            Button {
+                termiusNotice = nil
+                TermiusLauncher.open(ssh: ssh) { msg in termiusNotice = msg }
+            } label: {
+                Label(installed ? "Open in Termius" : "Get Termius on App Store", systemImage: "arrow.up.forward.app.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(installed && !runtimeRunning)
+
+            VStack(spacing: 0) {
+                copyRow("Host", "127.0.0.1")
+                Divider().padding(.leading, 12)
+                copyRow("Port", ssh.port)
+                Divider().padding(.leading, 12)
+                copyRow("User", loginUser)
+            }
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color(.tertiarySystemGroupedBackground)))
+
+            Toggle("Auto-Open Termius on Launch", isOn: $autoOpenTermiusOnLaunch)
+            Text("When enabled, DebianRunner starts SSH, keeps Linux awake in the background, and automatically switches to Termius on launch.")
+                .font(.caption).foregroundColor(.secondary)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Redirect Mode").font(.subheadline.weight(.semibold))
+                Picker("Redirect Mode", selection: $termiusLaunchMode) {
+                    Text("Termius App").tag("termius")
+                    Text("SSH Link").tag("ssh")
+                    Text("Apple Shortcut").tag("shortcut")
+                }
+                .pickerStyle(.segmented)
+
+                if termiusLaunchMode == "shortcut" {
+                    TextField("Shortcut name (e.g. DebianRunner)", text: $termiusShortcutName)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                    Text("For 1-tap auto-connect: save 127.0.0.1:\(ssh.port) in Termius, open Apple Shortcuts → New Shortcut → add Termius's \"Connect to a host\" action, and enter that Shortcut's exact name above.")
+                        .font(.caption).foregroundColor(.secondary)
+                } else if termiusLaunchMode == "ssh" {
+                    Text("Opens ssh://\(loginUser)@127.0.0.1:\(ssh.port) (auto-connects in SSH clients that handle ssh:// links; falls back to Termius).")
+                        .font(.caption).foregroundColor(.secondary)
+                } else {
+                    Text("Launches Termius directly (termius://) and keeps Linux running in the background so your saved 127.0.0.1:\(ssh.port) host connects immediately.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
     private var connectionCard: some View {
         let ip = SSHServiceController.wifiAddress() ?? "iPhone-IP"
+        let localCmd = "ssh -p \(ssh.port) \(loginUser)@127.0.0.1"
         let cmd = "ssh -p \(ssh.port) \(loginUser)@\(ip)"
         let sftpCmd = "sftp -P \(ssh.port) \(loginUser)@\(ip)"
-        return LRCard(title: "Connect", symbol: "terminal.fill", colors: [.green, .mint], value: ":\(ssh.port)") {
+        return LRCard(title: "Connect from Other Devices", symbol: "laptopcomputer.and.iphone", colors: [.green, .mint], value: ":\(ssh.port)") {
             VStack(spacing: 0) {
+                copyRow("Local", localCmd)
+                Divider().padding(.leading, 12)
                 copyRow("SSH", cmd)
                 Divider().padding(.leading, 12)
                 copyRow("SFTP", sftpCmd)
@@ -580,7 +798,7 @@ private struct SSHServerView: View {
                 copyRow("Wi-Fi IP", ip)
             }
             .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color(.tertiarySystemGroupedBackground)))
-            Text("Connect from any Mac, PC, or SSH client on the same Wi-Fi network using your Linux user's password or ~/.ssh/authorized_keys.")
+            Text("Use 127.0.0.1:\(ssh.port) in Termius on this iPhone, or the Wi-Fi IP from any Mac, PC, or SSH client on the same network using your Linux password or ~/.ssh/authorized_keys.")
                 .font(.caption).foregroundColor(.secondary)
         }
     }
@@ -1037,7 +1255,6 @@ private struct SnapshotsView: View {
 struct ManagerView: View {
     @StateObject private var manager = EnvironmentManager()
     @StateObject private var ssh = SSHServiceController()
-    let terminal: TerminalViewController
     @State private var selectedTab = 0
     @State private var runtimeRunning = LRRuntimeBridge.isRunning()
     @State private var startingRuntime = false
@@ -1046,15 +1263,15 @@ struct ManagerView: View {
     @AppStorage("LinuxRunner.developerMode") private var developerMode = false
     @AppStorage("LinuxRunner.keepScreenAwake") private var keepScreenAwake = true
     @AppStorage(BackgroundRunner.defaultsKey) private var keepRunningInBackground = false
+    @AppStorage(TermiusLauncher.autoOpenOnLaunchKey) private var autoOpenTermiusOnLaunch = false
     @ObservedObject private var backgroundRunner = BackgroundRunner.shared
     @AppStorage("LinuxRunner.experimentalMemoryPCFusion") private var memoryPCFusion = true
     @AppStorage("LinuxRunner.appearance") private var appearance = "dark"
-    @State private var terminalAfterSetup = false
+    @State private var openTermiusAfterSetup = false
     @State private var setup = false
     @AppStorage("LinuxRunnerSetup.step") private var setupStep = "welcome"
     @State private var diagnostics = false
     @State private var importer = false
-    @State private var session: TerminalPresentation?
     @State private var share: ExportItem?
     @State private var importRoot: String?
     @State private var confirmWipe = false
@@ -1083,6 +1300,7 @@ struct ManagerView: View {
             if runtimeRunning {
                 ssh.ensureDefaultSSHIfNeeded()
                 ssh.refresh(queryGuest: false)
+                TermiusLauncher.maybeAutoOpenOnLaunch(ssh: ssh, setupPresented: setup)
             }
             // First launch without Debian minimal installed, or setup waiting for its relaunch/account step.
             if !SetupAutoPresentation.shown && !simulatorSuppressesSetup &&
@@ -1091,12 +1309,12 @@ struct ManagerView: View {
                 setup = true
             }
         }
+        .onChange(of: ssh.status) { _ in
+            TermiusLauncher.maybeAutoOpenOnLaunch(ssh: ssh, setupPresented: setup)
+        }
         #if targetEnvironment(simulator)
         .onAppear {
-            SimulatorWorkflow.start(manager: manager,
-                                    terminal: { if let environment = activeEnvironment { openTerminal(environment) } },
-                                    type: { terminal.sendSessionInput($0) },
-                                    tab: { selectedTab = $0 })
+            SimulatorWorkflow.start(manager: manager, tab: { selectedTab = $0 })
         }
         #endif
         .fullScreenCover(isPresented: $setup, onDismiss: {
@@ -1104,12 +1322,12 @@ struct ManagerView: View {
             snapshotCount = LRRuntimeBridge.snapshots().count
             manager.refresh()
             if runtimeRunning { ssh.ensureDefaultSSHIfNeeded() }
-            if terminalAfterSetup {
-                terminalAfterSetup = false
-                if let environment = activeEnvironment { openTerminal(environment) }
+            if openTermiusAfterSetup {
+                openTermiusAfterSetup = false
+                openInTermius()
             }
         }) {
-            SetupWizardView(manager: manager, openTerminal: { terminalAfterSetup = true })
+            SetupWizardView(manager: manager, openTermius: { openTermiusAfterSetup = true })
         }
         .alert("Wipe Debian Minimal?", isPresented: $confirmWipe) {
             Button("Cancel", role: .cancel) { }
@@ -1138,9 +1356,6 @@ struct ManagerView: View {
             Text("Debian Minimal is currently mounted. Close DebianRunner now and reopen it — the old filesystem will be wiped cleanly before startup so you can install fresh or restore a saved snapshot.")
         }
         .sheet(isPresented: $diagnostics) { DeveloperDiagnosticsView() }
-        .fullScreenCover(item: $session) { item in
-            TerminalScreen(controller: item.controller)
-        }
         .sheet(item: $share) { item in ShareView(item: item) }
         .fileImporter(isPresented: $importer, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
             guard let root = importRoot else { return }
@@ -1181,10 +1396,6 @@ struct ManagerView: View {
             let result = LRRuntimeBridge.startRuntime()
             runtimeRunning = LRRuntimeBridge.isRunning()
             if runtimeRunning {
-                if terminal.sessionTerminalUUID == nil {
-                    terminal.loadViewIfNeeded()
-                    terminal.startNewSession()
-                }
                 ssh.ensureDefaultSSHIfNeeded()
             } else {
                 manager.error = "Runtime initialization failed (\(result)). " + LRRuntimeBridge.runtimeStatus()
@@ -1194,16 +1405,19 @@ struct ManagerView: View {
         }
     }
 
+    private func openInTermius() {
+        TermiusLauncher.open(ssh: ssh) { notice in
+            manager.error = notice
+        }
+    }
+
     private func primaryHomeAction() {
         if manager.environments.isEmpty {
             startSetup()
         } else if !runtimeRunning {
             startRuntime()
-        } else if let environment = activeEnvironment {
-            openTerminal(environment)
         } else {
-            if terminal.sessionTerminalUUID == nil { terminal.loadViewIfNeeded(); terminal.startNewSession() }
-            session = TerminalPresentation(controller: terminal)
+            openInTermius()
         }
     }
 
@@ -1221,12 +1435,12 @@ struct ManagerView: View {
                 }
                 primaryAction
                 HStack(spacing: 14) {
-                    NavigationLink(destination: AppStoreView(manager: manager, run: run)) {
+                    NavigationLink(destination: AppStoreView(manager: manager)) {
                         HomeTile(title: "Packages", symbol: "shippingbox.fill", colors: [.blue, .indigo], large: true)
                     }
                     .buttonStyle(HomeTileStyle()).disabled(activeEnvironment == nil).accessibilityIdentifier("Packages")
                     NavigationLink(destination: SSHServerView(ssh: ssh)) {
-                        HomeTile(title: "SSH Server", symbol: "network", colors: [.green, .teal], large: true, badge: ssh.isRunning)
+                        HomeTile(title: "Termius & SSH", symbol: "network", colors: [.green, .teal], large: true, badge: ssh.isRunning)
                     }
                     .buttonStyle(HomeTileStyle()).accessibilityIdentifier("SSH Server")
                 }
@@ -1266,12 +1480,12 @@ struct ManagerView: View {
             HStack(spacing: 14) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(0.18)).frame(width: 44, height: 44)
-                    if startingRuntime { ProgressView().tint(.white) }
-                    else { Image(systemName: uninstalled ? "arrow.down.circle.fill" : runtimeRunning ? "terminal.fill" : "power").font(.title3.weight(.semibold)) }
+                    if startingRuntime || (runtimeRunning && ssh.busy) { ProgressView().tint(.white) }
+                    else { Image(systemName: uninstalled ? "arrow.down.circle.fill" : runtimeRunning ? "arrow.up.forward.app.fill" : "power").font(.title3.weight(.semibold)) }
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(uninstalled ? (snapshotCount > 0 ? "Install or Restore Debian" : "Install Debian Minimal") : runtimeRunning ? "Open Terminal" : startingRuntime ? "Starting Debian…" : "Start Debian Minimal").font(.headline)
-                    Text(uninstalled ? (snapshotCount > 0 ? "Install fresh or restore from \(snapshotCount) saved snapshot\(snapshotCount == 1 ? "" : "s")" : "Download & verify Debian 13 (trixie) ARM64") : runtimeRunning ? "Open an interactive Debian shell" : "Boot the ARM64 Linux runtime").font(.caption).opacity(0.85)
+                    Text(uninstalled ? (snapshotCount > 0 ? "Install or Restore Debian" : "Install Debian Minimal") : runtimeRunning ? "Open in Termius" : startingRuntime ? "Starting Debian…" : "Start Debian Minimal").font(.headline)
+                    Text(uninstalled ? (snapshotCount > 0 ? "Install fresh or restore from \(snapshotCount) saved snapshot\(snapshotCount == 1 ? "" : "s")" : "Download & verify Debian 13 (trixie) ARM64") : runtimeRunning ? (ssh.isRunning ? "Connect via SSH · 127.0.0.1:\(ssh.port)" : ssh.installing ? "Installing OpenSSH server…" : "Starts SSH & opens Termius") : "Boot the ARM64 Linux runtime").font(.caption).opacity(0.85)
                 }
                 Spacer()
                 Image(systemName: "chevron.right").font(.headline).opacity(0.7)
@@ -1281,7 +1495,7 @@ struct ManagerView: View {
         }
         .buttonStyle(HomeTileStyle())
         .disabled(!uninstalled && !runtimeRunning && (startingRuntime || !LRRuntimeBridge.canStartRuntime()))
-        .accessibilityIdentifier(uninstalled ? "Install Debian Minimal" : runtimeRunning ? "Open Terminal" : "Start Linux Runtime")
+        .accessibilityIdentifier(uninstalled ? "Install Debian Minimal" : runtimeRunning ? "Open in Termius" : "Start Linux Runtime")
     }
 
     private func homeTile(_ title: String, _ symbol: String, _ colors: [Color], large: Bool = false, enabled: Bool = true, action: @escaping () -> Void) -> some View {
@@ -1301,10 +1515,6 @@ struct ManagerView: View {
         snapshotCount = LRRuntimeBridge.snapshots().count
         manager.refresh()
         if runtimeRunning {
-            if terminal.sessionTerminalUUID == nil {
-                terminal.loadViewIfNeeded()
-                terminal.startNewSession()
-            }
             ssh.ensureDefaultSSHIfNeeded()
             ssh.refresh(queryGuest: false)
         }
@@ -1330,7 +1540,7 @@ struct ManagerView: View {
                             }
                         }.padding(.vertical, 4)
                         if active {
-                            Button { openTerminal(environment) } label: { Label("Open Terminal", systemImage: "terminal") }
+                            Button { openInTermius() } label: { Label("Open in Termius", systemImage: "arrow.up.forward.app.fill") }
                         } else {
                             Button { startRuntime() } label: {
                                 Label(startingRuntime ? "Starting Debian…" : "Start Debian Minimal", systemImage: "power")
@@ -1350,14 +1560,14 @@ struct ManagerView: View {
                     Section("Environment") {
                         NavigationLink(destination: SSHServerView(ssh: ssh)) {
                             HStack {
-                                Label("SSH Server", systemImage: "network")
+                                Label("Termius & SSH Server", systemImage: "network")
                                 Spacer()
                                 Text(ssh.isRunning ? "Running · :\(ssh.port)" : ssh.installing ? "Installing…" : ssh.isInstalled ? "Stopped" : "Not Installed")
                                     .font(.caption).foregroundColor(ssh.isRunning ? .green : .secondary)
                             }
                         }
                         if active {
-                            NavigationLink(destination: PackageView(environment: environment, manager: manager, run: run)) { Label("Packages (APT)", systemImage: "shippingbox") }
+                            NavigationLink(destination: PackageView(environment: environment, manager: manager)) { Label("Packages (APT)", systemImage: "shippingbox") }
                             NavigationLink(destination: LinuxUsersView()) { Label("Linux Users", systemImage: "person.2") }
                         }
                         NavigationLink(destination: FileSharingView(environment: environment, manager: manager, share: $share)) { Label("Files & Apple Files", systemImage: "folder") }
@@ -1384,7 +1594,7 @@ struct ManagerView: View {
                         } label: { Label("Continue Setup / Account", systemImage: "wrench.and.screwdriver") }
                     } footer: { Text("Re-runs Linux account setup without deleting files. APT checks and repairs are in Packages.") }
 
-                    Section("Details & Launchers") {
+                    Section("Details") {
                         DisclosureGroup("Installation Details") {
                             detailRow("Home", environment.homePath)
                             detailRow("Apple Files Mount", LRRuntimeBridge.fileProviderEnabled() ? "Enabled (\(LRRuntimeBridge.activeAppGroup()))" : "Shared folder only")
@@ -1392,14 +1602,6 @@ struct ManagerView: View {
                             if let result = environment.lastBootResult { detailRow("Last boot result", result) }
                             detailRow("Created", environment.createdAt.formatted(date: .abbreviated, time: .shortened))
                             if let last = environment.lastBootedAt { detailRow("Last started", last.formatted(date: .abbreviated, time: .shortened)) }
-                        }
-                        DisclosureGroup("Command Launchers") {
-                            ForEach(manager.environments.first(where: { $0.id == environment.id })?.applications ?? []) { app in
-                                Button { run(app) } label: { VStack(alignment: .leading) { Text(app.name); Text(([app.command] + app.arguments).joined(separator: " ")).font(.caption).foregroundColor(.secondary) } }
-                                    .disabled(!active).accessibilityIdentifier("run-\(app.name)")
-                            }
-                            NavigationLink("Create Command Launcher", destination: LauncherEditor { manager.add(application: $0, to: environment) })
-                            if active && !manager.detected.isEmpty { ForEach(manager.detected) { app in Button(app.name) { run(app) } } }
                         }
                     }
 
@@ -1497,17 +1699,15 @@ struct ManagerView: View {
                 if keepRunningInBackground {
                     Text(backgroundRunner.status).font(.caption).foregroundColor(.green)
                 }
+                Toggle(isOn: $autoOpenTermiusOnLaunch) { SettingsLabel("Auto-Open Termius on Launch", "arrow.up.forward.app.fill", .blue) }
             } header: { Text("General") } footer: {
-                Text("Keep Linux Running in Background uses a silent mixed audio and continuous location keep-alive so SSH, agy remote-control, and long tasks stay awake when your iPhone is locked.")
+                Text("Keep Linux Running in Background uses a silent mixed audio and continuous location keep-alive so SSH, Termius sessions, and background services stay awake when switching apps or locking your iPhone.")
             }
             Section("Performance") {
                 NavigationLink(destination: SystemResourcesView()) { SettingsLabel("CPU & Memory", "speedometer", .indigo) }
             }
-            Section("Input & Controls") {
-                NavigationLink(destination: TerminalSettingsView()) { SettingsLabel("Terminal & Keyboard", "keyboard.fill", .gray) }
-            }
             Section("Linux Environment") {
-                NavigationLink(destination: SSHServerView(ssh: ssh)) { SettingsLabel("SSH Server", "network", .green) }
+                NavigationLink(destination: SSHServerView(ssh: ssh)) { SettingsLabel("Termius & SSH Server", "network", .green) }
                 NavigationLink(destination: LinuxUsersView()) { SettingsLabel("Linux Users", "person.2.fill", .blue) }
                 NavigationLink(destination: FileSharingView(environment: currentEnvironment, manager: manager, share: $share)) { SettingsLabel("File Sharing", "folder.fill", .cyan) }
                 NavigationLink(destination: DevicesView()) { SettingsLabel("Devices", "cable.connector", .orange) }
@@ -1531,7 +1731,6 @@ struct ManagerView: View {
                 Toggle(isOn: $developerMode) { SettingsLabel("Developer Mode", "hammer.fill", .gray) }
                 if developerMode {
                     Toggle(isOn: $autoStartRuntime) { SettingsLabel("Start Runtime on Launch", "power", .green) }.onChange(of: autoStartRuntime) { UserDefaults.standard.set($0, forKey: "LinuxRunnerRuntimeAutoStart") }
-                    NavigationLink(destination: ExecutionEngineView()) { SettingsLabel("Execution Engine / StikDebug", "bolt.fill", .yellow) }
                     Toggle(isOn: $memoryPCFusion) { SettingsLabel("Memory Dispatch Fusion", "memorychip.fill", .teal) }
                     Button { diagnostics = true } label: { SettingsLabel("Runtime Diagnostics", "stethoscope", .pink) }.foregroundColor(.primary)
                 }
@@ -1542,21 +1741,6 @@ struct ManagerView: View {
                 NavigationLink(destination: LinuxRunnerAboutView()) { SettingsLabel("About DebianRunner", "info.circle.fill", .blue) }
             }
         }.listStyle(.insetGrouped).navigationTitle("Settings")
-    }
-
-    private func openTerminal(_ environment: LinuxEnvironment) {
-        guard manager.active(environment) else { return }
-        if terminal.sessionTerminalUUID == nil { terminal.loadViewIfNeeded(); terminal.startNewSession() }
-        session = TerminalPresentation(controller: terminal)
-    }
-
-    private func run(_ application: LinuxApplication) {
-        do {
-            try application.validate()
-            guard LRRuntimeBridge.isRunning() else { manager.error = LRRuntimeBridge.runtimeStatus(); return }
-            let controller = LRRuntimeBridge.terminal(forCommand: [application.command] + application.arguments, directory: application.workingDirectory)
-            session = TerminalPresentation(controller: controller)
-        } catch { manager.error = error.localizedDescription }
     }
 
     private func detailRow(_ title: String, _ value: String) -> some View {
@@ -1580,115 +1764,17 @@ struct ManagerView: View {
     }
 }
 
-/// Embeds a long-lived UIKit controller (the terminal) in SwiftUI so it can be
-/// re-presented cleanly across full-screen covers.
-struct NativeController: UIViewControllerRepresentable {
-    let controller: UIViewController
-    func makeUIViewController(context: Context) -> UIViewController { NativeContainer(embedding: controller) }
-    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
-        (uiViewController as? NativeContainer)?.embedIfNeeded()
-    }
-    static func dismantleUIViewController(_ uiViewController: UIViewController, coordinator: ()) {
-        (uiViewController as? NativeContainer)?.release()
-    }
-}
-
-final class NativeContainer: UIViewController {
-    private let child: UIViewController
-    init(embedding child: UIViewController) { self.child = child; super.init(nibName: nil, bundle: nil) }
-    required init?(coder: NSCoder) { fatalError("not used") }
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        view.backgroundColor = .black
-        embedIfNeeded()
-    }
-    func embedIfNeeded() {
-        guard isViewLoaded, child.parent !== self else { return }
-        if child.parent != nil || child.view.superview != nil {
-            child.willMove(toParent: nil)
-            child.view.removeFromSuperview()
-            child.removeFromParent()
-        }
-        addChild(child)
-        child.view.frame = view.bounds
-        child.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        view.addSubview(child.view)
-        child.didMove(toParent: self)
-    }
-    func release() {
-        guard child.parent === self else { return }
-        child.willMove(toParent: nil)
-        child.view.removeFromSuperview()
-        child.removeFromParent()
-    }
-    override var childForStatusBarHidden: UIViewController? { child }
-    override var childForStatusBarStyle: UIViewController? { child }
-    override var childForHomeIndicatorAutoHidden: UIViewController? { child }
-    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { child.supportedInterfaceOrientations }
-}
-
-struct TerminalScreen: View {
-    let controller: TerminalViewController
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
-        // Minimal chrome: true black and one blue Done (font size is in Settings).
-        VStack(spacing: 0) {
-            HStack {
-                Spacer()
-                Button("Done") { dismiss() }.font(.body.weight(.semibold)).foregroundColor(.accentColor)
-            }
-            .padding(.horizontal, 16).padding(.vertical, 8)
-            NativeController(controller: controller)
-        }.background(Color.black.ignoresSafeArea())
-         .onAppear {
-             currentTerminalViewController = controller
-             controller.onSessionEnded = { dismiss() }
-         }
-         .onDisappear {
-             if currentTerminalViewController === controller { currentTerminalViewController = nil }
-             controller.onSessionEnded = nil
-         }
-    }
-}
-
 enum SetupAutoPresentation { static var shown = false }
-
-struct LauncherEditor: View {
-    var save: (LinuxApplication) -> Void
-    @State private var name = ""
-    @State private var command = "/usr/bin/python3"
-    @State private var arguments = "[]"
-    @State private var directory = "/root"
-    @State private var error: String?
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
-        Form {
-            TextField("Name", text: $name)
-            TextField("Absolute executable", text: $command).autocorrectionDisabled().textInputAutocapitalization(.never)
-            TextField("Arguments as a JSON array", text: $arguments).autocorrectionDisabled().textInputAutocapitalization(.never)
-            Text("Example: [\"--version\"]. Each string is one argument; shell expansion is not applied.").font(.caption)
-            TextField("Working directory", text: $directory).autocorrectionDisabled().textInputAutocapitalization(.never)
-            Button("Save Launcher") {
-                do {
-                    let args = try JSONDecoder().decode([String].self, from: Data(arguments.utf8))
-                    let app = LinuxApplication(name: name, command: command, arguments: args, workingDirectory: directory)
-                    try app.validate(); save(app); dismiss()
-                } catch { self.error = error.localizedDescription }
-            }
-            if let error { Text(error).foregroundColor(.red) }
-        }.navigationTitle("Create Command Launcher")
-    }
-}
 
 struct PackageView: View {
     let environment: LinuxEnvironment
     @ObservedObject var manager: EnvironmentManager
-    var run: (LinuxApplication) -> Void
     @State private var query = ""
     @State private var packages: [LinuxPackageRecord] = []
     @State private var previousResult = ""
     @State private var resultReadID: UUID?
     @State private var resultsVisible = false
+    @State private var runningOperation = false
     @State private var details = ""
     @State private var log = ""
     @State private var status = "No package operation requested"
@@ -1697,14 +1783,17 @@ struct PackageView: View {
     @State private var error: String?
     @State private var share: ExportItem?
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-    private var enabled: Bool { manager.active(environment) }
+    private var enabled: Bool { manager.active(environment) && !runningOperation }
     private var support: URL { LRRuntimeBridge.exchangeURL(environment.rootfsName).appendingPathComponent(".linuxrunner/support") }
     var body: some View {
         Form {
             Section("Debian Environment") {
                 Text(environment.distribution + " " + environment.rootfsVersion + " · " + environment.architecture)
-                Text(enabled ? "Operations use Debian's real APT package manager." : "Select this environment for the next launch, then reopen DebianRunner.").font(.caption)
-                Text(status).font(.caption).textSelection(.enabled)
+                Text(manager.active(environment) ? "Operations run headlessly using Debian's real APT package manager." : "Select this environment for the next launch, then reopen DebianRunner.").font(.caption)
+                HStack(spacing: 8) {
+                    if runningOperation { ProgressView() }
+                    Text(status).font(.caption).textSelection(.enabled)
+                }
             }
             Section("APT Operations") {
                 Button("Installed Packages") { execute("installed") }
@@ -1714,9 +1803,9 @@ struct PackageView: View {
                 Button("Search") { execute("search") }.disabled(!PackageOperation.validName(query))
                 Button("Package Details") { execute("details") }.disabled(!PackageOperation.validName(query))
                 Button("Install Package") { confirm("install") }.disabled(!PackageOperation.validName(query))
-                Button("Review Package Upgrade") { confirm("upgrade") }.disabled(!PackageOperation.validName(query))
-                Button("Review Removal", role: .destructive) { confirm("remove") }.disabled(!PackageOperation.validName(query))
-                Text("Output, dependency plans, and progress open in a Linux terminal. Removal asks for confirmation there. Close the terminal when finished, then refresh the installed list. Cancellation during configuration may require Repair Center.").font(.caption)
+                Button("Upgrade Package") { confirm("upgrade") }.disabled(!PackageOperation.validName(query))
+                Button("Remove Package", role: .destructive) { confirm("remove") }.disabled(!PackageOperation.validName(query))
+                Text("Operations run headlessly and stream output into the Diagnostics section below. Cancellation during configuration may require Repair Center.").font(.caption)
             }.disabled(!enabled)
             if !packages.isEmpty {
                 Section("Package Results") {
@@ -1737,7 +1826,7 @@ struct PackageView: View {
                 Button("Check Dependencies") { execute("dependencies") }
                 Button("Configure Interrupted Debian Packages") { confirm("configure") }
                 Button("Check / Repair Package State") { confirm("repair") }
-                Text("Repair runs native dpkg/APT maintainer scripts and keeps a package-database metadata checkpoint inside Linux. It is not a full snapshot or automatic rollback. APT dependency repair asks for confirmation before changing packages. Safe diagnostic mode: use Diagnose and Check Dependencies before repair.").font(.caption)
+                Text("Repair runs native dpkg/APT maintainer scripts and keeps a package-database metadata checkpoint inside Linux. It is not a full snapshot or automatic rollback. Safe diagnostic mode: use Diagnose and Check Dependencies before repair.").font(.caption)
             }.disabled(!enabled)
             Section("Diagnostics") {
                 if !log.isEmpty { Text(log).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
@@ -1754,15 +1843,15 @@ struct PackageView: View {
             status = "No package operation requested"; readResults(); manager.refresh()
         }
         .confirmationDialog("Confirm Package Operation", isPresented: $showConfirmation, titleVisibility: .visible) {
-            Button("Continue in Linux Terminal") { if let operation = pendingOperation { execute(operation) } }
+            Button("Continue") { if let operation = pendingOperation { execute(operation) } }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(pendingOperation == "install"
                  ? "Install \(query) and its dependencies into \(environment.name) using APT?"
                  : pendingOperation == "upgrade"
-                 ? "Review an APT upgrade of \(query) and its dependencies in \(environment.name)."
+                 ? "Upgrade \(query) and its dependencies in \(environment.name) using APT?"
                  : pendingOperation == "remove"
-                 ? "Review removal of \(query) in \(environment.name). The terminal will list affected packages and ask before removing them. No purge or autoremove is requested."
+                 ? "Remove \(query) from \(environment.name) using APT? No purge or autoremove is requested."
                  : "Run dpkg/APT configuration or repair in \(environment.name). Maintainer scripts may update system configuration. A metadata checkpoint is saved first; this does not restore arbitrary filesystem changes.")
         }
         .sheet(item: $share) { ShareView(item: $0) }
@@ -1773,9 +1862,21 @@ struct PackageView: View {
             guard enabled, LRRuntimeBridge.activeRootName() == environment.rootfsName else { throw EnvironmentError.invalidMetadata }
             _ = try LRRuntimeBridge.prepareApplicationSupport()
             let command = try PackageOperation.command(operation, value: query)
+            self.error = nil
+            runningOperation = true
+            status = "Running \(operation)…"
             LRRuntimeBridge.logCategory("PACKAGE", event: "operation=\(operation) root=\(environment.rootfsName) requested")
-            run(LinuxApplication(name: "Package " + operation, command: command[0], arguments: Array(command.dropFirst()), workingDirectory: "/root"))
-        } catch { self.error = error.localizedDescription }
+            LRRuntimeBridge.runHeadlessCommand(command, directory: "/root", timeout: 1800) { _ in
+                Task { @MainActor in
+                    runningOperation = false
+                    readResults()
+                    manager.refresh()
+                }
+            }
+        } catch {
+            runningOperation = false
+            self.error = error.localizedDescription
+        }
     }
     private func readResults() {
         guard resultsVisible && resultReadID == nil else { return }
@@ -1787,7 +1888,9 @@ struct PackageView: View {
             }
             let records = LinuxPackageRecord.parse(read("package-state.tsv", 262144))
             let detailText = read("package-details.txt", 16384)
-            let logText = LRRuntimeBridge.redactDiagnosticText(read("package-operation.log", 8192), application: false)
+            let liveTail = read("package-output.tmp", 8192)
+            let rawLog = liveTail.isEmpty ? read("package-operation.log", 8192) : liveTail
+            let logText = LRRuntimeBridge.redactDiagnosticText(rawLog, application: false)
             let code = read("package-result", 128).trimmingCharacters(in: .whitespacesAndNewlines)
             #if targetEnvironment(simulator)
             NotificationCenter.default.post(name: Notification.Name("LRSimulatorPackageResultRead"), object: nil, userInfo: ["mainThread": Thread.isMainThread, "records": records.count])
@@ -1796,7 +1899,7 @@ struct PackageView: View {
                 guard resultReadID == request else { return }
                 resultReadID = nil; packages = records; details = detailText; log = logText
                 if code != previousResult { previousResult = code; if code == "0" { manager.refresh() } }
-                if code == "running" { status = "Operation running or interrupted; inspect terminal / Diagnose Package State." }
+                if code == "running" { status = runningOperation ? "Operation running…" : "Operation interrupted; inspect Diagnostics or run Diagnose Package State." }
                 else if !code.isEmpty { status = code == "0" ? "Last package operation completed (exit 0)" : "Last operation failed (exit \(code)); inspect logs and Repair Center." }
             }
         }
@@ -2263,131 +2366,6 @@ struct StorageManagementView: View {
     }
 }
 
-struct ExecutionEngineView: View {
-    @State private var confirmJITRetry = false
-    @State private var status = LRRuntimeBridge.executionBackendStatus() as? [String: Any] ?? [:]
-    @State private var report = LRRuntimeBridge.jitStatusReport() as? [String: Any] ?? [:]
-    @State private var mode = LRRuntimeBridge.executionMode()
-    private let ticker = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-    @State private var requested = false
-    @State private var message: String?
-    private var compiled: Bool { status["compiled"] as? Bool ?? false }
-    private var active: Bool { (status["active"] as? String) == "jit" }
-    var body: some View {
-        List {
-            Section {
-                HStack {
-                    Image(systemName: jitStateIcon).foregroundColor(jitStateColor)
-                    Text(report["state"] as? String ?? "Interpreter Active").bold()
-                }
-                Text(report["detail"] as? String ?? "").font(.footnote).foregroundColor(.secondary)
-                if compiled {
-                    let pic = report["pic"] as? Bool ?? false
-                    let reused = (report["reused"] as? NSNumber)?.uint64Value ?? 0
-                    let usedKB = (report["region_used_kb"] as? NSNumber)?.uint64Value ?? 0
-                    let capKB = (report["region_capacity_kb"] as? NSNumber)?.uint64Value ?? 0
-                    let exhausted = report["region_exhausted"] as? Bool ?? false
-                    LabeledRow("Running", active ? (pic ? "ARM64 JIT (PIC shared)" : "ARM64 JIT (with interpreter for untranslated code)") : "ARM64 Interpreter")
-                    LabeledRow("Debugger attached", (report["debugger"] as? Bool ?? false) ? "Yes" : "No")
-                    LabeledRow("Guest blocks translated", "\((report["blocks"] as? NSNumber)?.uint64Value ?? 0)")
-                    if pic || reused > 0 {
-                        LabeledRow("Blocks reused (PIC)", "\(reused)")
-                    }
-                    if capKB > 0 {
-                        let usedMB = Double(usedKB) / 1024.0
-                        let capMB = Double(capKB) / 1024.0
-                        LabeledRow("Code region", "\(String(format: "%.1f / %.0f MB", usedMB, capMB))\(exhausted ? " (Full)" : "")")
-                    } else {
-                        LabeledRow("Native code", "\((report["code_kb"] as? NSNumber)?.uint64Value ?? 0) KB")
-                    }
-                    LabeledRow("iOS", report["os"] as? String ?? "")
-                }
-            } header: { Text("JIT Status") } footer: {
-                Text("JIT Active is shown only after LinuxRunner ran test code in its JIT region and installed translated guest code that the runtime now executes. StikDebug reporting that JIT was assigned is not enough on its own.")
-            }
-            if compiled {
-                Section {
-                    Picker("Mode", selection: $mode) {
-                        Text("Interpreter").tag("interpreter")
-                        Text("Automatic").tag("automatic")
-                        Text("JIT").tag("jit")
-                    }.onChange(of: mode) { LRRuntimeBridge.setExecutionMode($0) }
-                } footer: {
-                    Text("Interpreter always works. Automatic and JIT start the JIT only after iOS allows it — LinuxRunner launched or attached by StikDebug — and otherwise keep the interpreter. The active backend above is what actually runs.")
-                }
-                if !active && (mode != "interpreter" || (report["debugger"] as? Bool ?? false)) {
-                    Section {
-                        Button("Attach with StikDebug") { requestAttachment() }
-                        Button("Activate JIT Now") {
-                            if report["activationQuarantined"] as? Bool == true { confirmJITRetry = true }
-                            else { activate() }
-                        }
-                        if let message { Text(message).font(.footnote).foregroundColor(.orange) }
-                    } footer: {
-                        Text(LRRuntimeBridge.requiresPreparedJITRegion()
-                             ? "This device needs StikDebug's universal.js script. Tap Attach with StikDebug (it asks for the script), return here, and LinuxRunner prepares its code region while StikDebug stays attached; Activate JIT Now retries safely at any time."
-                             : "StikDebug attaches and detaches; return here and LinuxRunner checks whether iOS now allows its code region.")
-                    }
-                }
-            } else {
-                Section { Text("This build is interpreter-only. The JIT-capable LinuxRunner build adds the JIT option here; the interpreter remains the default there too.").font(.footnote) }
-            }
-        }.navigationTitle("Execution Engine")
-        .alert("Retry JIT Activation?", isPresented: $confirmJITRetry) {
-            Button("Cancel", role: .cancel) { }
-            Button("Retry JIT") { activate(retryQuarantined: true) }
-        } message: {
-            Text("An earlier activation ended before verification. Save your Linux work first: another attempt may close LinuxRunner. This retries the method for this iOS version once; automatic retries remain blocked if it fails again.")
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
-            if requested { requested = false; activate() } else { refresh() }
-        }
-        .onReceive(ticker) { _ in if UIApplication.shared.applicationState == .active { refresh() } }
-    }
-    private var jitStateIcon: String {
-        switch report["state"] as? String {
-        case "JIT Active": return "bolt.fill"
-        case "JIT Initializing", "JIT Available": return "bolt"
-        case "JIT Failed", "JIT Unavailable": return "exclamationmark.triangle"
-        case "Waiting for JIT Authorization": return "hourglass"
-        default: return "cpu"
-        }
-    }
-    private var jitStateColor: Color {
-        switch report["state"] as? String {
-        case "JIT Active": return .green
-        case "JIT Failed", "JIT Unavailable": return .orange
-        default: return .secondary
-        }
-    }
-    private func refresh() {
-        status = LRRuntimeBridge.executionBackendStatus() as? [String: Any] ?? [:]
-        report = LRRuntimeBridge.jitStatusReport() as? [String: Any] ?? [:]
-    }
-    private func activate(retryQuarantined: Bool = false) {
-        var detail: NSString?
-        if mode == "interpreter" { mode = "automatic"; LRRuntimeBridge.setExecutionMode(mode) }
-        let ok = retryQuarantined ? LRRuntimeBridge.retryJIT(afterFailure: &detail) : LRRuntimeBridge.activateJIT(&detail)
-        message = ok ? nil : detail as String?
-        refresh()
-    }
-    private func requestAttachment() {
-        guard let url = LRRuntimeBridge.stikDebugRequestURL(), UIApplication.shared.canOpenURL(url) else {
-            message = "StikDebug is not installed or not set up. Install it, pair this device, then try again."
-            return
-        }
-        requested = true
-        LRRuntimeBridge.logCategory("JIT", event: "StikDebug attachment requested")
-        UIApplication.shared.open(url, options: [:]) { opened in if !opened { requested = false; message = "StikDebug could not be opened." } }
-    }
-}
-
-private struct LabeledRow: View {
-    let label: String, value: String
-    init(_ label: String, _ value: String) { self.label = label; self.value = value }
-    var body: some View { HStack { Text(label).foregroundColor(.secondary); Spacer(); Text(value).multilineTextAlignment(.trailing) }.font(.footnote) }
-}
-
 // Public host information only: no SSID entitlement, scan, probe or namespace.
 @MainActor private final class HostNetworkStatus: ObservableObject {
     @Published var status = "Waiting for system path"
@@ -2527,7 +2505,7 @@ private struct DevicesView: View {
         let bleLinks = LRBLESerial.shared().links.count
         let midiLinks = LRMIDISerial.shared().links.count
         rows = [
-            Row(name: "Keyboard", symbol: "keyboard", detected: keyboard ? "Connected" : "None", linux: "Key presses from USB and Bluetooth keyboards go directly to the Linux terminal.", works: true, connected: keyboard),
+            Row(name: "Keyboard", symbol: "keyboard", detected: keyboard ? "Connected" : "None", linux: "Hardware keyboards work directly inside Termius or any SSH client connected to DebianRunner.", works: true, connected: keyboard),
             Row(name: "Drives & Folders", symbol: "externaldrive", detected: folders.isEmpty ? "None shared" : "\(available) of \(folders.count)", linux: "Folders you share in File Sharing (on a drive, iCloud, or On My iPhone) appear in Linux at /mnt/<name>.", works: true, connected: available > 0),
             Row(name: "Serial Links", symbol: "dot.radiowaves.left.and.right", detected: (bleLinks + midiLinks) == 0 ? "None" : "\(bleLinks + midiLinks) active", linux: "Bluetooth LE serial boards (/dev/ttyBLE0-3) and USB-MIDI serial adapters (/dev/ttyMIDI0-3) are exposed to Linux.", works: true, connected: (bleLinks + midiLinks) > 0),
             Row(name: "USB Serial & Raw USB", symbol: "cable.connector", detected: "—", linux: "iOS gives apps no USB host access to CH340, CP210x, or FTDI chips. Use a USB Serial Adapter (USB MIDI), Bluetooth Serial, or Wi-Fi instead.", works: false, connected: false),
@@ -2535,17 +2513,7 @@ private struct DevicesView: View {
     }
 }
 
-// Native screens opened from Objective-C (the terminal's settings button and
-// Command-comma).
-@objc(LRNativeScreens) final class LRNativeScreens: NSObject {
-    @objc static func terminalSettings() -> UIViewController {
-        let host = UIHostingController(rootView: NavigationView { TerminalSettingsView() }.navigationViewStyle(.stack))
-        host.modalPresentationStyle = .formSheet
-        return host
-    }
-}
-
-// Open-source components and their licenses. Bundled notice files are shown verbatim.
+// Open-source components and their licenses.
 private struct NoticesView: View {
     @Environment(\.dismiss) private var dismiss
     private let components: [(String, String)] = [
@@ -2554,71 +2522,17 @@ private struct NoticesView: View {
         ("ios-linuxkit (Rui Carmo)", "Upstream runtime derived from iSH. Same license terms as iSH."),
         ("iSH (Theodore Dubois)", "Foundational userspace Linux runtime for iOS. GNU GPL version 3 (contributions after 0e3a4144 also GPL version 2), with the iSH App Store terms in LICENSE.IOS."),
         ("Linux kernel headers", "GNU GPL version 2 with the Linux syscall note."),
-        ("xterm.js, hterm, ghostty-web", "Terminal frontends: MIT (xterm.js), BSD 3-Clause (hterm, The Chromium OS Authors), ghostty-web (see project notices)."),
-        ("Fira Code and JetBrains Mono (Nerd Fonts)", "SIL Open Font License 1.1."),
         ("libarchive", "BSD 2-Clause License."),
         ("Debian GNU/Linux packages", "Downloaded and installed from Debian's official repositories under each package's own license (/usr/share/doc/<package>/copyright in Linux)."),
     ]
-    private var bundled: [(String, String)] {
-        guard let support = Bundle.main.url(forResource: "Support", withExtension: "bundle") else { return [] }
-        return ["terminal-notices.txt"].compactMap { name in
-            (try? String(contentsOf: support.appendingPathComponent(name))).map { (name, $0) }
-        }
-    }
     var body: some View {
         NavigationView {
             List {
                 Section { ForEach(components, id: \.0) { item in VStack(alignment: .leading, spacing: 4) { Text(item.0).font(.headline); Text(item.1).font(.footnote).foregroundStyle(.secondary) } } }
-                ForEach(bundled, id: \.0) { item in Section(item.0) { Text(item.1).font(.caption.monospaced()).textSelection(.enabled) } }
             }
             .navigationTitle("Notices & Credits")
             .toolbar { Button("Done") { dismiss() } }
         }.navigationViewStyle(.stack)
-    }
-}
-
-private struct TerminalSettingsView: View {
-    private let prefs = UserPreferences.shared()
-    @State private var fontSize = 12.0
-    @State private var cursor = 0
-    @State private var blink = true
-    @State private var scheme = 0
-    @State private var capsLock = 0
-    @State private var optionEscape = false
-    @State private var backtickEscape = false
-    @State private var controlSpace = false
-    @State private var hideExtraKeys = false
-    @AppStorage("LinuxRunnerTerminal.sharpness") private var sharpness = "sharp"
-    var body: some View {
-        Form {
-            Section {
-                Picker("Text Sharpness", selection: $sharpness) { Text("Sharp").tag("sharp"); Text("Balanced").tag("balanced"); Text("Battery Saver").tag("battery") }
-                    .onChange(of: sharpness) { _ in prefs.fontSize = prefs.fontSize }
-            } footer: { Text("Sharp draws terminal text at the screen's full resolution. Battery Saver uses one pixel per point: lighter, but softer on Retina screens.") }
-            Section("Appearance") {
-                Stepper(value: $fontSize, in: 8...32, step: 1) { HStack { Text("Font Size"); Spacer(); Text("\(Int(fontSize)) pt").foregroundStyle(.secondary) } }
-                    .onChange(of: fontSize) { prefs.fontSize = NSNumber(value: $0) }
-                Picker("Cursor", selection: $cursor) { Text("Block").tag(0); Text("Bar").tag(1); Text("Underline").tag(2) }
-                    .onChange(of: cursor) { if let v = CursorStyle(rawValue: $0) { prefs.cursorStyle = v } }
-                Toggle("Blinking Cursor", isOn: $blink).onChange(of: blink) { prefs.blinkCursor = $0 }
-                Picker("Colors", selection: $scheme) { Text("Match System").tag(0); Text("Light").tag(1); Text("Dark").tag(2) }
-                    .onChange(of: scheme) { prefs.colorScheme = .init(rawValue: $0) ?? prefs.colorScheme }
-            }
-            Section {
-                Picker("Caps Lock", selection: $capsLock) { Text("Caps Lock").tag(0); Text("Control").tag(1); Text("Escape").tag(2) }
-                    .onChange(of: capsLock) { if let v = CapsLockMapping(rawValue: $0) { prefs.capsLockMapping = v } }
-                Toggle("Option Sends Escape", isOn: $optionEscape).onChange(of: optionEscape) { prefs.optionMapping = $0 ? OptionMapEsc : OptionMapNone }
-                Toggle("Backtick Sends Escape", isOn: $backtickEscape).onChange(of: backtickEscape) { prefs.backtickMapEscape = $0 }
-                Toggle("Ctrl-Space Goes to Linux", isOn: $controlSpace).onChange(of: controlSpace) { prefs.overrideControlSpace = $0 }
-                Toggle("Hide Extra Keys with Hardware Keyboard", isOn: $hideExtraKeys).onChange(of: hideExtraKeys) { prefs.hideExtraKeysWithExternalKeyboard = $0 }
-            } header: { Text("Keyboard") } footer: { Text("The terminal's key bar provides Esc, Tab, Ctrl, Alt, and arrow keys on screen. Changes apply to open terminals.") }
-        }
-        .navigationTitle("Terminal & Keyboard")
-        .onAppear {
-            fontSize = prefs.fontSize.doubleValue; cursor = prefs.cursorStyle.rawValue; blink = prefs.blinkCursor; scheme = prefs.colorScheme.rawValue
-            capsLock = prefs.capsLockMapping.rawValue; optionEscape = prefs.optionMapping == OptionMapEsc; backtickEscape = prefs.backtickMapEscape
-            controlSpace = prefs.overrideControlSpace; hideExtraKeys = prefs.hideExtraKeysWithExternalKeyboard
-        }
     }
 }
 
@@ -2743,7 +2657,7 @@ enum SimulatorWorkflow {
         defer { timer.invalidate() }
         var top = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.rootViewController
         while let presented = top?.presentedViewController { top = presented }
-        let page = PackageView(environment: environment, manager: manager, run: { _ in })
+        let page = PackageView(environment: environment, manager: manager)
         let host = UIHostingController(rootView: NavigationView { page }.navigationViewStyle(.stack))
         host.overrideUserInterfaceStyle = .dark
         top?.present(host, animated: false)
@@ -2764,7 +2678,7 @@ enum SimulatorWorkflow {
     }
 
     static func start(manager: EnvironmentManager,
-                      terminal: @escaping () -> Void = {}, type: @escaping (String) -> Void = { _ in }, tab: @escaping (Int) -> Void = { _ in }) {
+                      tab: @escaping (Int) -> Void = { _ in }) {
         guard !started, let script = ProcessInfo.processInfo.environment["LR_SIM_SCRIPT"] else { return }
         started = true
         var delay = 0.0
@@ -2773,7 +2687,6 @@ enum SimulatorWorkflow {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 LRRuntimeBridge.logCategory("SIMULATOR", event: "workflow step \(step)")
                 if step.hasPrefix("tab:") { tab(Int(step.dropFirst(4)) ?? 0); return }
-                if step.hasPrefix("type:") { type(String(step.dropFirst(5)) + "\n"); return }
                 switch step {
                 case "network-contract":
                     let model = HostNetworkStatus(); model.start()
@@ -2789,17 +2702,10 @@ enum SimulatorWorkflow {
                             try? data.write(to: url, options: .atomic)
                         }
                     }
-                case "terminal": terminal()
                 case "taskmanager":
                     var top = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.rootViewController
                     while let next = top?.presentedViewController { top = next }
                     top?.present(LinuxRunnerShell.makeTaskManagerController(), animated: true)
-                case "jit-status":
-                    var top = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.rootViewController
-                    while let next = top?.presentedViewController { top = next }
-                    let host = UIHostingController(rootView: NavigationView { ExecutionEngineView() }.navigationViewStyle(.stack))
-                    host.overrideUserInterfaceStyle = .dark
-                    top?.present(host, animated: true)
                 case "package-discovery-contract":
                     Task { @MainActor in await packageDiscoveryContract(manager) }
                 case "install-debian":
@@ -3330,8 +3236,6 @@ struct TaskManagerView: View {
     }
 
     private var overview: some View {
-        let execution = LRRuntimeBridge.executionBackendStatus()
-        let jit = (execution["active"] as? String) == "jit"
         let rootName = LRRuntimeBridge.activeRootName()
         let ringMemKB = sampler.footprint > 0 ? appFootprintKB : guestMappedKB
         return ScrollView { VStack(spacing: 12) {
@@ -3345,7 +3249,7 @@ struct TaskManagerView: View {
                 tile("\(sampler.processes.count)", "Processes", "square.stack.3d.up.fill", TaskStyle.frost)
                 tile("\(sampler.processes.reduce(0) { $0 + $1.threads })", "Threads", "point.3.connected.trianglepath.dotted", Color(red: 0.75, green: 0.45, blue: 1))
                 tile(Self.bytes(guestMappedKB), "Linux mapped", "memorychip", TaskStyle.yellow)
-                tile(jit ? "JIT" : "Interpreter", "Execution", jit ? "bolt.fill" : "cpu", jit ? TaskStyle.green : TaskStyle.frost)
+                tile("Interpreter", "Execution", "cpu", TaskStyle.frost)
             }
             card("Network I/O", systemImage: "arrow.up.arrow.down") {
                 HStack(spacing: 12) {
@@ -3370,7 +3274,7 @@ struct TaskManagerView: View {
             card("DebianRunner", systemImage: "cpu") {
                 row("Distribution", "Debian GNU/Linux (minimal)")
                 row("Environment", rootName.isEmpty ? "None" : rootName)
-                row("Execution", (LRRuntimeBridge.jitStatusReport() as? [String: Any])?["state"] as? String ?? (jit ? "JIT" : "Interpreter"))
+                row("Execution", "ARM64 Interpreter")
             }
         }.padding(.horizontal).padding(.bottom, 16) }
     }

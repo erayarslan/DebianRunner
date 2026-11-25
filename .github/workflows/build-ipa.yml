@@ -36,20 +36,11 @@ concurrency:
 
 jobs:
   build-ipa:
-    name: Build ${{ matrix.label }} iOS IPA
+    name: Build iOS IPA
     runs-on: macos-15
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Standard
-            jit: 'NO'
-          - label: JIT
-            jit: 'YES'
     env:
       BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'dev.debianrunner.app' }}
-      LINUXRUNNER_JIT: ${{ matrix.jit }}
       DIAGNOSTIC: ${{ github.event.inputs.diagnostic == 'true' && 'YES' || 'NO' }}
     steps:
       - name: Checkout repository
@@ -59,8 +50,8 @@ jobs:
 
       - name: Initialize required submodules
         run: |
-          git submodule sync -- deps/libapps deps/libarchive
-          git submodule update --init --recursive --checkout -- deps/libapps deps/libarchive
+          git submodule sync -- deps/libarchive
+          git submodule update --init --recursive --checkout -- deps/libarchive
 
       - name: Install macOS build tools (meson, ninja, lld)
         run: |
@@ -84,16 +75,12 @@ jobs:
             flags+=(--diagnostic)
             artifact="DebianRunner-Debug"
           fi
-          if [[ "${LINUXRUNNER_JIT}" == "YES" ]]; then
-            artifact="${artifact}-JIT"
-          fi
           echo "ARTIFACT_NAME=${artifact}" >> "$GITHUB_ENV"
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             export MARKETING_VERSION="${GITHUB_REF_NAME#v}"
           fi
           ARTIFACT_NAME="${artifact}" \
           BUNDLE_ID="${BUNDLE_ID}" \
-          LINUXRUNNER_JIT="${LINUXRUNNER_JIT}" \
           RELEASE_DIR="$PWD/build/releases" \
           scripts/build-ipa.sh "${flags[@]}"
 
@@ -104,7 +91,6 @@ jobs:
             verify_flags+=(--diagnostic)
           fi
           ARTIFACT_NAME="${ARTIFACT_NAME}" \
-          LINUXRUNNER_JIT="${LINUXRUNNER_JIT}" \
           LINUXRUNNER_VERIFY_SOURCE_TREE="$PWD" \
           LINUXRUNNER_EXPECTED_SOURCE_COMMIT="${GITHUB_SHA}" \
           python3 scripts/verify-ipa.py build/releases "${verify_flags[@]}"
@@ -126,7 +112,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ matrix.label }}-${{ github.run_number }}
+          name: build-logs-${{ github.run_number }}
           overwrite: true
           retention-days: 1
           if-no-files-found: ignore
@@ -168,5 +154,5 @@ jobs:
           )
           gh release create "${TAG}" "${files[@]}" \
             --title "DebianRunner ${TAG}" \
-            --notes "Unsigned ARM64 iOS IPAs (Standard and JIT-capable) for headless Debian 13 (trixie) minimal. Sideload with AltStore, SideStore, Sideloadly, or TrollStore." \
+            --notes "Unsigned ARM64 iOS IPA for headless Debian 13 (trixie) minimal. Sideload with AltStore, SideStore, Sideloadly, or TrollStore." \
             || gh release upload "${TAG}" "${files[@]}" --clobber

@@ -1,5 +1,4 @@
 #import <UIKit/UIKit.h>
-#import "../TerminalViewController.h"
 
 NS_ASSUME_NONNULL_BEGIN
 // Settings › CPU & Memory (NSInteger, 0 = automatic); applied at the next launch.
@@ -44,11 +43,6 @@ void LRSetDatalessMaterialization(void);
 + (BOOL)importVerifiedEnvironment:(NSURL *)archive root:(NSString *)root sha256:(NSString *)sha256 progress:(void (^)(double, NSString *))progress cancel:(BOOL (^)(void))cancel error:(NSError **)error;
 + (BOOL)activeEnvironmentIsDebian;
 + (nullable NSString *)activeDistributionID;
-+ (NSDictionary *)probeJITPermissions;
-/// Execution backend. The JIT exists only in the JIT-capable build variant and
-/// runs only after iOS grants executable memory (an attached debugger such as
-/// StikDebug); the interpreter is the default and always available.
-+ (BOOL)jitCompiledIn;
 // Task Manager: live guest processes. Each entry: pid, ppid, name, uid, state
 // (R running, S sleeping in a blocking call, T stopped, Z zombie), threads,
 // cpu_ms (user+system time of all its threads, host-measured), and the pages
@@ -61,17 +55,6 @@ void LRSetDatalessMaterialization(void);
 + (uint64_t)appFootprintBytes;
 // Cumulative IPv4/IPv6 network bytes transferred by guest Linux sockets: rx_bytes, tx_bytes.
 + (NSDictionary<NSString *, NSNumber *> *)networkIOBytes;
-+ (NSString *)executionMode;            // interpreter | automatic | jit
-+ (void)setExecutionMode:(NSString *)mode;
-+ (BOOL)debuggerAttached;
-+ (NSDictionary *)jitStatusReport;           // state (Interpreter Active … JIT Active), detail, counters
-+ (void)retryJITWhenAuthorized;
-+ (BOOL)requiresPreparedJITRegion;      // iOS 26+: StikDebug's TXM script protocol
-+ (NSDictionary *)executionBackendStatus;
-+ (BOOL)activateJIT:(NSString * _Nullable * _Nullable)detail;
-+ (BOOL)retryJITAfterFailure:(NSString * _Nullable * _Nullable)detail;
-+ (NSURL * _Nullable)stikDebugRequestURL;
-+ (void)prepareExecutionBackendAtLaunch;
 // The mounted root stays in use until app relaunch, even after guest init exits.
 + (nullable NSString *)environmentDeletionUnavailableReason:(NSString *)root;
 + (void)deleteEnvironment:(NSString *)root completion:(void (^)(NSError * _Nullable))completion;
@@ -102,9 +85,13 @@ void LRSetDatalessMaterialization(void);
 /// Read at most 256 KiB before allocation, refusing symlinks and non-regular files.
 + (NSString *)boundedDiagnosticTail:(NSURL *)url maxBytes:(NSUInteger)bytes;
 + (NSURL * _Nullable)prepareApplicationSupport:(NSError **)error;
-+ (TerminalViewController *)terminalForCommand:(NSArray<NSString *> *)command directory:(NSString *)directory;
-// Real guest account database and distro-managed password prompts. No passwords
-// cross this bridge or enter native preferences/logs.
+// Headless guest process runner (attached to /dev/null; zero WebViews or PTYs).
++ (void)runHeadlessCommand:(NSArray<NSString *> *)command
+                 directory:(NSString *)directory
+                   timeout:(NSTimeInterval)timeout
+                completion:(void (^ _Nullable)(int exitCode))completion
+                NS_SWIFT_NAME(runHeadlessCommand(_:directory:timeout:completion:));
+// Real guest account database. No passwords cross this bridge into preferences/logs.
 + (NSArray<NSDictionary<NSString *, NSString *> *> *)linuxAccounts;
 + (NSString *)defaultLinuxUser;
 // Shared iPhone folders (Files › document picker), bind-mounted at /mnt/<name>.
@@ -116,21 +103,18 @@ void LRSetDatalessMaterialization(void);
 + (void)checkSharedFolder:(NSString *)name completion:(void (^)(NSString *summary))completion;
 + (void)checkAppSharedFolder:(void (^)(NSString *summary))completion;
 + (BOOL)setDefaultLinuxUser:(NSString *)name error:(NSError **)error;
-+ (NSArray<NSString *> * _Nullable)defaultLinuxLoginCommand:(NSError **)error;
-+ (TerminalViewController * _Nullable)createLinuxUser:(NSString *)name error:(NSError **)error;
-+ (TerminalViewController * _Nullable)createLinuxUser:(NSString *)name administrator:(BOOL)administrator error:(NSError **)error;
-+ (TerminalViewController * _Nullable)createLinuxUser:(NSString *)name administrator:(BOOL)administrator passwordlessSudo:(BOOL)passwordlessSudo error:(NSError **)error;
 + (BOOL)canGrantAdministrator;
-// Native account setup (no terminal): installs missing account tools/sudo,
-// creates the user, optionally writes a validated /etc/sudoers.d NOPASSWD
-// drop-in, sets the password from an app-side SHA-512 crypt hash and verifies
-// it in /etc/shadow. Completion and progress run on the main thread.
+// Native account setup: installs missing account tools/sudo, creates the user,
+// optionally writes a validated /etc/sudoers.d NOPASSWD drop-in, sets the
+// password from an app-side SHA-512 crypt hash and verifies it in /etc/shadow.
+// Completion and progress run on the main thread.
 + (void)createLinuxUser:(NSString *)name password:(NSString *)password administrator:(BOOL)administrator
                progress:(void (^)(NSString *message))progress completion:(void (^)(NSError * _Nullable error))completion;
 + (void)createLinuxUser:(NSString *)name password:(NSString *)password administrator:(BOOL)administrator passwordlessSudo:(BOOL)passwordlessSudo
                progress:(void (^)(NSString *message))progress completion:(void (^)(NSError * _Nullable error))completion;
 + (BOOL)accountToolsPresent;
 + (void)setLinuxPassword:(NSString *)name password:(NSString *)password progress:(void (^)(NSString *message))progress completion:(void (^)(NSError * _Nullable error))completion;
++ (void)removeLinuxUserKeepingHome:(NSString *)name completion:(void (^)(NSError * _Nullable error))completion NS_SWIFT_NAME(removeLinuxUserKeepingHome(_:completion:));
 // Built-in OpenSSH Server (managed headlessly without spawning WebViews or PTYs).
 + (BOOL)sshBinaryInstalled;
 + (BOOL)sshAutoStart;
@@ -153,9 +137,6 @@ void LRSetDatalessMaterialization(void);
 + (void)endAwake:(NSString *)reason;
 + (void)refreshAwake;
 + (NSArray<NSString *> *)awakeReasons;
-+ (TerminalViewController * _Nullable)changeLinuxPassword:(NSString *)name error:(NSError **)error;
-+ (TerminalViewController * _Nullable)removeLinuxUserKeepingHome:(NSString *)name error:(NSError **)error;
-+ (TerminalViewController * _Nullable)terminalForLinuxUser:(NSString *)name error:(NSError **)error;
 + (void)logCategory:(NSString *)category event:(NSString *)event;
 + (NSArray<NSString *> *)logLines;
 + (NSURL * _Nullable)exportLogs:(NSError **)error;

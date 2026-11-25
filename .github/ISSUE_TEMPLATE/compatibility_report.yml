@@ -30,6 +30,6 @@ body:
     id: details
     attributes:
       label: Actions tested and limitations
-      description: List actual operations, duration if relevant, execution mode (interpreter/JIT) and reproduction steps. A launch is not a full compatibility test. Review logs for personal data before sharing.
+      description: List actual operations, duration if relevant, and reproduction steps. A launch is not a full compatibility test. Review logs for personal data before sharing.
     validations:
       required: true

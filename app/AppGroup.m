@@ -221,11 +221,6 @@ NSURL *ContainerURL(void) {
 #endif
     });
     return container;
-#elif ISH_AOT_BOOTSTRAP
-    // This isolated target has no file-provider extension or shared container.
-    NSURL *support = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory
-                                                        inDomains:NSUserDomainMask].firstObject;
-    return [support URLByAppendingPathComponent:@"LinuxKitAOTBootstrap" isDirectory:YES];
 #else
     NSString *appGroup = CurrentAppGroups().firstObject;
     return appGroup ? [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:appGroup] : nil;

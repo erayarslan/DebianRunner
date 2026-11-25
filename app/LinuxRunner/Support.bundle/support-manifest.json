@@ -34,7 +34,7 @@
     },
     {
       "name": "package-manager.sh",
-      "sha256": "ca22a70f8371c23849609ac59bb96af962e92dcae1bac288d07a2f020968a741",
+      "sha256": "b18497ddfe71ae3097fca10594c3197234226ec4866af2352ef32d3ce4bc879d",
       "mode": "0755"
     },
     {
@@ -55,11 +55,6 @@
     {
       "name": "support-version",
       "sha256": "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
-      "mode": "0644"
-    },
-    {
-      "name": "terminal-notices.txt",
-      "sha256": "eb8209ed950389276daab13795cfbe3dd4c214865ce2a7478c60136bee838ac3",
       "mode": "0644"
     }
   ]

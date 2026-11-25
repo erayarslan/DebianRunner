@@ -102,12 +102,9 @@ perform() {
   install)
    (umask 022; DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --no-remove -y -- "$value");;
   upgrade)
-   apt-get --simulate install --only-upgrade --no-install-recommends --no-remove -- "$value"
-   echo 'Confirm named-package upgrade by typing yes:'
-   read -r answer; [ "$answer" = yes ] || return 1
-   (umask 022; apt-get install --only-upgrade --no-install-recommends --no-remove -- "$value");;
+   (umask 022; DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade --no-install-recommends --no-remove -- "$value");;
   remove)
-   (umask 022; apt-get remove -- "$value");;
+   (umask 022; DEBIAN_FRONTEND=noninteractive apt-get remove -y -- "$value");;
   diagnose)
    cat /proc/ish/tasks 2>/dev/null || true
    dpkg --audit || true
@@ -117,8 +114,8 @@ perform() {
    checkpoint=$(mktemp -d /var/lib/linuxrunner/repair-checkpoints/repair.XXXXXX)
    cp -p /var/lib/dpkg/status "$checkpoint/dpkg-status"
    dpkg --audit || true
-   (umask 022; dpkg --force-confdef --force-confold --configure -a)
-   if [ "$operation" = repair ]; then (umask 022; apt-get -f install); fi
+   (umask 022; DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold --configure -a)
+   if [ "$operation" = repair ]; then (umask 022; DEBIAN_FRONTEND=noninteractive apt-get -f install -y); fi
    echo "PACKAGE_REPAIR: metadata_checkpoint=$checkpoint rollback=manual-not-automatic";;
   dependencies)
    apt-get check;;

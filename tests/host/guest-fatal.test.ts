@@ -11,7 +11,7 @@ test.skipIf(!ish || !root)('fatal guest signals retain wait status and do not te
     done
     echo GUEST_FATAL_STATUS_OK`;
     const result = Bun.spawnSync([resolve(ish!), '-f', resolve(root!), '/bin/sh', '-c', command], {
-        env: { ...process.env, ISH_JIT: '0' }, timeout: 30000,
+        env: { ...process.env }, timeout: 30000,
     });
     expect(result.exitCode).toBe(0);
     expect(result.signalCode).toBeFalsy();

@@ -11,7 +11,7 @@ test.skipIf(!build || process.platform !== 'darwin' || process.arch !== 'arm64')
     try {
         const binary = join(stage, 'unlink');
         const compile = Bun.spawnSync(['clang', '-O2', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
-            '-D_XOPEN_SOURCE=700', '-D_DARWIN_C_SOURCE', '-DGUEST_ARM64=1', '-DENGINE_ASBESTOS=1', '-DISH_JIT=1',
+            '-D_XOPEN_SOURCE=700', '-D_DARWIN_C_SOURCE', '-DGUEST_ARM64=1', '-DENGINE_ASBESTOS=1',
             '-I' + resolve(import.meta.dir, '../..'), '-I' + resolve(build), '-Wl,-dead_strip',
             join(import.meta.dir, 'realfs-unlink.c'), join(build, 'libish.a'), join(build, 'libish_emu.a'),
             join(build, 'libfakefs.a'), '-lm', '-lsqlite3', '-o', binary], { timeout: 120000 });
@@ -28,7 +28,7 @@ test.skipIf(!ish || !root)('guest Bun removes directory trees without following 
     const run = Bun.spawnSync([resolve(ish!), '-f', resolve(root!), '/usr/bin/env',
         'BUN_JSC_useJIT=0', 'BUN_JSC_numberOfGCMarkers=1', 'BUN_JSC_useConcurrentGC=0',
         '/usr/local/bin/bun', '/mnt/bun-remove'], {
-        env: { ...process.env, ISH_JIT: '0', ISH_BIND_MOUNTS: `/mnt/bun-remove=${script}:ro` },
+        env: { ...process.env, ISH_BIND_MOUNTS: `/mnt/bun-remove=${script}:ro` },
         timeout: 60000,
     });
     expect(run.exitCode).toBe(0);

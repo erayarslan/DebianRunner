@@ -13,7 +13,6 @@ if [ -z "${EVIDENCE_DIR:-}" ]; then trap 'rm -rf "$TMP"' EXIT; fi
 test -x "$ISH_BIN"; test -d "$ROOTFS"
 BUILD_DIR=$(dirname "$ISH_BIN")
 HOST_DEFS=(-DGUEST_ARM64=1 -DENGINE_ASBESTOS=1)
-if grep -q -- "-DISH_JIT=1" "$BUILD_DIR/compile_commands.json"; then HOST_DEFS+=(-DISH_JIT=1); fi
 libs=(-Wl,--start-group "$BUILD_DIR/libish.a" "$BUILD_DIR/libish_emu.a" "$BUILD_DIR/libfakefs.a" -Wl,--end-group -lrt -lm -ldl -lsqlite3)
 for fixture in proc-pid-lookup proc-open-locks proc-stat-locks; do
     wraps=()

@@ -18,7 +18,6 @@ ln -s input "$TMP/seed/a/output-link"
 ln -s absent "$TMP/seed/a/dangling"
 tar -C "$TMP/seed" -czf "$TMP/seed.tar.gz" .
 DEFS=(-D_GNU_SOURCE -DGUEST_ARM64=1 -DENGINE_ASBESTOS=1 -DISH_NATIVE_OFFLOAD_TEST_HANDLERS=1)
-if grep -q -- '-DISH_JIT=1' "$BUILD_DIR/compile_commands.json"; then DEFS+=(-DISH_JIT=1); fi
 WRAPS=()
 for name in native_fs_open fd_close native_handler_check do_exit malloc calloc chdir fchdir pipe opendir unlink unlinkat pthread_create; do WRAPS+=(-Wl,--wrap=$name); done
 "${CC:-clang}" -O2 -Wall -Wextra -Werror -Wno-unused-function "${DEFS[@]}" \

@@ -24,7 +24,7 @@ struct HomeStatus: View {
     }
     private var symbol: String {
         switch phase {
-        case .running: return "terminal.fill"
+        case .running: return "arrow.up.forward.app.fill"
         case .starting: return "power"
         case .stopped: return "power"
         case .uninstalled: return "arrow.down.circle"

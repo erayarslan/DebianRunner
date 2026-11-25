@@ -100,7 +100,6 @@ struct data {
     bool memfd_maywrite;
     size_t file_offset;
     size_t mapping_offset; // host alignment correction at the first guest page
-    int jit_mod; // module cache; unconditional for app/kernel layout parity
     const char *name;
 #if LEAK_DEBUG
     int pid;

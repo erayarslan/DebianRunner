@@ -1,11 +1,7 @@
 #!/bin/sh
 set -eu
 
-if [ "${TARGET_NAME:-}" = iSH-ARM64-AOT-Bootstrap ]; then
-    "$SRCROOT/app/xcode-meson.sh" --aot-bootstrap
-else
-    "$SRCROOT/app/xcode-meson.sh"
-fi
+"$SRCROOT/app/xcode-meson.sh"
 cd "$MESON_BUILD_DIR"
 "$SRCROOT/app/xcode-ninja.sh" $NINJA_TARGETS
 

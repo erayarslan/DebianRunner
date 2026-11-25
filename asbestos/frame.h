@@ -23,12 +23,6 @@ struct fiber_frame {
     uint64_t xzr_read;
     uint64_t xzr_sink;
     long ret_cache[FIBER_RETURN_CACHE_SIZE]; // a map of ip to pointer-to-call-gadget-arguments
-#ifdef ISH_JIT
-    uintptr_t native_fault_host_pc;
-    uint64_t native_fault_guest_pc;
-    uint64_t native_fault_addr;
-    uint64_t native_fault_write;
-#endif
 };
 
 #endif

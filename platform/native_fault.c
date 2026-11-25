@@ -5,9 +5,6 @@
 #include "platform/host_context_aarch64.h"
 #include "asbestos/frame.h"
 #include "asbestos/asbestos.h"
-#ifdef ISH_JIT
-#include "asbestos/guest-arm64/jit.h"
-#endif
 extern __thread volatile sig_atomic_t in_jit;
 extern __thread volatile uint64_t jit_saved_pc;
 extern __thread volatile uint64_t jit_last_host_fault, jit_last_x7, jit_last_x10;
@@ -23,31 +20,22 @@ _Static_assert(offsetof(struct fiber_frame,jit_saved_pc)==LOCAL_jit_saved_pc,"fa
 enum ish_fault_result ish_native_fault_recover(int sig,const siginfo_t *info,
         void *context,int allow_gadget_replay) {
 #if defined(__aarch64__)
-    if((sig!=SIGSEGV && sig!=SIGBUS) || !in_jit || !context || !info)
+    if((sig!=SIGSEGV && sig!=SIGBUS) || !in_jit || !context || !info || !allow_gadget_replay)
         return ISH_FAULT_UNHANDLED;
     ucontext_t *uc=context;
-    int native=0;
-#ifdef ISH_JIT
-    native=jit_crash_recover(uc);
-    if(native<0) return ISH_FAULT_FATAL;
-#endif
-    if(!native && !allow_gadget_replay) return ISH_FAULT_UNHANDLED;
     uintptr_t cpu_ptr=host_ctx_aarch64_reg(uc,1);
     uint64_t x7=host_ctx_aarch64_reg(uc,7), x10=host_ctx_aarch64_reg(uc,10);
-    // Native recovery validated x1 against dispatch's trusted frame. The CLI
-    // gadget fallback deliberately retains its existing pinned-register ABI.
+    // CLI gadget fault replay retains its pinned-register ABI.
     struct fiber_frame *frame=(struct fiber_frame *)cpu_ptr;
     if(!frame) return ISH_FAULT_FATAL;
-    if(!native) {
-        frame->cpu.segfault_addr=(x7-x10)&0xffffffffffffULL;
-        frame->cpu.segfault_was_write=host_ctx_aarch64_fault_was_write(uc,info)!=0;
-        frame->cpu.pc=frame->jit_saved_pc ? frame->jit_saved_pc : (uint64_t)jit_saved_pc;
-        // A fault in gadget code: x28 is the code-stream position, which the
-        // executing block's fault-PC table maps to the precise retry PC.
-        addr_t precise;
-        if(fiber_block_fault_pc(frame->last_block,(const unsigned long *)host_ctx_aarch64_reg(uc,28),&precise))
-            frame->cpu.pc=precise;
-    }
+    frame->cpu.segfault_addr=(x7-x10)&0xffffffffffffULL;
+    frame->cpu.segfault_was_write=host_ctx_aarch64_fault_was_write(uc,info)!=0;
+    frame->cpu.pc=frame->jit_saved_pc ? frame->jit_saved_pc : (uint64_t)jit_saved_pc;
+    // A fault in gadget code: x28 is the code-stream position, which the
+    // executing block's fault-PC table maps to the precise retry PC.
+    addr_t precise;
+    if(fiber_block_fault_pc(frame->last_block,(const unsigned long *)host_ctx_aarch64_reg(uc,28),&precise))
+        frame->cpu.pc=precise;
     jit_last_host_fault=(uintptr_t)info->si_addr;
     jit_last_x7=x7; jit_last_x10=x10; jit_crash_count++;
     host_ctx_aarch64_set_sp(uc,frame->jit_exit_sp);

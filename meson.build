@@ -28,18 +28,6 @@ add_project_arguments('-DLOG_HANDLER_' + get_option('log_handler').to_upper() + 
 add_project_arguments('-DENGINE_' + get_option('engine').to_upper() + '=1', language: 'c')
 
 guest_arch = get_option('guest_arch')
-ish_jit = get_option('jit')
-if ish_jit
-    if host_machine.cpu_family() != 'aarch64' or host_machine.system() not in ['darwin', 'linux']
-        error('Native/AOT backend needs AArch64 Darwin or Linux')
-    endif
-    add_project_arguments('-DISH_JIT=1', language: 'c')
-    if not get_option('jit_emit')
-        add_project_arguments('-DISH_JIT_NO_EMIT=1', language: 'c')
-    endif
-elif get_option('cli_aot').length() != 0
-    error('cli_aot requires jit=true')
-endif
 if guest_arch != 'arm64'
     error('Only the ARM64 guest backend is supported')
 endif
@@ -81,7 +69,6 @@ emu_src += [
     'asbestos/guest-arm64/crypto_helpers.c',
     'asbestos/helpers.c',
     'platform/native_fault.c',
-    'platform/native_fault_app.c',
     gadgets+'/entry.S',
     gadgets+'/memory.S',
     gadgets+'/control.S',
@@ -91,9 +78,6 @@ emu_src += [
     offsets,
 ]
 
-if ish_jit
-    emu_src += 'asbestos/guest-arm64/jit.c'
-endif
 libish_emu = library('ish_emu', emu_src, include_directories: includes)
 
 libfakefs = library('fakefs',
@@ -206,8 +190,7 @@ if get_option('kernel') == 'ish'
         include_directories: includes)
 
     if not meson.is_cross_build()
-        executable('ish', ['main.c'] + get_option('cli_aot'), dependencies: ish,
-            export_dynamic: ish_jit)
+        executable('ish', ['main.c'], dependencies: ish)
     endif
 
 else

@@ -17,8 +17,8 @@ bun test tests/host/arm64-gadget-differential.test.ts \
   tests/host/bun-remove.test.ts
 ```
 
-The instruction tests use the actual decoder/gadgets and native Apple Silicon
-instructions, not the JIT emitter. Default fixtures cover USHL sizes/aliases,
+The instruction tests compare the actual decoder/gadgets against native Apple Silicon
+instructions. Default fixtures cover USHL sizes/aliases,
 integer operations and every SIMD single-structure lane with one to four
 registers, wrapped register numbers, post-indexing and unaligned/page-crossing
 memory. Their binaries optionally accept a file of little-endian instruction
@@ -35,7 +35,6 @@ The live TLS test is separate from offline CI. It contacts public hosts only,
 uses no authentication, and leaves certificate verification enabled:
 
 ```sh
-ISH_JIT=0 \
 ISH_BIND_MOUNTS="/mnt/benchmark=$PWD/tests/arm64/benchmarks:ro" \
   "$ISH_BIN" -f "$ROOTFS" /usr/bin/env \
   BUN_JSC_useJIT=0 BUN_JSC_numberOfGCMarkers=1 BUN_JSC_useConcurrentGC=0 \
@@ -51,9 +50,6 @@ coverage. Remove `--downloads` to run only the handshake checks.
 Pinned release URLs may eventually stop being served; an HTTP failure should
 be distinguished from a crypto failure rather than silently accepted.
 
-For linked AOT validation, repeat the guest checks with the no-emitter linked
-CLI and `ISH_JIT=1`, and inspect its AOT/emit counters. Decoder changes require
-fresh target-bound recordings; version-11 images cannot validate version 12.
 Mac checks do not replace physical iPhone workload and memory-policy checks.
 
 ## Pi tool installation

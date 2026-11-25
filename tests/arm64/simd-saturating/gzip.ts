@@ -15,8 +15,7 @@ writeFileSync(nativeBusybox, readFileSync(busybox)); chmodSync(nativeBusybox, 0o
 writeFileSync(loader, readFileSync(join(data, 'lib/ld-musl-aarch64.so.1'))); chmodSync(loader, 0o755);
 const sha = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const env = { ...process.env };
-for (const key of Object.keys(env)) if (/^ISH_(JIT|AOT|TRACE|ARM64_)/.test(key)) delete env[key];
-env.ISH_JIT = '0';
+for (const key of Object.keys(env)) if (/^ISH_(TRACE|ARM64_)/.test(key)) delete env[key];
 let commandIndex = 0;
 function run(label: string, args: string[], success: boolean) {
   const proc = Bun.spawnSync(args, { env, timeout: 120_000, maxBuffer: 16 * 1024 * 1024 });

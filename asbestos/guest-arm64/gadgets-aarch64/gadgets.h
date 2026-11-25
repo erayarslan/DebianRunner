@@ -55,8 +55,7 @@ _tlb    .req x2
 _pc     .req x28
 
 // dst = owning block's guest address, given a pointer to its code[] (block->code).
-// One load when the negative offset fits (gadget builds); ISH_JIT builds have a
-// larger struct fiber_block, beyond the [-256, 255] unscaled range.
+// Uses a single unscaled load when the negative offset fits in [-256, 255].
 .macro load_block_addr dst, codeptr
 .if (FIBER_BLOCK_code - FIBER_BLOCK_addr) <= 256
     ldur \dst, [\codeptr, #(-FIBER_BLOCK_code + FIBER_BLOCK_addr)]

@@ -18,9 +18,6 @@
 #include "emu/cpu.h"
 #include "emu/tlb.h"
 #include "asbestos/frame.h"
-#ifdef ISH_JIT
-#include "asbestos/guest-arm64/jit.h"
-#endif
 #include "asbestos/asbestos.h"
 #include "platform/host_context_aarch64.h"
 #include "platform/native_fault.h"
@@ -53,7 +50,7 @@ static int crash_fd(void) { return fcntl(666, F_GETFD) != -1 ? 666 : STDERR_FILE
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     enum ish_fault_result recovered=ish_native_fault_recover(sig,info,ctx,1);
     if(recovered==ISH_FAULT_FATAL) {
-        static const char message[]="unrecoverable native JIT/AOT fault\n";
+        static const char message[]="unrecoverable guest fault\n";
         (void)write(crash_fd(),message,sizeof(message)-1);
         _exit(139);
     }
